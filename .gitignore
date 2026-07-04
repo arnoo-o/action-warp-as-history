@@ -1,0 +1,11 @@
+__pycache__/
+
+/.agents
+/.codex
+/upload_bundle
+/data
+/runs
+/checkpoints
+/logs
+/data/training/prompt_cache
+env.sh

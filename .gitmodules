@@ -1,0 +1,3 @@
+[submodule "third_party/Pi3"]
+	path = third_party/Pi3
+	url = https://github.com/yyfz/Pi3

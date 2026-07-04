@@ -1,0 +1,433 @@
+<div align="center">
+<h1>
+  Warp-as-History:
+  Generalizable Camera-Controlled Video Generation 
+  from <strong>One</strong> Training Video
+</h1>
+<p class="eyebrow">Video History is More Than Context.</p>
+<p class="authors"><a href="https://yyfz.github.io/">Yifan Wang</a><sup>1,2</sup> and <a href="https://tonghe90.github.io/">Tong He</a><sup>2,3</sup></p>
+<p class="affiliations">
+  <span><sup>1</sup> Shanghai Jiao Tong University</span>
+  <span><sup>2</sup> Shanghai AI Laboratory</span>
+  <span><sup>3</sup> Shanghai Innovation Institute</span>
+</p>
+<img src="assets/github_teaser.jpg" alt="Warp-as-History teaser" width="100%">
+<p>
+  <a href="https://arxiv.org/abs/2605.15182">
+    <img src="assets/paper_button.svg" alt="Paper" height="44">
+  </a>
+  <a href="https://yyfz.github.io/warp-as-history">
+    <img src="assets/demo_button.svg" alt="See More Demo" height="44">
+  </a>
+</p>
+</div>
+
+<div align="center">
+This repository provides the official implementation of Warp-as-History. Our method enables realtime interactive camera trajectory following and viewpoint manipulation, similar to HappyOyster and Genie 3, using only a single camera-annotated training example.
+</div>
+
+
+## Installation
+
+```bash
+git clone --recurse-submodules https://github.com/yyfz/Warp-as-History.git
+cd Warp-as-History
+
+conda create -n warp-as-history python=3.10 -y
+conda activate warp-as-history
+python -m pip install --upgrade pip setuptools wheel
+```
+
+Install PyTorch for your own CUDA/driver setup. For example, CUDA 12.4:
+
+```bash
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+```
+
+Then install the project dependencies:
+
+```bash
+pip install -r requirements.txt
+pip install -e .
+pip install -e third_party/Pi3
+```
+
+`third_party/Pi3` is a git submodule. If you cloned without submodules, run
+`git submodule update --init --recursive`.
+
+`xformers` and `flash-attn` are optional. The default code path uses PyTorch
+native attention. In our CUDA 12.4 / PyTorch 2.5.1 setup, this FlashAttention
+version works:
+
+```bash
+pip install "flash-attn==2.7.4.post1" --no-build-isolation
+```
+
+For other CUDA/PyTorch setups, install a `flash-attn` version compatible with
+your environment.
+
+## Models
+
+- Helios-Distilled (default): [`BestWishYsh/Helios-Distilled`](https://huggingface.co/BestWishYsh/Helios-Distilled/tree/main)
+- Pi3X: [`yyfz233/Pi3X`](https://huggingface.co/yyfz233/Pi3X)
+- Warp-as-History LoRA (default): [`yyfz233/warp-as-history`](https://huggingface.co/yyfz233/warp-as-history)
+- Warp-as-History efficient realtime LoRA (optional): [`visible_lora_state_step1000_efficient_patchmid.pt`](https://huggingface.co/yyfz233/warp-as-history/blob/main/visible_lora_state_step1000_efficient_patchmid.pt)
+- Helios-Mid (optional, training only): [`BestWishYsh/Helios-Mid`](https://huggingface.co/BestWishYsh/Helios-Mid)
+
+Download the required models once before inference or training:
+
+```bash
+huggingface-cli download BestWishYsh/Helios-Distilled \
+  --local-dir checkpoints/helios-distilled
+
+huggingface-cli download yyfz233/Pi3X model.safetensors \
+  --local-dir checkpoints/pi3x
+
+huggingface-cli download yyfz233/warp-as-history visible_lora_state_step1000.safetensors \
+  --local-dir checkpoints/warp-as-history
+
+# optional: released efficient realtime LoRA
+huggingface-cli download yyfz233/warp-as-history visible_lora_state_step1000_efficient_patchmid.pt \
+  --local-dir checkpoints/warp-as-history
+
+# only for training
+huggingface-cli download BestWishYsh/Helios-Mid \
+  --local-dir checkpoints/helios-mid
+```
+
+Model check:
+
+```bash
+python scripts/check_models.py
+```
+
+Missing Helios-Mid is reported as a warning unless you plan to train with it.
+
+## Inference
+
+The demo CSV files under `data/demo` contain one input image path, prompt, and
+either `camera_poses_path` or a pre-rendered `warp_video_path`. Run a minimal
+end-to-end inference with:
+
+```bash
+python scripts/infer_warp_as_history.py data/demo/angel.csv \
+  --output runs/angel.mp4
+```
+
+By default, inference loads
+`checkpoints/warp-as-history/visible_lora_state_step1000.safetensors`. Pass
+`--no_lora` only for ablations.
+
+Pass `--warp_debug_dir runs/angel_warp_debug` to also save the warp
+conditioning video as `runs/angel_warp_debug/warp.mp4`.
+
+Each demo CSV has these columns:
+
+```csv
+first_frame_path,prompt,camera_poses_path,warp_video_path,warp_visibility_mask_path
+```
+
+`camera_poses_path` should point to an `.npz` file whose `camera_poses` entry
+contains OpenCV `c2w` poses with shape `[T, 4, 4]`.
+
+When both `warp_video_path` and `camera_poses_path` are provided, inference uses
+the pre-rendered warp video. Without `--output`, the script writes
+`runs/<csv_stem>.mp4`. By default it uses the warp video frame count, or all
+frames in `camera_poses.npz`; pass `--num_frames 33` only when you want a short
+smoke test.
+
+```python
+from warp_as_history import WarpAsHistoryPipeline
+
+pipe = WarpAsHistoryPipeline.from_pretrained(
+    "checkpoints/helios-distilled",
+).to("cuda")
+
+video = pipe(
+    prompt="a car driving through a roundabout",
+    image=first_frame,
+    camera_poses=camera_poses,
+    camera_control_translation_scale=0.1,
+)
+```
+
+`camera_control_translation_scale` controls the online warp translation scale
+and defaults to `0.1`. Warp-as-History conditioning loads the default LoRA
+from `checkpoints/warp-as-history/visible_lora_state_step1000.safetensors`
+unless you pass `lora_path=None` or another disabled value such as `"off"`.
+
+If neither `camera_poses` nor `warp_video` is provided,
+`WarpAsHistoryPipeline` falls back to the original Helios pipeline. This path
+does not load or apply Warp-as-History LoRA weights, prompt triggers, warp
+latents, or visible-token masking:
+
+```python
+video = pipe(
+    prompt="a car driving through a roundabout",
+    image=first_frame,
+    num_frames=33,
+)
+```
+
+Passing an explicit `lora_path` without `camera_poses` or `warp_video` raises
+an error, because WAH LoRA weights are only defined for Warp-as-History
+conditioning. Original Helios keyword arguments, such as `guidance_scale` and
+`num_inference_steps`, are passed through on this fallback path.
+
+To save the warp conditioning used by a Warp-as-History run, pass
+`warp_debug_dir`. The pipeline writes only `warp.mp4` under that directory:
+
+```python
+video = pipe(
+    prompt=prompt,
+    image=first_frame,
+    camera_poses=camera_poses,
+    warp_debug_dir="runs/angel_warp_debug",
+)
+```
+
+Use `return_warp_debug=True` when you also want the returned object to include
+the CPU `warp_video` tensor. Warp debug is only available when `camera_poses` or
+`warp_video` is provided.
+
+For online/autoregressive generation, initialize a state once and feed one
+camera or warp chunk at a time:
+
+```python
+state = pipe.init_autoregressive_state(
+    prompt=prompt,
+    image=first_frame,
+    conditioning_type="camera",
+    num_frames=99,
+    height=384,
+    width=640,
+    generator=generator,
+)
+
+window = state["window_num_frames"]  # 33 with the default WAH recipe
+for chunk_index in range(state["num_warp_chunks"]):
+    start = chunk_index * window
+    camera_chunk = camera_poses[start : start + window]
+    chunk_video, state = pipe.generate_next_chunk(
+        state,
+        camera_poses=camera_chunk,
+    )
+
+video = pipe.finalize_autoregressive_state(state)
+```
+
+`generate_next_chunk` returns the newly finalized video frames plus the next
+state. For camera control, the first chunk should provide `window` poses. Later
+chunks may either provide `window` new poses, in which case the pipeline
+prepends the cached previous boundary pose, or provide `window + 1` poses
+including that boundary pose explicitly. For pre-rendered warp conditioning,
+initialize with `conditioning_type="warp"` and pass exactly `window` warp frames
+per call via `warp_video` and optionally `warp_visibility_mask`.
+
+### Web realtime demo
+
+An interactive browser UI is available for prompt-and-button camera control.
+The web demo has two presets: `normal` keeps the standard, higher-quality
+Warp-as-History recipe, while `efficient_realtime` switches to the low-latency
+realtime recipe.
+
+```bash
+python scripts/web_realtime_demo.py \
+  --preset normal \
+  --host 0.0.0.0 \
+  --port 7860
+```
+
+```bash
+python scripts/web_realtime_demo.py \
+  --preset efficient_realtime \
+  --host 0.0.0.0 \
+  --port 7860
+```
+
+`normal` uses the standard Warp-as-History inference recipe and is the
+recommended browser mode when quality matters more than latency.
+`efficient_realtime` uses the released efficient LoRA at
+`checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt`
+and matches the realtime web preset: `patch_mid`, `[1, 1, 1]` inference steps,
+no first-chunk amplification, `matmul_precision=high`, disabled progress bars,
+visible-token threshold `0.6`, `target_fill` camera warp, `camera_pi3_pixel_limit=130000`,
+`camera_mesh_samples_per_axis=2`, full TAEHV VAE from `checkpoints/taehv/taew2_1.pth`,
+official kernels, optional attention, and pipeline preload.
+
+Open the printed URL, upload a first frame, enter a prompt, select translation
+and rotation buttons, then click Start. The server keeps the autoregressive
+state alive between Start clicks. Generated mp4 files are written under
+`runs/web_realtime_demo` or `runs/web_realtime_demo_efficient_realtime` by default.
+
+<img src="assets/webcontrol_demo.gif" alt="WebControl demo" width="100%">
+
+## Realtime / H200 deployment
+
+This section targets the low-latency `efficient_realtime` path. For the
+higher-quality browser demo, use `--preset normal` as shown above.
+
+For realtime H200 deployment, first follow the upstream Helios performance
+setup and verify that the base Helios pipeline reaches about 20 FPS in your
+environment. Use the FlashAttention 3 kernel recommended by the Helios
+repository for Hopper/H200-class GPUs, set the pyramid inference steps from
+`[2, 2, 2]` to `[1, 1, 1]`, and disable first-chunk amplification.
+
+TAEHV code is vendored under `third_party/taehv`. For the `efficient_realtime`
+web preset, download the Wan 2.1 / Qwen Image style TAEHV checkpoint once:
+
+```bash
+mkdir -p checkpoints/taehv
+wget -O checkpoints/taehv/taew2_1.pth \
+  https://github.com/madebyollin/taehv/raw/main/taew2_1.pth
+```
+
+No extra web flags are needed; `--preset efficient_realtime` enables full TAEHV
+VAE automatically. For command-line inference, TAEHV remains optional and can be
+enabled with `--taehv_checkpoint checkpoints/taehv/taew2_1.pth`.
+
+Run the efficient realtime web demo with:
+
+```bash
+python scripts/web_realtime_demo.py \
+  --preset efficient_realtime \
+  --host 0.0.0.0 \
+  --port 7860
+```
+
+Run efficient realtime command-line inference with the matching LoRA:
+
+```bash
+python scripts/infer_warp_as_history.py data/demo/angel.csv \
+  --output runs/angel_h200_realtime.mp4 \
+  --lora_path checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt \
+  --warp_history_downsample_mode patch_mid \
+  --camera_realtime_fast_warp \
+  --pyramid_num_inference_steps_list 1 1 1 \
+  --no_amplify_first_chunk \
+  --enable_optional_attention
+```
+
+`--camera_realtime_fast_warp` switches camera conditioning to the tested
+realtime warp preset: `target_fill`, `camera_pi3_pixel_limit=130000`, and
+`camera_mesh_samples_per_axis=2`. Efficient `patch_mid` inference enables this
+preset by default; use `--no_camera_realtime_fast_warp` for the original
+high-quality camera warp defaults, or override the individual values explicitly.
+
+To train a matching efficient LoRA yourself instead of using the released
+checkpoint, see [Train efficient realtime LoRA](#train-efficient-realtime-lora).
+
+## Training
+
+Preview sampled training batches:
+
+```bash
+python scripts/dryrun_online_warp_batch.py
+```
+
+### Train standard LoRA
+
+```bash
+python scripts/train_warp_as_history_lora.py \
+  --prompt_csv data/training/training_data.csv \
+  --data_root data/training \
+  --output_dir runs/warp_as_history_lora \
+  --max_steps 1000 \
+  --save_every 1000 \
+  --log_every 10 \
+  --overwrite
+```
+
+### Train efficient realtime LoRA
+
+Train the optional efficient LoRA with `patch_mid` conditioning:
+
+```bash
+python scripts/train_warp_as_history_lora.py \
+  --prompt_csv data/training/training_data.csv \
+  --data_root data/training \
+  --output_dir runs/warp_as_history_lora_efficient \
+  --max_steps 1000 \
+  --save_every 1000 \
+  --log_every 10 \
+  --warp_history_downsample_mode patch_mid \
+  --overwrite
+```
+
+Use that LoRA for efficient inference by passing the same mode, for example:
+
+```bash
+python scripts/infer_warp_as_history.py demo.csv \
+  --lora_path runs/warp_as_history_lora_efficient/visible_lora_state.pt \
+  --warp_history_downsample_mode patch_mid
+```
+
+You can also download the released efficient checkpoint
+[`visible_lora_state_step1000_efficient_patchmid.pt`](https://huggingface.co/yyfz233/warp-as-history/blob/main/visible_lora_state_step1000_efficient_patchmid.pt)
+and pass it as `--lora_path checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt`.
+
+The training script writes `train_config.json`, `train_loss.json`,
+`visible_lora_state.pt`, and step checkpoints when `--save_every` is enabled.
+
+## GPU memory
+
+The numbers below were measured on a clean single GPU with Helios-Distilled,
+BF16, `384x640`, 33 frames, and no CPU/offload mode unless noted.
+
+| Run | Peak VRAM |
+| --- | ---: |
+| Original Helios I2V | 46.1 GB |
+| Warp-as-History with pre-rendered `warp_video_path` | 46.1 GB |
+| Warp-as-History with online `camera_poses_path` | 53.6 GB |
+| Helios-Mid LoRA training, 1 step | 48.7 GB |
+
+Pre-rendered warp inference has essentially the same memory footprint as the
+original Helios pipeline. Online camera inference is higher because Pi3X and
+the camera-warp renderer stay resident together with Helios. Helios' low-VRAM
+group-offloading mode is a different configuration and is not included in this
+table.
+
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@misc{wang2026warpashistorygeneralizablecameracontrolledvideo,
+      title={Warp-as-History: Generalizable Camera-Controlled Video Generation from One Training Video}, 
+      author={Yifan Wang and Tong He},
+      year={2026},
+      eprint={2605.15182},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2605.15182}, 
+}
+```
+
+## Acknowledgements
+
+We sincerely thank the authors of
+[Helios](https://github.com/PKU-YuanGroup/Helios) for releasing such an
+excellent open-source video generation model. Warp-as-History is built directly
+on top of Helios, and this work would not be possible without their model,
+codebase, and open research contribution.
+
+We also thank [TAEHV](https://github.com/madebyollin/taehv) for lightweight
+video VAE preview support used by the realtime demo.
+
+## License
+
+- Helios code and weights follow the upstream Helios license:
+  https://github.com/PKU-YuanGroup/Helios
+- Pi3X code and weights follow the upstream Pi3 license:
+  https://github.com/yyfz/Pi3
+- TAEHV code is vendored from https://github.com/madebyollin/taehv under the
+  MIT License; see [third_party/taehv/LICENSE](third_party/taehv/LICENSE).
+- Warp-as-History code authored in this repository is licensed under
+  Apache-2.0; see [LICENSE](LICENSE).
+- LoRA weights are released under CC BY-NC 4.0 and are strictly
+  non-commercial.
+- Some training/inference examples are derived from one publicly available video
+  sequence from the DAVIS Challenge dataset. The original DAVIS data is not
+  covered by this repository license and should be obtained from the official
+  DAVIS website: https://davischallenge.org/. Please follow the DAVIS dataset
+  terms and cite the corresponding DAVIS papers when using DAVIS-derived data.
