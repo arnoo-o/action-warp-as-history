@@ -1,31 +1,55 @@
 <div align="center">
 <h1>
-  Warp-as-History:
-  Generalizable Camera-Controlled Video Generation 
-  from <strong>One</strong> Training Video
+  action-warp-as-history
 </h1>
-<p class="eyebrow">Video History is More Than Context.</p>
-<p class="authors"><a href="https://yyfz.github.io/">Yifan Wang</a><sup>1,2</sup> and <a href="https://tonghe90.github.io/">Tong He</a><sup>2,3</sup></p>
-<p class="affiliations">
-  <span><sup>1</sup> Shanghai Jiao Tong University</span>
-  <span><sup>2</sup> Shanghai AI Laboratory</span>
-  <span><sup>3</sup> Shanghai Innovation Institute</span>
-</p>
+<p class="eyebrow">Warp-as-History + CS2 interaction-conditioned pseudo-history training.</p>
 <img src="assets/github_teaser.jpg" alt="Warp-as-History teaser" width="100%">
-<p>
-  <a href="https://arxiv.org/abs/2605.15182">
-    <img src="assets/paper_button.svg" alt="Paper" height="44">
-  </a>
-  <a href="https://yyfz.github.io/warp-as-history">
-    <img src="assets/demo_button.svg" alt="See More Demo" height="44">
-  </a>
-</p>
 </div>
 
 <div align="center">
-This repository provides the official implementation of Warp-as-History. Our method enables realtime interactive camera trajectory following and viewpoint manipulation, similar to HappyOyster and Genie 3, using only a single camera-annotated training example.
+This repository is a modified codebase built on top of Warp-as-History for CS2 gameplay data cleaning, interaction-aware pseudo-history injection, and lightweight LoRA training experiments.
 </div>
 
+## What This Repo Contains
+
+- The Warp-as-History codebase and its Helios/Pi3-related source code.
+- CS2-specific data cleaning and training scripts.
+- Interaction-conditioned pseudo-history injection for long-, mid-, and short-term history latents.
+- Safer training logic that removes the future-interaction fallback and future-keyframe leakage paths we identified during experimentation.
+
+## What This Repo Does Not Contain
+
+- Raw training videos and other large datasets.
+- Model checkpoints under `checkpoints/`.
+- Training outputs under `runs/` or logs under `logs/`.
+
+If you want to actually train or run inference, you still need to download the required model files and prepare the dataset locally.
+
+## Main Local Changes
+
+- `scripts/prepare_cs2_dataset.py`
+  - Builds `cs2_training.csv` and per-video `*_interaction_history.json` files from CS2 gameplay data.
+- `warp_as_history/training/data.py`
+  - Loads interaction-history JSON files.
+  - Summarizes long-/mid-/short-term interaction memory.
+  - Injects interaction pseudo-history into training items.
+  - Uses on-demand warp geometry preparation instead of full in-memory precompute.
+  - Removes future-keyframe conditioning and future-target fallback when history is empty.
+- `warp_as_history/training/core.py`
+  - Adds interaction pseudo-history latent injection.
+  - Keeps LoRA-only trainable parameter checks.
+- `scripts/train_warp_as_history_lora.py`
+  - Adds online CS2 training options and safer disk-cache behavior.
+- `scripts/run_remote_cs2_lora_train.sh`
+  - Remote launcher with explicit logging and disk-cache control.
+
+## Quick Start For This Modified Repo
+
+1. Install dependencies.
+2. Download the missing checkpoints and Pi3 source code.
+3. Prepare CS2 data with `scripts/prepare_cs2_dataset.py`.
+4. Run `scripts/check_models.py`.
+5. Train with `scripts/train_warp_as_history_lora.py` or `scripts/run_remote_cs2_lora_train.sh`.
 
 ## Installation
 
