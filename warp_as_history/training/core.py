@@ -382,37 +382,76 @@ def _action_vector_to_history_bias(vector, template, *, phase_shift=0.0):
 
 
 def inject_action_pseudo_history(histories, interaction_pseudo_history, args, device, seq=None):
-    if not bool(getattr(args, "online_interaction_pseudo_history", True)):
+    # Deprecated on purpose: interaction features should not be injected directly
+    # into history latents. Camera/warp history remains the conditioning pathway.
+    if bool(getattr(args, "online_interaction_pseudo_history", False)):
+        print(
+            json.dumps(
+                {
+                    "event": "interaction_pseudo_history_disabled",
+                    "seq": seq,
+                    "reason": "pseudo interaction latent injection removed in favor of warp/image-memory conditioning",
+                }
+            ),
+            flush=True,
+        )
+    return histories
+
+
+def inject_first_frame_image_memory(histories, image_latents, args, device, seq=None):
+    if not bool(getattr(args, "use_warp_as_history", False)):
         return histories
-    pseudo = interaction_pseudo_history or {}
-    scale = float(getattr(args, "online_interaction_pseudo_history_scale", 0.035))
-    if scale == 0.0:
+    if image_latents is None:
+        return histories
+    slots = max(0, int(getattr(args, "online_first_frame_memory_slots", 1) or 0))
+    if slots <= 0:
         return histories
 
-    segment_specs = [
-        ("latents_history_long", "long_term", 0.15),
-        ("latents_history_mid", "mid_term", 0.35),
-        ("latents_history_short", "short_term", 0.55),
-    ]
+    source = image_latents[:, :, :1].detach().to(device=device, dtype=torch.float32)
+    remaining = int(slots)
     applied = {}
-    for latent_key, pseudo_key, phase_shift in segment_specs:
+    for latent_key, mask_key in (
+        ("latents_history_long", "history_visible_mask_long"),
+        ("latents_history_mid", "history_visible_mask_mid"),
+    ):
         tensor = histories.get(latent_key)
-        if tensor is None:
+        if tensor is None or int(tensor.shape[2]) <= 0 or remaining <= 0:
             continue
-        vector = _action_feature_vector(pseudo.get(pseudo_key))
-        if float(vector.abs().sum().item()) == 0.0:
-            continue
-        bias = _action_vector_to_history_bias(vector, tensor, phase_shift=phase_shift)
-        histories[latent_key] = (tensor.to(dtype=torch.float32) + scale * bias.to(dtype=torch.float32)).to(
-            dtype=tensor.dtype
-        )
-        applied[pseudo_key] = {
-            "scale": scale,
-            "vector_l1": float(vector.abs().sum().item()),
-            "vector_nonzero": int((vector != 0).sum().item()),
-        }
+        fill = min(int(tensor.shape[2]), remaining)
+        updated = tensor.to(dtype=torch.float32)
+        updated[:, :, -fill:] = source.expand(updated.shape[0], updated.shape[1], fill, updated.shape[3], updated.shape[4])
+        histories[latent_key] = updated.to(dtype=tensor.dtype)
+
+        mask = histories.get(mask_key)
+        if mask is None:
+            mask = torch.zeros(
+                updated.shape[0],
+                1,
+                updated.shape[2],
+                updated.shape[3],
+                updated.shape[4],
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            mask = mask.to(device=device, dtype=torch.float32)
+        mask[:, :, -fill:] = 1.0
+        histories[mask_key] = mask
+        applied[latent_key] = fill
+        remaining -= fill
+
     if applied:
-        print(json.dumps({"event": "interaction_pseudo_history_injected", "seq": seq, "applied": applied}), flush=True)
+        print(
+            json.dumps(
+                {
+                    "event": "first_frame_image_memory_injected",
+                    "seq": seq,
+                    "requested_slots": int(slots),
+                    "applied_slots": applied,
+                }
+            ),
+            flush=True,
+        )
     return histories
 
 
@@ -1249,6 +1288,7 @@ def flow_matching_loss_train_exact(
     histories,
     args,
     device,
+    loss_focus_mask=None,
 ):
     stage_items = flow_matching_train_exact_items(pipe, target_latents, args, device)
     stage_losses = []
@@ -1306,6 +1346,19 @@ def flow_matching_loss_train_exact(
     for item, cur_model_pred, target, cur_sigmas in zip(stage_items, model_pred, targets, sigmas):
         stage_id = item["stage_id"]
         weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=cur_sigmas)
+        if loss_focus_mask is not None:
+            focus_mask = loss_focus_mask.to(device=target.device, dtype=torch.float32)
+            if focus_mask.shape[2:] != target.shape[2:]:
+                focus_mask = F.interpolate(
+                    focus_mask,
+                    size=(target.shape[2], target.shape[3], target.shape[4]),
+                    mode="trilinear",
+                    align_corners=False,
+                )
+            focus_scale = float(getattr(args, "online_primary_fire_focus_loss_scale", 0.0) or 0.0)
+            weighting = weighting.float() * (1.0 + focus_scale * focus_mask.float())
+            stats[f"focus_mask_mean_stage{stage_id}"] = focus_mask.detach().float().mean()
+            stats[f"focus_mask_max_stage{stage_id}"] = focus_mask.detach().float().max()
         stage_loss = torch.mean(
             (weighting.float() * (cur_model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
             1,
@@ -1332,6 +1385,7 @@ def flow_matching_loss(
     histories,
     args,
     device,
+    loss_focus_mask=None,
 ):
     return flow_matching_loss_train_exact(
         pipe,
@@ -1340,6 +1394,7 @@ def flow_matching_loss(
         histories,
         args,
         device,
+        loss_focus_mask=loss_focus_mask,
     )
 
 def lora_target_modules(args):

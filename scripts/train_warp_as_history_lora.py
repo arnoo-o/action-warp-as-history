@@ -207,8 +207,12 @@ def parse_args():
     parser.add_argument("--online_interaction_column", default="")
     parser.add_argument("--online_prompt_trigger", default="camctl23x.")
     parser.add_argument("--online_interaction_max_items", type=int, default=8)
-    parser.add_argument("--online_interaction_pseudo_history", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--online_interaction_pseudo_history_scale", type=float, default=0.035)
+    parser.add_argument("--online_interaction_pseudo_history", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--online_interaction_pseudo_history_scale", type=float, default=0.0)
+    parser.add_argument("--online_first_frame_memory_slots", type=int, default=1)
+    parser.add_argument("--online_primary_fire_click_radius_frames", type=int, default=12)
+    parser.add_argument("--online_primary_fire_residual_threshold", type=float, default=0.08)
+    parser.add_argument("--online_primary_fire_focus_loss_scale", type=float, default=3.0)
     parser.add_argument("--online_frame_stride", type=int, default=1)
     parser.add_argument("--online_max_video_frames", type=int, default=0)
     parser.add_argument("--online_warp_memory_cache_size", type=int, default=2)
@@ -278,6 +282,10 @@ def build_exact_args(args):
     exact.online_interaction_max_items = int(args.online_interaction_max_items)
     exact.online_interaction_pseudo_history = bool(args.online_interaction_pseudo_history)
     exact.online_interaction_pseudo_history_scale = float(args.online_interaction_pseudo_history_scale)
+    exact.online_first_frame_memory_slots = int(args.online_first_frame_memory_slots)
+    exact.online_primary_fire_click_radius_frames = int(args.online_primary_fire_click_radius_frames)
+    exact.online_primary_fire_residual_threshold = float(args.online_primary_fire_residual_threshold)
+    exact.online_primary_fire_focus_loss_scale = float(args.online_primary_fire_focus_loss_scale)
     exact.online_direction_augmentation = bool(args.direction_augmentation)
     exact.online_direction_reverse_prob = float(args.direction_reverse_probability)
     exact.online_frame_stride = int(args.online_frame_stride)
@@ -435,6 +443,7 @@ def main():
             item["histories"],
             exact_args,
             device,
+            loss_focus_mask=item.get("loss_focus_mask_latents"),
         )
         loss.backward()
         grad_norm = None

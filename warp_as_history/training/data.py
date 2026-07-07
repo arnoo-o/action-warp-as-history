@@ -37,6 +37,7 @@ ONLINE_VIDEO_COLUMNS = ("video", "video_url", "url", "video_path", "path")
 ONLINE_PROMPT_COLUMNS = ("prompt", "prompts", "caption", "text")
 ONLINE_INTERACTION_COLUMNS = ("interaction_history_path", "action_history_path", "frame_action_summary_path")
 ONLINE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+PRIMARY_FIRE_CHAR = "["
 
 
 def _online_infer_column(columns, requested, candidates, label):
@@ -282,6 +283,85 @@ def summarize_multiscale_action_pseudo_history(store, history_indices, target_in
         return result
 
     return {name: aggregate(indices) for name, indices in slices.items()}
+
+
+def extract_primary_fire_click_frames(store):
+    frame_features = {} if not store else dict(store.get("frame_features", {}) or {})
+    if not frame_features:
+        return []
+    click_frames = []
+    prev_pressed = False
+    for frame_idx in sorted(int(idx) for idx in frame_features.keys()):
+        action_text = str(frame_features.get(frame_idx, {}).get("actions_raw", "") or "")
+        pressed = PRIMARY_FIRE_CHAR in action_text
+        if pressed and not prev_pressed:
+            click_frames.append(int(frame_idx))
+        prev_pressed = pressed
+    return click_frames
+
+
+def build_primary_fire_click_supervision(store, target_indices, *, radius_frames=12):
+    target_indices = [int(idx) for idx in target_indices]
+    click_frames = extract_primary_fire_click_frames(store)
+    hit_frames = [frame for frame in click_frames if frame in set(target_indices)]
+    temporal_mask = [
+        1.0 if any(abs(int(frame_idx) - int(click_frame)) <= int(radius_frames) for click_frame in click_frames) else 0.0
+        for frame_idx in target_indices
+    ]
+    return {
+        "click_frames": click_frames,
+        "target_click_frames": hit_frames,
+        "target_has_click": bool(hit_frames),
+        "temporal_mask": temporal_mask,
+        "radius_frames": int(radius_frames),
+    }
+
+
+def build_primary_fire_focus_mask_frames(target_frames, warp_frames, supervision, *, residual_threshold=0.08):
+    temporal_mask = list(supervision.get("temporal_mask", []) or [])
+    if not temporal_mask or len(target_frames) != len(warp_frames):
+        return None, {}
+    mask_frames = []
+    active_frames = 0
+    active_pixels = 0.0
+    total_pixels = 0.0
+    for weight, target_frame, warp_frame in zip(temporal_mask, target_frames, warp_frames):
+        target_np = np.asarray(target_frame.convert("RGB"), dtype=np.float32) / 255.0
+        warp_np = np.asarray(warp_frame.convert("RGB"), dtype=np.float32) / 255.0
+        residual = np.abs(target_np - warp_np).mean(axis=2)
+        mask = (residual >= float(residual_threshold)).astype(np.float32)
+        if float(weight) <= 0.0:
+            mask *= 0.0
+        if mask.any():
+            active_frames += 1
+        active_pixels += float(mask.sum())
+        total_pixels += float(mask.size)
+        mask_frames.append(Image.fromarray((mask * 255.0).astype(np.uint8), mode="L"))
+    stats = {
+        "residual_threshold": float(residual_threshold),
+        "active_frame_count": int(active_frames),
+        "active_pixel_ratio": 0.0 if total_pixels <= 0 else float(active_pixels / total_pixels),
+    }
+    return mask_frames, stats
+
+
+def online_mask_frames_to_latent_mask(mask_frames, *, target_latents, num_frames, temporal_scale, device):
+    if not mask_frames:
+        return None
+    mask = np.stack([np.asarray(frame.convert("L"), dtype=np.float32) / 255.0 for frame in mask_frames], axis=0)
+    if mask.shape[0] < int(num_frames):
+        raise ValueError(f"Focus mask produced {mask.shape[0]} frames, need at least {int(num_frames)}.")
+    sampled_ids = np.arange(int(target_latents.shape[2]), dtype=np.int64) * int(temporal_scale)
+    sampled_ids = np.clip(sampled_ids, 0, mask.shape[0] - 1)
+    sampled = torch.from_numpy(mask[sampled_ids]).to(device=device, dtype=torch.float32)
+    sampled = sampled.unsqueeze(0).unsqueeze(0)
+    sampled = torch.nn.functional.interpolate(
+        sampled,
+        size=(int(target_latents.shape[2]), int(target_latents.shape[3]), int(target_latents.shape[4])),
+        mode="trilinear",
+        align_corners=False,
+    )
+    return sampled.clamp_(0.0, 1.0)
 
 
 def _online_is_uri(value):
@@ -699,10 +779,16 @@ class OnlineWarpTrainingCache:
             target_indices,
             max_items=int(getattr(self.exact_args, "online_interaction_max_items", 8)),
         )
-        interaction_pseudo_history = summarize_multiscale_action_pseudo_history(
+        primary_fire_supervision = build_primary_fire_click_supervision(
             self.interaction_histories.get(row_index),
-            history_indices,
             target_indices,
+            radius_frames=int(getattr(self.exact_args, "online_primary_fire_click_radius_frames", 12)),
+        )
+        focus_mask_frames, focus_mask_stats = build_primary_fire_focus_mask_frames(
+            [frames[idx] for idx in target_indices],
+            warp_frames,
+            primary_fire_supervision,
+            residual_threshold=float(getattr(self.exact_args, "online_primary_fire_residual_threshold", 0.08)),
         )
         seq = f"{row['id']}:{direction}:{chunk_mode}:{int(prepare_index)}"
         result = {
@@ -727,12 +813,13 @@ class OnlineWarpTrainingCache:
                 "warp_render_stats": rendered.get("warp_render_stats", {}),
                 "interaction_history_text": interaction_memory.get("merged", ""),
                 "interaction_memory": interaction_memory,
-                "interaction_pseudo_history": interaction_pseudo_history,
+                "primary_fire_supervision": primary_fire_supervision,
+                "focus_mask_stats": focus_mask_stats,
             },
             "interaction_history_text": interaction_memory.get("merged", ""),
             "interaction_memory": interaction_memory,
-            "interaction_pseudo_history": interaction_pseudo_history,
-            "prompt": compose_action_conditioned_prompt(row["prompt"], interaction_memory),
+            "primary_fire_supervision": primary_fire_supervision,
+            "prompt": row["prompt"],
             "prompt_base": row["prompt"],
             "prompt_raw": row.get("prompt_raw", row["prompt"]),
             "row": row,
@@ -741,6 +828,7 @@ class OnlineWarpTrainingCache:
             "target_indices": target_indices,
             "warp_frames": warp_frames,
             "warp_mask_frames": warp_mask_frames,
+            "focus_mask_frames": focus_mask_frames,
         }
         del rendered, warp_video, warp_mask, geometry, poses
         self.renderer._pi3x_runtime = None
@@ -828,6 +916,7 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
     had_extra_mask = hasattr(exact_args, "history_visibility_extra_mask_frames")
     old_extra_mask = getattr(exact_args, "history_visibility_extra_mask_frames", None)
     exact_args.history_visibility_extra_mask_frames = mask_frames
+    loss_focus_mask_latents = None
 
     try:
         with torch.no_grad():
@@ -860,12 +949,13 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
                 video_latents=video_latents,
                 seq=seq,
             )
-            histories = opt.inject_action_pseudo_history(
-                histories,
-                case.get("interaction_pseudo_history"),
-                exact_args,
-                device,
-                seq=seq,
+            histories = opt.inject_first_frame_image_memory(histories, image_latents, exact_args, device, seq=seq)
+            loss_focus_mask_latents = online_mask_frames_to_latent_mask(
+                case.get("focus_mask_frames"),
+                target_latents=target_latents,
+                num_frames=int(exact_args.num_frames),
+                temporal_scale=int(pipe.vae_scale_factor_temporal),
+                device=device,
             )
     finally:
         _restore_optional_attr(exact_args, "history_visibility_extra_mask_frames", had_extra_mask, old_extra_mask)
@@ -880,7 +970,8 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
         "prompt_cache_status": prompt_cache_status,
         "training": case["metadata"],
         "interaction_memory": case.get("interaction_memory"),
-        "interaction_pseudo_history": case.get("interaction_pseudo_history"),
+        "primary_fire_supervision": case.get("primary_fire_supervision"),
+        "loss_focus_mask_latents": None if loss_focus_mask_latents is None else loss_focus_mask_latents.detach(),
     }
     if keep_frames:
         item["target_frames"] = [frame.resize((exact_args.width, exact_args.height)) for frame in target_frames]

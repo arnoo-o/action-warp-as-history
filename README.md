@@ -2,19 +2,19 @@
 <h1>
   action-warp-as-history
 </h1>
-<p class="eyebrow">Warp-as-History + CS2 interaction-conditioned pseudo-history training.</p>
+<p class="eyebrow">Warp-as-History + CS2 primary-fire-focused warp/image-memory training.</p>
 <img src="assets/github_teaser.jpg" alt="Warp-as-History teaser" width="100%">
 </div>
 
 <div align="center">
-This repository is a modified codebase built on top of Warp-as-History for CS2 gameplay data cleaning, interaction-aware pseudo-history injection, and lightweight LoRA training experiments.
+This repository is a modified codebase built on top of Warp-as-History for CS2 gameplay data cleaning, warp/image-memory conditioning, and lightweight LoRA training experiments.
 </div>
 
 ## What This Repo Contains
 
 - The Warp-as-History codebase and its Helios/Pi3-related source code.
 - CS2-specific data cleaning and training scripts.
-- Interaction-conditioned pseudo-history injection for long-, mid-, and short-term history latents.
+- CS2-specific warp/image-memory training utilities for action-heavy gameplay clips.
 - Safer training logic that removes the future-interaction fallback and future-keyframe leakage paths we identified during experimentation.
 
 ## What This Repo Does Not Contain
@@ -31,17 +31,21 @@ If you want to actually train or run inference, you still need to download the r
   - Builds `cs2_training.csv` and per-video `*_interaction_history.json` files from CS2 gameplay data.
 - `warp_as_history/training/data.py`
   - Loads interaction-history JSON files.
-  - Summarizes long-/mid-/short-term interaction memory.
-  - Injects interaction pseudo-history into training items.
+  - Keeps the base prompt clean instead of appending action text.
+  - Builds primary-fire click supervision and warp-vs-target residual focus masks.
   - Uses on-demand warp geometry preparation instead of full in-memory precompute.
   - Removes future-keyframe conditioning and future-target fallback when history is empty.
 - `warp_as_history/training/core.py`
-  - Adds interaction pseudo-history latent injection.
+  - Disables direct pseudo-action latent injection.
+  - Injects first-frame image latents into warp history memory slots for point-cloud/image complementarity.
+  - Adds fire-focused loss weighting on top of the original Warp-as-History objective.
   - Keeps LoRA-only trainable parameter checks.
 - `scripts/train_warp_as_history_lora.py`
-  - Adds online CS2 training options and safer disk-cache behavior.
+  - Adds online CS2 training options, first-frame memory slots, and primary-fire focus-loss controls.
+- `scripts/prepare_cs2_primary_fire_chunks.py`
+  - Extracts >=20s MP4/parquet chunks around left-click primary-fire events while preserving frame alignment.
 - `scripts/run_remote_cs2_lora_train.sh`
-  - Remote launcher with explicit logging and disk-cache control.
+  - Remote launcher with explicit logging, first-frame memory settings, and fire-focused training knobs.
 
 ## Quick Start For This Modified Repo
 
