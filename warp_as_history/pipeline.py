@@ -931,6 +931,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             if loaded_path is not None:
                 self._delete_wah_adapter()
             self.load_lora_weights(adapter_path, adapter_name=self._wah_adapter_name)
+            self._apply_wah_extra_state(lora_path)
             self._wah_loaded_lora_path = lora_path
 
         if hasattr(self, "set_adapters"):
@@ -979,6 +980,30 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             str(materialized),
         )
         return str(materialized)
+
+    def _apply_wah_extra_state(self, lora_path: str | Path) -> None:
+        path = Path(lora_path).expanduser().resolve()
+        if path.suffix == ".safetensors" or not path.is_file():
+            return
+        loaded = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(loaded, dict):
+            return
+        extra_state = loaded.get("extra_state")
+        if not isinstance(extra_state, dict):
+            return
+        history_invisible_token = extra_state.get("history_invisible_token")
+        if torch.is_tensor(history_invisible_token):
+            if getattr(self.transformer, "history_invisible_token", None) is None:
+                self.transformer.register_parameter(
+                    "history_invisible_token",
+                    torch.nn.Parameter(history_invisible_token.to(device=self.transformer.device)),
+                )
+            else:
+                self.transformer.history_invisible_token.data.copy_(history_invisible_token.to(self.transformer.device))
+        target_channel_fusion_state = extra_state.get("target_channel_fusion_mlp")
+        if isinstance(target_channel_fusion_state, dict):
+            self.transformer.enable_target_channel_fusion()
+            self.transformer.target_channel_fusion_mlp.load_state_dict(target_channel_fusion_state, strict=True)
 
     def _get_camera_warp_renderer(
         self,
@@ -1404,6 +1429,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         camera_control_pi3_pixel_limit: int = CAMERA_CONTROL_PI3_PIXEL_LIMIT,
         camera_control_mesh_samples_per_axis: int = CAMERA_CONTROL_MESH_SAMPLES_PER_AXIS,
         camera_control_pi3x_keyframe_memory: bool = CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY,
+        primary_fire_event_latents: torch.Tensor | None = None,
+        use_primary_fire_event_condition: bool = False,
         return_warp_debug: bool = False,
         warp_debug_dir: str | Path | None = None,
         warp_debug_fps: int = 16,
@@ -1426,6 +1453,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
 
         normalized_lora_path = _normalize_optional_lora_path(lora_path)
         lora_active = self._configure_wah_lora(normalized_lora_path)
+        if bool(use_primary_fire_event_condition) and getattr(self.transformer, "target_channel_fusion_mlp", None) is None:
+            self.transformer.enable_target_channel_fusion()
         if lora_prompt_embeds is not None and lora_prompt_embeds.shape[0] != 1:
             raise ValueError("WarpAsHistoryPipeline currently supports lora_prompt_embeds batch size 1.")
         if lora_prompt_embeds is not None and not lora_active:
@@ -1645,6 +1674,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 "warp_debug_dir": str(Path(warp_debug_dir).expanduser()) if warp_debug_dir is not None else None,
                 "warp_debug_fps": int(warp_debug_fps),
                 "warp_debug_chunks": {},
+                "primary_fire_event_latents": primary_fire_event_latents,
+                "use_primary_fire_event_condition": bool(use_primary_fire_event_condition),
             }
         )
 
@@ -2158,6 +2189,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         camera_control_pi3_pixel_limit: int = CAMERA_CONTROL_PI3_PIXEL_LIMIT,
         camera_control_mesh_samples_per_axis: int = CAMERA_CONTROL_MESH_SAMPLES_PER_AXIS,
         camera_control_pi3x_keyframe_memory: bool = CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY,
+        primary_fire_event_latents: torch.Tensor | None = None,
+        use_primary_fire_event_condition: bool = False,
         return_warp_debug: bool = False,
         warp_debug_dir: str | Path | None = None,
         warp_debug_fps: int = 16,
@@ -2249,6 +2282,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             camera_control_pi3_pixel_limit=max(int(camera_control_pi3_pixel_limit), 1),
             camera_control_mesh_samples_per_axis=max(int(camera_control_mesh_samples_per_axis), 1),
             camera_control_pi3x_keyframe_memory=bool(camera_control_pi3x_keyframe_memory),
+            primary_fire_event_latents=primary_fire_event_latents,
+            use_primary_fire_event_condition=bool(use_primary_fire_event_condition),
             return_warp_debug=bool(return_warp_debug),
             warp_debug_dir=warp_debug_dir,
             warp_debug_fps=int(warp_debug_fps),
@@ -2519,6 +2554,38 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                         current_history_visible_mask_short = None
                         current_history_visible_mask_mid = None
                         current_history_visible_mask_long = None
+                    current_target_channel_fusion_latents = None
+                    if bool(state.get("use_primary_fire_event_condition", False)):
+                        current_target_channel_fusion_latents = state.get("primary_fire_event_latents")
+                        if current_target_channel_fusion_latents is not None and (
+                            int(current_target_channel_fusion_latents.shape[-2]) != int(latents.shape[-2])
+                            or int(current_target_channel_fusion_latents.shape[-1]) != int(latents.shape[-1])
+                        ):
+                            batch_size_now, channels_now, frames_now = (
+                                int(current_target_channel_fusion_latents.shape[0]),
+                                int(current_target_channel_fusion_latents.shape[1]),
+                                int(current_target_channel_fusion_latents.shape[2]),
+                            )
+                            current_target_channel_fusion_latents = current_target_channel_fusion_latents.permute(
+                                0, 2, 1, 3, 4
+                            ).reshape(
+                                batch_size_now * frames_now,
+                                channels_now,
+                                int(current_target_channel_fusion_latents.shape[-2]),
+                                int(current_target_channel_fusion_latents.shape[-1]),
+                            )
+                            current_target_channel_fusion_latents = F.interpolate(
+                                current_target_channel_fusion_latents,
+                                size=(int(latents.shape[-2]), int(latents.shape[-1])),
+                                mode="nearest",
+                            )
+                            current_target_channel_fusion_latents = current_target_channel_fusion_latents.reshape(
+                                batch_size_now,
+                                frames_now,
+                                channels_now,
+                                int(latents.shape[-2]),
+                                int(latents.shape[-1]),
+                            ).permute(0, 2, 1, 3, 4)
 
                     timestep = t.expand(latents.shape[0]).to(torch.int64)
                     model_latents = latents.to(transformer_dtype)
@@ -2547,6 +2614,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                             history_visible_mask_short=current_history_visible_mask_short,
                             history_visible_mask_mid=current_history_visible_mask_mid,
                             history_visible_mask_long=current_history_visible_mask_long,
+                            target_channel_fusion_latents=_optional_to_dtype(
+                                current_target_channel_fusion_latents, transformer_dtype
+                            ),
                         )[0]
 
                     if self.do_classifier_free_guidance:
@@ -2571,6 +2641,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                                 history_visible_mask_short=current_history_visible_mask_short,
                                 history_visible_mask_mid=current_history_visible_mask_mid,
                                 history_visible_mask_long=current_history_visible_mask_long,
+                                target_channel_fusion_latents=_optional_to_dtype(
+                                    current_target_channel_fusion_latents, transformer_dtype
+                                ),
                             )[0]
 
                         if self.config.is_cfg_zero_star:

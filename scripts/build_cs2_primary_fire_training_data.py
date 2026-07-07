@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-frames", type=int, default=33)
     parser.add_argument("--summary-stride", type=int, default=12)
     parser.add_argument("--top-tokens", type=int, default=6)
+    parser.add_argument("--pre-fire-frames", type=int, default=16)
+    parser.add_argument("--post-fire-frames", type=int, default=24)
     parser.add_argument("--max-folders", type=int, default=0)
     parser.add_argument("--max-videos-per-folder", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
@@ -304,6 +306,40 @@ def main() -> None:
                     },
                 }
                 out_json.write_text(json.dumps(cleaned_payload, ensure_ascii=False), encoding="utf-8")
+                clip_clicks = [int(x) for x in click_frames if int(start_frame) <= x < int(end_frame)]
+                time_mask = [0.0] * int(len(clipped_frame_data))
+                event_windows = []
+                for click_frame_source in clip_clicks:
+                    local_click = int(click_frame_source) - int(start_frame)
+                    window_start = max(0, local_click - int(args.pre_fire_frames))
+                    window_end = min(len(clipped_frame_data), local_click + int(args.post_fire_frames) + 1)
+                    event_windows.append(
+                        {
+                            "click_frame_local": int(local_click),
+                            "window_start": int(window_start),
+                            "window_end_exclusive": int(window_end),
+                        }
+                    )
+                    for idx in range(window_start, window_end):
+                        time_mask[idx] = 1.0
+                out_event_json = cleaned_dir / f"{clip_id}_primary_fire_event.json"
+                out_event_json.write_text(
+                    json.dumps(
+                        {
+                            "clip_id": clip_id,
+                            "fps": fps,
+                            "num_frames": int(len(clipped_frame_data)),
+                            "click_frames": clip_clicks,
+                            "click_frames_local": [int(x) - int(start_frame) for x in clip_clicks],
+                            "event_windows": event_windows,
+                            "source_frame_indices": [int(start_frame) + idx for idx in range(len(clipped_frame_data))],
+                            "time_mask": time_mask,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
 
                 rows.append(
                     {
@@ -315,6 +351,10 @@ def main() -> None:
                         "round_number": int(row["round_number"]),
                         "num_frames": int(len(clipped_frame_data)),
                         "fps": fps,
+                        "primary_fire_event_path": repo_relative_text(out_event_json),
+                        "primary_fire_loss_mask_path": "",
+                        "warp_video_path": "",
+                        "warp_visibility_mask_path": "",
                     }
                 )
                 manifest_rows.append(
@@ -325,6 +365,7 @@ def main() -> None:
                         "video_path": repo_relative_text(out_mp4),
                         "parquet_path": repo_relative_text(out_parquet),
                         "interaction_history_path": repo_relative_text(out_json),
+                        "primary_fire_event_path": repo_relative_text(out_event_json),
                         "start_frame": int(start_frame),
                         "end_frame_exclusive": int(end_frame),
                         "num_frames": int(len(clipped_frame_data)),
@@ -340,7 +381,20 @@ def main() -> None:
     with training_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["id", "video_path", "prompt", "interaction_history_path", "map", "round_number", "num_frames", "fps"],
+            fieldnames=[
+                "id",
+                "video_path",
+                "prompt",
+                "interaction_history_path",
+                "map",
+                "round_number",
+                "num_frames",
+                "fps",
+                "primary_fire_event_path",
+                "primary_fire_loss_mask_path",
+                "warp_video_path",
+                "warp_visibility_mask_path",
+            ],
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -349,7 +403,19 @@ def main() -> None:
     with manifest_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["id", "source_dir", "source_video", "video_path", "parquet_path", "interaction_history_path", "start_frame", "end_frame_exclusive", "num_frames", "duration_s"],
+            fieldnames=[
+                "id",
+                "source_dir",
+                "source_video",
+                "video_path",
+                "parquet_path",
+                "interaction_history_path",
+                "primary_fire_event_path",
+                "start_frame",
+                "end_frame_exclusive",
+                "num_frames",
+                "duration_s",
+            ],
         )
         writer.writeheader()
         writer.writerows(manifest_rows)

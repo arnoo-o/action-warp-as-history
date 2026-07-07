@@ -398,63 +398,6 @@ def inject_action_pseudo_history(histories, interaction_pseudo_history, args, de
     return histories
 
 
-def inject_first_frame_image_memory(histories, image_latents, args, device, seq=None):
-    if not bool(getattr(args, "use_warp_as_history", False)):
-        return histories
-    if image_latents is None:
-        return histories
-    slots = max(0, int(getattr(args, "online_first_frame_memory_slots", 1) or 0))
-    if slots <= 0:
-        return histories
-
-    source = image_latents[:, :, :1].detach().to(device=device, dtype=torch.float32)
-    remaining = int(slots)
-    applied = {}
-    for latent_key, mask_key in (
-        ("latents_history_long", "history_visible_mask_long"),
-        ("latents_history_mid", "history_visible_mask_mid"),
-    ):
-        tensor = histories.get(latent_key)
-        if tensor is None or int(tensor.shape[2]) <= 0 or remaining <= 0:
-            continue
-        fill = min(int(tensor.shape[2]), remaining)
-        updated = tensor.to(dtype=torch.float32)
-        updated[:, :, -fill:] = source.expand(updated.shape[0], updated.shape[1], fill, updated.shape[3], updated.shape[4])
-        histories[latent_key] = updated.to(dtype=tensor.dtype)
-
-        mask = histories.get(mask_key)
-        if mask is None:
-            mask = torch.zeros(
-                updated.shape[0],
-                1,
-                updated.shape[2],
-                updated.shape[3],
-                updated.shape[4],
-                device=device,
-                dtype=torch.float32,
-            )
-        else:
-            mask = mask.to(device=device, dtype=torch.float32)
-        mask[:, :, -fill:] = 1.0
-        histories[mask_key] = mask
-        applied[latent_key] = fill
-        remaining -= fill
-
-    if applied:
-        print(
-            json.dumps(
-                {
-                    "event": "first_frame_image_memory_injected",
-                    "seq": seq,
-                    "requested_slots": int(slots),
-                    "applied_slots": applied,
-                }
-            ),
-            flush=True,
-        )
-    return histories
-
-
 def remap_history_rope_indices(
     indices_latents_history_long,
     indices_latents_history_mid,
@@ -1111,7 +1054,18 @@ def visible_aux_state_dict(transformer):
     token = getattr(transformer, "history_invisible_token", None)
     if token is not None:
         state["history_invisible_token"] = token.detach().cpu()
+    target_channel_fusion_mlp = getattr(transformer, "target_channel_fusion_mlp", None)
+    if target_channel_fusion_mlp is not None:
+        state["target_channel_fusion_mlp"] = {
+            key: value.detach().cpu() for key, value in target_channel_fusion_mlp.state_dict().items()
+        }
     return state
+
+
+def ensure_target_channel_fusion(transformer):
+    if getattr(transformer, "target_channel_fusion_mlp", None) is None:
+        transformer.enable_target_channel_fusion()
+    return transformer.target_channel_fusion_mlp
 
 def downsample_latents_spatial_bilinear(latents, height, width, scale=1.0):
     batch_size, channels, latent_frames, _, _ = latents.shape
@@ -1289,6 +1243,7 @@ def flow_matching_loss_train_exact(
     args,
     device,
     loss_focus_mask=None,
+    target_channel_fusion_latents=None,
 ):
     stage_items = flow_matching_train_exact_items(pipe, target_latents, args, device)
     stage_losses = []
@@ -1332,7 +1287,11 @@ def flow_matching_loss_train_exact(
         prompt_embeds,
         histories,
         attention_kwargs=attention_kwargs,
-        target_channel_fusion_latents=None,
+        target_channel_fusion_latents=(
+            training_exact_pyramid_latents(target_channel_fusion_latents, len(stage_items))
+            if target_channel_fusion_latents is not None
+            else None
+        ),
         is_first_denoising_step=False,
     )
     if not isinstance(model_pred, list):
@@ -1356,13 +1315,26 @@ def flow_matching_loss_train_exact(
                     align_corners=False,
                 )
             focus_scale = float(getattr(args, "online_primary_fire_focus_loss_scale", 0.0) or 0.0)
-            weighting = weighting.float() * (1.0 + focus_scale * focus_mask.float())
-            stats[f"focus_mask_mean_stage{stage_id}"] = focus_mask.detach().float().mean()
-            stats[f"focus_mask_max_stage{stage_id}"] = focus_mask.detach().float().max()
-        stage_loss = torch.mean(
-            (weighting.float() * (cur_model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
-            1,
-        ).mean()
+            background_scale = float(getattr(args, "online_primary_fire_background_loss_scale", 1.0) or 1.0)
+            if bool(getattr(args, "use_primary_fire_focus_loss", False)) and float(focus_mask.max()) > 0.0:
+                weighting = weighting.float() * (
+                    background_scale + focus_mask.float() * max(0.0, focus_scale - background_scale)
+                )
+                stats[f"focus_mask_mean_stage{stage_id}"] = focus_mask.detach().float().mean()
+                stats[f"focus_mask_max_stage{stage_id}"] = focus_mask.detach().float().max()
+            elif bool(getattr(args, "use_primary_fire_focus_loss", False)):
+                stats[f"focus_mask_warning_stage{stage_id}"] = "empty_mask_fallback"
+        loss_map = weighting.float() * (cur_model_pred.float() - target.float()) ** 2
+        stage_loss = torch.mean(loss_map.reshape(target.shape[0], -1), 1).mean()
+        if loss_focus_mask is not None and bool(getattr(args, "use_primary_fire_focus_loss", False)):
+            mask_now = focus_mask.float()
+            if float(mask_now.max()) > 0.0:
+                focus_den = mask_now.sum().clamp_min(1.0)
+                bg_mask = 1.0 - mask_now
+                bg_den = bg_mask.sum().clamp_min(1.0)
+                stats[f"focus_loss_stage{stage_id}"] = (loss_map * mask_now).sum().detach() / focus_den
+                stats[f"background_loss_stage{stage_id}"] = (loss_map * bg_mask).sum().detach() / bg_den
+                stats[f"mask_coverage_stage{stage_id}"] = mask_now.detach().mean()
         stage_losses.append(stage_loss)
         stats[f"flow_mse_stage{stage_id}"] = stage_loss.detach()
         stats[f"target_flow_norm_stage{stage_id}"] = target.float().square().mean().sqrt().detach()
@@ -1386,6 +1358,7 @@ def flow_matching_loss(
     args,
     device,
     loss_focus_mask=None,
+    target_channel_fusion_latents=None,
 ):
     return flow_matching_loss_train_exact(
         pipe,
@@ -1395,6 +1368,7 @@ def flow_matching_loss(
         args,
         device,
         loss_focus_mask=loss_focus_mask,
+        target_channel_fusion_latents=target_channel_fusion_latents,
     )
 
 def lora_target_modules(args):
@@ -1424,6 +1398,15 @@ def setup_visible_lora(transformer, args, seq):
         transformer.eval()
     trainable = []
     trainable_ids = set()
+    if bool(getattr(args, "use_primary_fire_event_condition", False)):
+        target_channel_fusion_mlp = ensure_target_channel_fusion(transformer)
+        target_channel_fusion_mlp.requires_grad_(optimize_lora_now)
+        for param in target_channel_fusion_mlp.parameters():
+            if optimize_lora_now:
+                param.data = param.data.float()
+            if id(param) not in trainable_ids:
+                trainable.append(param)
+                trainable_ids.add(id(param))
     if using_history_invisible_token(args):
         token = ensure_history_invisible_token(transformer)
         token.requires_grad_(optimize_lora_now)
@@ -1452,11 +1435,18 @@ def setup_visible_lora(transformer, args, seq):
         "lora_target_modules": lora_target_modules(args),
         "lora_trainable_params": int(sum(p.numel() for p in trainable)),
         "history_invisible_token_mode": str(getattr(args, "history_invisible_token_mode", "none") or "none"),
+        "use_primary_fire_event_condition": bool(getattr(args, "use_primary_fire_event_condition", False)),
     }
     return adapter_name, trainable, stats
 
 
-def assert_lora_only_trainable(transformer, trainable, *, allow_history_invisible_token=True):
+def assert_lora_only_trainable(
+    transformer,
+    trainable,
+    *,
+    allow_history_invisible_token=True,
+    allow_target_channel_fusion=False,
+):
     trainable_ids = {id(param) for param in trainable}
     unexpected = []
     for name, param in transformer.named_parameters():
@@ -1465,6 +1455,8 @@ def assert_lora_only_trainable(transformer, trainable, *, allow_history_invisibl
         if ".lora_" in name:
             continue
         if allow_history_invisible_token and name == "history_invisible_token":
+            continue
+        if allow_target_channel_fusion and name.startswith("target_channel_fusion_mlp."):
             continue
         unexpected.append(name)
     if unexpected:

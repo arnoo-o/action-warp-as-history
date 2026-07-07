@@ -2,19 +2,19 @@
 <h1>
   action-warp-as-history
 </h1>
-<p class="eyebrow">Warp-as-History + CS2 primary-fire-focused warp/image-memory training.</p>
+<p class="eyebrow">Warp-as-History + CS2 primary-fire-focused warp conditioning.</p>
 <img src="assets/github_teaser.jpg" alt="Warp-as-History teaser" width="100%">
 </div>
 
 <div align="center">
-This repository is a modified codebase built on top of Warp-as-History for CS2 gameplay data cleaning, warp/image-memory conditioning, and lightweight LoRA training experiments.
+This repository is a modified codebase built on top of Warp-as-History for CS2 gameplay data cleaning, warp conditioning, and lightweight LoRA training experiments.
 </div>
 
 ## What This Repo Contains
 
 - The Warp-as-History codebase and its Helios/Pi3-related source code.
 - CS2-specific data cleaning and training scripts.
-- CS2-specific warp/image-memory training utilities for action-heavy gameplay clips.
+- CS2-specific warp-conditioned training utilities for action-heavy gameplay clips.
 - Safer training logic that removes the future-interaction fallback and future-keyframe leakage paths we identified during experimentation.
 
 ## What This Repo Does Not Contain
@@ -37,15 +37,14 @@ If you want to actually train or run inference, you still need to download the r
   - Removes future-keyframe conditioning and future-target fallback when history is empty.
 - `warp_as_history/training/core.py`
   - Disables direct pseudo-action latent injection.
-  - Injects first-frame image latents into warp history memory slots for point-cloud/image complementarity.
   - Adds fire-focused loss weighting on top of the original Warp-as-History objective.
   - Keeps LoRA-only trainable parameter checks.
 - `scripts/train_warp_as_history_lora.py`
-  - Adds online CS2 training options, first-frame memory slots, and primary-fire focus-loss controls.
+  - Adds online CS2 training options and primary-fire focus-loss / event-condition controls.
 - `scripts/prepare_cs2_primary_fire_chunks.py`
   - Extracts >=20s MP4/parquet chunks around left-click primary-fire events while preserving frame alignment.
 - `scripts/run_remote_cs2_lora_train.sh`
-  - Remote launcher with explicit logging, first-frame memory settings, and fire-focused training knobs.
+  - Remote launcher with explicit logging and fire-focused training knobs.
 
 ## Quick Start For This Modified Repo
 

@@ -36,6 +36,8 @@ from warp_as_history.training.utils import detach_tree
 ONLINE_VIDEO_COLUMNS = ("video", "video_url", "url", "video_path", "path")
 ONLINE_PROMPT_COLUMNS = ("prompt", "prompts", "caption", "text")
 ONLINE_INTERACTION_COLUMNS = ("interaction_history_path", "action_history_path", "frame_action_summary_path")
+ONLINE_PRIMARY_FIRE_EVENT_COLUMNS = ("primary_fire_event_path",)
+ONLINE_PRIMARY_FIRE_MASK_COLUMNS = ("primary_fire_loss_mask_path",)
 ONLINE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 PRIMARY_FIRE_CHAR = "["
 
@@ -76,6 +78,8 @@ def normalize_online_training_dataframe(df, exact_args):
         "prompt",
     )
     prompt_trigger = str(getattr(exact_args, "online_prompt_trigger", CAMERA_CONTROL_PROMPT_TRIGGER) or "")
+    event_column = _online_optional_column(columns, "", ONLINE_PRIMARY_FIRE_EVENT_COLUMNS)
+    loss_mask_column = _online_optional_column(columns, "", ONLINE_PRIMARY_FIRE_MASK_COLUMNS)
     rows = []
     for row_index, (_, row) in enumerate(df.iterrows()):
         base = row.to_dict()
@@ -85,12 +89,18 @@ def normalize_online_training_dataframe(df, exact_args):
         base["video_path"] = str(base[video_column])
         base["prompt_raw"] = raw_prompt
         base["prompt"] = add_online_prompt_trigger(raw_prompt, prompt_trigger)
+        if event_column:
+            base["primary_fire_event_path"] = base.get(event_column, "")
+        if loss_mask_column:
+            base["primary_fire_loss_mask_path"] = base.get(loss_mask_column, "")
         rows.append(base)
     normalized = df.__class__(rows)
     meta = {
         "video_column": video_column,
         "prompt_column": prompt_column,
         "prompt_trigger": prompt_trigger,
+        "primary_fire_event_column": event_column,
+        "primary_fire_loss_mask_column": loss_mask_column,
         "rows": len(rows),
     }
     return normalized, meta
@@ -103,6 +113,23 @@ def _online_optional_column(columns, requested, candidates):
         if name in columns:
             return name
     return None
+
+
+def _normalize_frame_to_latent_mapping(num_frames, latent_frames, temporal_scale):
+    mapping = []
+    for latent_idx in range(int(latent_frames)):
+        start = int(latent_idx) * int(temporal_scale)
+        end = min(int(num_frames), start + int(temporal_scale))
+        if end <= start:
+            end = min(int(num_frames), start + 1)
+        mapping.append(
+            {
+                "latent_index": int(latent_idx),
+                "frame_start": int(start),
+                "frame_end_exclusive": int(end),
+            }
+        )
+    return mapping
 
 
 def _load_interaction_history_store(path):
@@ -362,6 +389,47 @@ def online_mask_frames_to_latent_mask(mask_frames, *, target_latents, num_frames
         align_corners=False,
     )
     return sampled.clamp_(0.0, 1.0)
+
+
+def load_primary_fire_event_payload(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def load_primary_fire_loss_mask_frames(path):
+    array = np.load(path)
+    if array.ndim != 3:
+        raise ValueError(f"Expected primary_fire_loss_mask.npy with shape [T,H,W], got {array.shape}")
+    array = np.clip(array.astype(np.float32), 0.0, 1.0)
+    return [Image.fromarray((frame * 255.0).astype(np.uint8), mode="L") for frame in array]
+
+
+def build_primary_fire_event_latents(*, event_payload, target_indices, target_latents, temporal_scale, device):
+    target_indices = [int(idx) for idx in target_indices]
+    latent_frames = int(target_latents.shape[2])
+    latent_height = int(target_latents.shape[3])
+    latent_width = int(target_latents.shape[4])
+    target_channels = int(target_latents.shape[1])
+
+    source_frame_indices = [int(x) for x in event_payload.get("source_frame_indices", target_indices)]
+    time_mask = event_payload.get("time_mask")
+    if time_mask is None:
+        click_frames = {int(x) for x in event_payload.get("click_frames", [])}
+        time_mask = [1.0 if int(idx) in click_frames else 0.0 for idx in source_frame_indices]
+    if len(source_frame_indices) != len(time_mask):
+        raise ValueError("primary_fire_event source_frame_indices and time_mask lengths must match.")
+    frame_weight_map = {int(src): float(weight) for src, weight in zip(source_frame_indices, time_mask)}
+    target_frame_weights = np.asarray([frame_weight_map.get(int(idx), 0.0) for idx in target_indices], dtype=np.float32)
+
+    mapping = _normalize_frame_to_latent_mapping(len(target_indices), latent_frames, temporal_scale)
+    latent_values = np.zeros(latent_frames, dtype=np.float32)
+    for item in mapping:
+        start = int(item["frame_start"])
+        end = int(item["frame_end_exclusive"])
+        latent_values[int(item["latent_index"])] = float(target_frame_weights[start:end].max()) if end > start else 0.0
+
+    latent_mask = torch.from_numpy(latent_values).to(device=device, dtype=torch.float32).view(1, 1, latent_frames, 1, 1)
+    latent_mask = latent_mask.expand(1, target_channels, latent_frames, latent_height, latent_width).contiguous()
+    return latent_mask, mapping
 
 
 def _online_is_uri(value):
@@ -779,17 +847,39 @@ class OnlineWarpTrainingCache:
             target_indices,
             max_items=int(getattr(self.exact_args, "online_interaction_max_items", 8)),
         )
-        primary_fire_supervision = build_primary_fire_click_supervision(
-            self.interaction_histories.get(row_index),
-            target_indices,
-            radius_frames=int(getattr(self.exact_args, "online_primary_fire_click_radius_frames", 12)),
-        )
-        focus_mask_frames, focus_mask_stats = build_primary_fire_focus_mask_frames(
-            [frames[idx] for idx in target_indices],
-            warp_frames,
-            primary_fire_supervision,
-            residual_threshold=float(getattr(self.exact_args, "online_primary_fire_residual_threshold", 0.08)),
-        )
+        event_path_raw = str(row.get("primary_fire_event_path", "") or "").strip()
+        loss_mask_path_raw = str(row.get("primary_fire_loss_mask_path", "") or "").strip()
+        event_payload = None
+        focus_mask_frames = None
+        focus_mask_stats = {}
+        if event_path_raw:
+            event_payload = load_primary_fire_event_payload(Path(getattr(self.exact_args, "data_root", ".")) / event_path_raw)
+            primary_fire_supervision = {
+                "click_frames": [int(x) for x in event_payload.get("click_frames", [])],
+                "target_click_frames": [
+                    int(x) for x in event_payload.get("click_frames", []) if int(x) in set(target_indices)
+                ],
+                "target_has_click": any(int(x) in set(target_indices) for x in event_payload.get("click_frames", [])),
+                "temporal_mask": list(event_payload.get("time_mask", [])),
+            }
+            if loss_mask_path_raw:
+                focus_mask_frames = load_primary_fire_loss_mask_frames(
+                    Path(getattr(self.exact_args, "data_root", ".")) / loss_mask_path_raw
+                )
+                focus_mask_stats = {"source": "precomputed_primary_fire_loss_mask"}
+        else:
+            primary_fire_supervision = build_primary_fire_click_supervision(
+                self.interaction_histories.get(row_index),
+                target_indices,
+                radius_frames=int(getattr(self.exact_args, "online_primary_fire_click_radius_frames", 12)),
+            )
+        if focus_mask_frames is None:
+            focus_mask_frames, focus_mask_stats = build_primary_fire_focus_mask_frames(
+                [frames[idx] for idx in target_indices],
+                warp_frames,
+                primary_fire_supervision,
+                residual_threshold=float(getattr(self.exact_args, "online_primary_fire_residual_threshold", 0.08)),
+            )
         seq = f"{row['id']}:{direction}:{chunk_mode}:{int(prepare_index)}"
         result = {
             "condition_frame": condition_frame,
@@ -814,11 +904,13 @@ class OnlineWarpTrainingCache:
                 "interaction_history_text": interaction_memory.get("merged", ""),
                 "interaction_memory": interaction_memory,
                 "primary_fire_supervision": primary_fire_supervision,
+                "primary_fire_event_payload": event_payload,
                 "focus_mask_stats": focus_mask_stats,
             },
             "interaction_history_text": interaction_memory.get("merged", ""),
             "interaction_memory": interaction_memory,
             "primary_fire_supervision": primary_fire_supervision,
+            "primary_fire_event_payload": event_payload,
             "prompt": row["prompt"],
             "prompt_base": row["prompt"],
             "prompt_raw": row.get("prompt_raw", row["prompt"]),
@@ -917,6 +1009,8 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
     old_extra_mask = getattr(exact_args, "history_visibility_extra_mask_frames", None)
     exact_args.history_visibility_extra_mask_frames = mask_frames
     loss_focus_mask_latents = None
+    primary_fire_event_latents = None
+    primary_fire_event_debug = None
 
     try:
         with torch.no_grad():
@@ -949,7 +1043,6 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
                 video_latents=video_latents,
                 seq=seq,
             )
-            histories = opt.inject_first_frame_image_memory(histories, image_latents, exact_args, device, seq=seq)
             loss_focus_mask_latents = online_mask_frames_to_latent_mask(
                 case.get("focus_mask_frames"),
                 target_latents=target_latents,
@@ -957,6 +1050,24 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
                 temporal_scale=int(pipe.vae_scale_factor_temporal),
                 device=device,
             )
+            if bool(getattr(exact_args, "use_primary_fire_event_condition", False)):
+                event_payload = case.get("primary_fire_event_payload") or {
+                    "click_frames": case.get("primary_fire_supervision", {}).get("click_frames", []),
+                    "source_frame_indices": case.get("target_indices", []),
+                    "time_mask": case.get("primary_fire_supervision", {}).get("temporal_mask", []),
+                }
+                primary_fire_event_latents, mapping = build_primary_fire_event_latents(
+                    event_payload=event_payload,
+                    target_indices=case.get("target_indices", []),
+                    target_latents=target_latents,
+                    temporal_scale=int(pipe.vae_scale_factor_temporal),
+                    device=device,
+                )
+                primary_fire_event_debug = {
+                    "frame_to_latent_mapping": mapping,
+                    "source_frame_indices": list(event_payload.get("source_frame_indices", case.get("target_indices", []))),
+                    "click_frames": list(event_payload.get("click_frames", [])),
+                }
     finally:
         _restore_optional_attr(exact_args, "history_visibility_extra_mask_frames", had_extra_mask, old_extra_mask)
 
@@ -972,6 +1083,10 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
         "interaction_memory": case.get("interaction_memory"),
         "primary_fire_supervision": case.get("primary_fire_supervision"),
         "loss_focus_mask_latents": None if loss_focus_mask_latents is None else loss_focus_mask_latents.detach(),
+        "primary_fire_event_latents": None
+        if primary_fire_event_latents is None
+        else primary_fire_event_latents.detach(),
+        "primary_fire_event_debug": primary_fire_event_debug,
     }
     if keep_frames:
         item["target_frames"] = [frame.resize((exact_args.width, exact_args.height)) for frame in target_frames]

@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "CSV containing first_frame_path, prompt, camera_poses_path, "
-            "warp_video_path, and warp_visibility_mask_path."
+            "warp_video_path, warp_visibility_mask_path, and optional primary_fire_event_path."
         ),
     )
     parser.add_argument("--output", type=Path, default=None, help="Output mp4 path. Defaults to runs/<csv_stem>.mp4.")
@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
     parser.add_argument("--no_lora", action="store_true", help="Run without loading a Warp-as-History LoRA.")
+    parser.add_argument("--use_primary_fire_event_condition", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--pyramid_num_inference_steps_list",
         type=int,
@@ -206,7 +207,38 @@ def load_demo_row(csv_path: Path) -> dict[str, Any]:
             ),
             csv_path,
         ),
+        "primary_fire_event_path": _resolve_csv_path(_field(row, "primary_fire_event_path"), csv_path),
     }
+
+
+def build_primary_fire_event_latents(
+    *,
+    path: Path,
+    num_frames: int,
+    latent_channels: int,
+    latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    temporal_scale: int,
+):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    source_frame_indices = [int(x) for x in payload.get("source_frame_indices", list(range(int(num_frames))))]
+    time_mask = payload.get("time_mask")
+    if time_mask is None:
+        click_frames = {int(x) for x in payload.get("click_frames", [])}
+        time_mask = [1.0 if int(idx) in click_frames else 0.0 for idx in source_frame_indices]
+    frame_weight_map = {int(idx): float(weight) for idx, weight in zip(source_frame_indices, time_mask)}
+    frame_weights = np.asarray([frame_weight_map.get(frame_idx, 0.0) for frame_idx in range(int(num_frames))], dtype=np.float32)
+    latent_values = np.zeros(int(latent_frames), dtype=np.float32)
+    for latent_idx in range(int(latent_frames)):
+        start = int(latent_idx) * int(temporal_scale)
+        end = min(int(num_frames), start + int(temporal_scale))
+        if end <= start:
+            end = min(int(num_frames), start + 1)
+        latent_values[int(latent_idx)] = float(frame_weights[start:end].max()) if end > start else 0.0
+    latents = latent_values.reshape(1, 1, int(latent_frames), 1, 1)
+    latents = np.broadcast_to(latents, (1, int(latent_channels), int(latent_frames), int(latent_height), int(latent_width)))
+    return latents.astype(np.float32)
 
 
 def load_camera_poses(path: Path, key: str) -> tuple[np.ndarray, int]:
@@ -419,6 +451,7 @@ def main() -> None:
     warp_video = None
     warp_visibility_mask = None
     camera_poses = None
+    primary_fire_event_latents = None
     conditioning_type = ""
     conditioning_frames = 0
     conditioning_fps = 16
@@ -501,6 +534,7 @@ def main() -> None:
         "camera_control_mesh_samples_per_axis": max(int(camera_mesh_samples_per_axis), 1),
         "warp_debug_dir": args.warp_debug_dir,
         "warp_debug_fps": fps,
+        "use_primary_fire_event_condition": bool(args.use_primary_fire_event_condition and sample["primary_fire_event_path"] is not None),
     }
     if args.pyramid_num_inference_steps_list is not None:
         pipe_kwargs["pyramid_num_inference_steps_list"] = list(args.pyramid_num_inference_steps_list)
@@ -509,6 +543,20 @@ def main() -> None:
         pipe_kwargs["warp_visibility_mask"] = warp_visibility_mask
     else:
         pipe_kwargs["camera_poses"] = camera_poses
+    if bool(args.use_primary_fire_event_condition) and sample["primary_fire_event_path"] is not None:
+        latent_frames = ((int(num_frames) - 1) // int(pipe.vae_scale_factor_temporal)) + 1
+        latent_height = int(args.height) // int(pipe.vae_scale_factor_spatial)
+        latent_width = int(args.width) // int(pipe.vae_scale_factor_spatial)
+        primary_fire_event_latents = build_primary_fire_event_latents(
+            path=sample["primary_fire_event_path"],
+            num_frames=int(num_frames),
+            latent_channels=int(pipe.transformer.config.in_channels),
+            latent_frames=int(latent_frames),
+            latent_height=int(latent_height),
+            latent_width=int(latent_width),
+            temporal_scale=int(pipe.vae_scale_factor_temporal),
+        )
+        pipe_kwargs["primary_fire_event_latents"] = torch.from_numpy(primary_fire_event_latents).to(device=device, dtype=dtype)
 
     result = pipe(**pipe_kwargs)
     frames = unwrap_video_frames(result)
@@ -535,6 +583,7 @@ def main() -> None:
                 "conditioning_frames": conditioning_frames,
                 "num_frames": num_frames,
                 "fps": fps,
+                "use_primary_fire_event_condition": bool(args.use_primary_fire_event_condition and sample["primary_fire_event_path"] is not None),
             }
         ),
         flush=True,
