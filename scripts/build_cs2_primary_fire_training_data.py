@@ -329,7 +329,7 @@ def main() -> None:
                             "clip_id": clip_id,
                             "fps": fps,
                             "num_frames": int(len(clipped_frame_data)),
-                            "click_frames": clip_clicks,
+                            "click_frames_source": clip_clicks,
                             "click_frames_local": [int(x) - int(start_frame) for x in clip_clicks],
                             "event_windows": event_windows,
                             "source_frame_indices": [int(start_frame) + idx for idx in range(len(clipped_frame_data))],

@@ -390,7 +390,7 @@ def inject_action_pseudo_history(histories, interaction_pseudo_history, args, de
                 {
                     "event": "interaction_pseudo_history_disabled",
                     "seq": seq,
-                    "reason": "pseudo interaction latent injection removed in favor of warp/image-memory conditioning",
+                    "reason": "pseudo interaction latent injection disabled; use camera poses and primary-fire event conditioning only",
                 }
             ),
             flush=True,
@@ -1545,6 +1545,12 @@ def validate_args(args):
         raise ValueError("--flow_matching_stage_id must be non-negative when stage sampling is fixed.")
     if int(args.history_position_count) < 0:
         raise ValueError("--history_position_count must be non-negative.")
+    if float(getattr(args, "online_future_keyframe_prob", 0.0) or 0.0) > 0.0:
+        raise ValueError("online_future_keyframe_prob is deprecated and must remain 0 to avoid future leakage.")
+    if int(getattr(args, "online_future_keyframes_min", 0) or 0) > 0:
+        raise ValueError("online_future_keyframes_min is deprecated and must remain 0 to avoid future leakage.")
+    if int(getattr(args, "online_future_keyframes_max", 0) or 0) > 0:
+        raise ValueError("online_future_keyframes_max is deprecated and must remain 0 to avoid future leakage.")
     if int(args.history_position_delta) < 0:
         raise ValueError("--history_position_delta must be non-negative.")
     if str(getattr(args, "warp_history_downsample_mode", "short") or "short") not in {"short", "patch_mid"}:

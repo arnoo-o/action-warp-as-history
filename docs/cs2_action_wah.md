@@ -27,9 +27,10 @@
 ## Training Flags
 
 - `--use_primary_fire_focus_loss`
-- `--online_primary_fire_focus_loss_scale`
-- `--online_primary_fire_background_loss_scale`
+- `--primary_fire_focus_loss_scale`
+- `--primary_fire_background_loss_scale`
 - `--use_primary_fire_event_condition`
+- `--online_primary_fire_window_probability`
 
 If `primary_fire_loss_mask_path` is missing, training falls back to an online residual mask built from target vs warp frames.
 
@@ -43,3 +44,4 @@ If `primary_fire_loss_mask_path` is missing, training falls back to an online re
 - Future GT frames are only used as targets or for loss-mask construction.
 - Future GT content must not be injected into history latents.
 - `online_future_keyframe_*` defaults are now zeroed and should be treated as deprecated.
+- Image-memory / first-frame-memory branches are not part of the current CS2 primary-fire path.

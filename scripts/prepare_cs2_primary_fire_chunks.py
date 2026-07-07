@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--min-clip-seconds", type=float, default=20.0)
+    parser.add_argument("--pre-fire-frames", type=int, default=16)
+    parser.add_argument("--post-fire-frames", type=int, default=24)
     parser.add_argument("--max-videos", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -124,8 +126,9 @@ def main() -> None:
             chunk_id = f"{parquet_path.stem}_fire_{clip_idx:03d}"
             out_mp4 = output_dir / f"{chunk_id}.mp4"
             out_parquet = output_dir / f"{chunk_id}.parquet"
-            if (out_mp4.exists() or out_parquet.exists()) and not args.overwrite:
-                raise FileExistsError(f"{out_mp4} or {out_parquet} already exists. Use --overwrite.")
+            out_event = output_dir / f"{chunk_id}_primary_fire_event.json"
+            if (out_mp4.exists() or out_parquet.exists() or out_event.exists()) and not args.overwrite:
+                raise FileExistsError(f"{out_mp4} or {out_parquet} or {out_event} already exists. Use --overwrite.")
 
             write_video_clip(video_path, out_mp4, start_frame, end_frame, fps)
             clipped_frame_data = frame_data[start_frame:end_frame]
@@ -137,6 +140,37 @@ def main() -> None:
             pd.DataFrame([clipped_row]).to_parquet(out_parquet, index=False)
 
             clip_clicks = [frame for frame in click_frames if int(start_frame) <= frame < int(end_frame)]
+            click_frames_local = [int(frame) - int(start_frame) for frame in clip_clicks]
+            time_mask = [0.0] * int(len(clipped_frame_data))
+            event_windows = []
+            for click_local in click_frames_local:
+                win_start = max(0, int(click_local) - int(args.pre_fire_frames))
+                win_end = min(len(clipped_frame_data), int(click_local) + int(args.post_fire_frames) + 1)
+                event_windows.append(
+                    {
+                        "click_frame_local": int(click_local),
+                        "window_start": int(win_start),
+                        "window_end_exclusive": int(win_end),
+                    }
+                )
+                for idx in range(win_start, win_end):
+                    time_mask[idx] = 1.0
+            out_event.write_text(
+                json.dumps(
+                    {
+                        "fps": float(fps),
+                        "num_frames": int(len(clipped_frame_data)),
+                        "click_frames_source": [int(x) for x in clip_clicks],
+                        "click_frames_local": click_frames_local,
+                        "event_windows": event_windows,
+                        "source_frame_indices": [int(start_frame) + idx for idx in range(len(clipped_frame_data))],
+                        "time_mask": time_mask,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             manifest_rows.append(
                 {
                     "clip_id": chunk_id,
@@ -150,6 +184,7 @@ def main() -> None:
                     "duration_s": float(len(clipped_frame_data) / fps),
                     "click_count": int(len(clip_clicks)),
                     "click_frames_source": " ".join(str(x) for x in clip_clicks),
+                    "primary_fire_event_path": out_event.name,
                 }
             )
             summary["clips_total"] += 1
@@ -170,6 +205,7 @@ def main() -> None:
                 "duration_s",
                 "click_count",
                 "click_frames_source",
+                "primary_fire_event_path",
             ],
         )
         writer.writeheader()

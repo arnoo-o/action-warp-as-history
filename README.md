@@ -38,6 +38,7 @@ If you want to actually train or run inference, you still need to download the r
 - `warp_as_history/training/core.py`
   - Disables direct pseudo-action latent injection.
   - Adds fire-focused loss weighting on top of the original Warp-as-History objective.
+  - Uses lightweight primary-fire event conditioning instead of any image-memory branch.
   - Keeps LoRA-only trainable parameter checks.
 - `scripts/train_warp_as_history_lora.py`
   - Adds online CS2 training options and primary-fire focus-loss / event-condition controls.
@@ -45,6 +46,12 @@ If you want to actually train or run inference, you still need to download the r
   - Extracts >=20s MP4/parquet chunks around left-click primary-fire events while preserving frame alignment.
 - `scripts/run_remote_cs2_lora_train.sh`
   - Remote launcher with explicit logging and fire-focused training knobs.
+
+## Current Stage
+
+- The active conditioning path for this CS2 branch is: `camera_poses` + `primary_fire_event` + `primary_fire_focus_loss`.
+- First-frame image-memory experiments are not part of the current training path and should be treated as disabled / future work.
+- Primary-fire residual masks are only used for training loss weighting, never as inference content input.
 
 ## Quick Start For This Modified Repo
 

@@ -59,6 +59,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
     parser.add_argument("--no_lora", action="store_true", help="Run without loading a Warp-as-History LoRA.")
     parser.add_argument("--use_primary_fire_event_condition", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use_primary_fire_focus_loss", action=argparse.BooleanOptionalAction, default=False, help=argparse.SUPPRESS)
+    parser.add_argument("--primary_fire_focus_loss_scale", type=float, default=3.0, help=argparse.SUPPRESS)
+    parser.add_argument("--primary_fire_background_loss_scale", type=float, default=1.0, help=argparse.SUPPRESS)
     parser.add_argument(
         "--pyramid_num_inference_steps_list",
         type=int,
@@ -225,20 +228,31 @@ def build_primary_fire_event_latents(
     source_frame_indices = [int(x) for x in payload.get("source_frame_indices", list(range(int(num_frames))))]
     time_mask = payload.get("time_mask")
     if time_mask is None:
-        click_frames = {int(x) for x in payload.get("click_frames", [])}
+        click_frames = {int(x) for x in payload.get("click_frames_source", payload.get("click_frames", []))}
         time_mask = [1.0 if int(idx) in click_frames else 0.0 for idx in source_frame_indices]
-    frame_weight_map = {int(idx): float(weight) for idx, weight in zip(source_frame_indices, time_mask)}
-    frame_weights = np.asarray([frame_weight_map.get(frame_idx, 0.0) for frame_idx in range(int(num_frames))], dtype=np.float32)
+    if len(source_frame_indices) != len(time_mask):
+        raise ValueError("primary_fire_event source_frame_indices and time_mask lengths must match.")
+    frame_weights = np.asarray([float(weight) for weight in time_mask[: int(num_frames)]], dtype=np.float32)
     latent_values = np.zeros(int(latent_frames), dtype=np.float32)
+    mapping = []
     for latent_idx in range(int(latent_frames)):
         start = int(latent_idx) * int(temporal_scale)
         end = min(int(num_frames), start + int(temporal_scale))
         if end <= start:
             end = min(int(num_frames), start + 1)
         latent_values[int(latent_idx)] = float(frame_weights[start:end].max()) if end > start else 0.0
+        mapping.append(
+            {
+                "latent_index": int(latent_idx),
+                "frame_start": int(start),
+                "frame_end_exclusive": int(end),
+                "source_frames": source_frame_indices[start:end],
+                "has_click": any(float(x) > 0.0 for x in frame_weights[start:end]),
+            }
+        )
     latents = latent_values.reshape(1, 1, int(latent_frames), 1, 1)
     latents = np.broadcast_to(latents, (1, int(latent_channels), int(latent_frames), int(latent_height), int(latent_width)))
-    return latents.astype(np.float32)
+    return latents.astype(np.float32), mapping
 
 
 def load_camera_poses(path: Path, key: str) -> tuple[np.ndarray, int]:
@@ -547,7 +561,7 @@ def main() -> None:
         latent_frames = ((int(num_frames) - 1) // int(pipe.vae_scale_factor_temporal)) + 1
         latent_height = int(args.height) // int(pipe.vae_scale_factor_spatial)
         latent_width = int(args.width) // int(pipe.vae_scale_factor_spatial)
-        primary_fire_event_latents = build_primary_fire_event_latents(
+        primary_fire_event_latents, event_mapping = build_primary_fire_event_latents(
             path=sample["primary_fire_event_path"],
             num_frames=int(num_frames),
             latent_channels=int(pipe.transformer.config.in_channels),
@@ -557,6 +571,13 @@ def main() -> None:
             temporal_scale=int(pipe.vae_scale_factor_temporal),
         )
         pipe_kwargs["primary_fire_event_latents"] = torch.from_numpy(primary_fire_event_latents).to(device=device, dtype=dtype)
+        if args.warp_debug_dir is not None:
+            debug_dir = Path(args.warp_debug_dir).expanduser().resolve()
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            (debug_dir / "primary_fire_event_latent_mapping.json").write_text(
+                json.dumps({"mapping": event_mapping}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     result = pipe(**pipe_kwargs)
     frames = unwrap_video_frames(result)

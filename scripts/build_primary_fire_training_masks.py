@@ -64,12 +64,17 @@ def main() -> None:
         raise ValueError("target, warp, and visibility videos must have the same frame count.")
 
     num_frames = len(target_frames)
-    click_frames_local = [int(x) for x in event_payload.get("click_frames_local", [])]
-    time_mask = np.zeros((num_frames,), dtype=np.float32)
-    for click in click_frames_local:
-        start = max(0, int(click) - int(args.pre_fire_frames))
-        end = min(num_frames, int(click) + int(args.post_fire_frames) + 1)
-        time_mask[start:end] = 1.0
+    if event_payload.get("time_mask") is not None:
+        time_mask = np.asarray(event_payload.get("time_mask", []), dtype=np.float32)
+        if time_mask.shape[0] != num_frames:
+            raise ValueError("primary_fire_event time_mask length must match video frame count.")
+    else:
+        click_frames_local = [int(x) for x in event_payload.get("click_frames_local", [])]
+        time_mask = np.zeros((num_frames,), dtype=np.float32)
+        for click in click_frames_local:
+            start = max(0, int(click) - int(args.pre_fire_frames))
+            end = min(num_frames, int(click) + int(args.post_fire_frames) + 1)
+            time_mask[start:end] = 1.0
 
     target = target_frames.astype(np.float32) / 255.0
     warp = warp_frames.astype(np.float32) / 255.0
