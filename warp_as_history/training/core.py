@@ -1065,6 +1065,7 @@ def visible_aux_state_dict(transformer):
 def ensure_target_channel_fusion(transformer):
     if getattr(transformer, "target_channel_fusion_mlp", None) is None:
         transformer.enable_target_channel_fusion()
+        transformer.target_channel_fusion_mlp.to(device=transformer.device)
     return transformer.target_channel_fusion_mlp
 
 def downsample_latents_spatial_bilinear(latents, height, width, scale=1.0):
@@ -1288,7 +1289,7 @@ def flow_matching_loss_train_exact(
         histories,
         attention_kwargs=attention_kwargs,
         target_channel_fusion_latents=(
-            training_exact_pyramid_latents(target_channel_fusion_latents, len(stage_items))
+            [training_exact_pyramid_latents(target_channel_fusion_latents, len(args.pyramid_num_inference_steps_list))[sid] for sid in stage_ids]
             if target_channel_fusion_latents is not None
             else None
         ),

@@ -764,7 +764,7 @@ class OnlineWarpTrainingCache:
     def _load_geometry_from_disk(self, cache_path):
         if cache_path is None or not cache_path.is_file():
             return None
-        payload = torch.load(cache_path, map_location="cpu")
+        payload = torch.load(cache_path, map_location="cpu", weights_only=False)
         geometry = payload.get("geometry")
         if not isinstance(geometry, dict):
             return None
@@ -1063,7 +1063,7 @@ def encode_prompt_cached(pipe, prompt, exact_args, device, cache_dir, memory_cac
     if cache_dir:
         cache_path = Path(cache_dir) / f"{key}.pt"
         if cache_path.exists():
-            payload = torch.load(cache_path, map_location="cpu")
+            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
             prompt_embeds = payload["prompt_embeds"].to(device=device, dtype=pipe.transformer.dtype)
             memory_cache[key] = {"prompt_embeds": prompt_embeds}
             return prompt_embeds, "disk"

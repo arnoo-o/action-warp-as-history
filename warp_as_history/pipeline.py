@@ -935,7 +935,10 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             self._wah_loaded_lora_path = lora_path
 
         if hasattr(self, "set_adapters"):
-            self.set_adapters([self._wah_adapter_name], adapter_weights=[1.0])
+            try:
+                self.set_adapters([self._wah_adapter_name], adapter_weights=[1.0])
+            except (KeyError, NotImplementedError):
+                self.transformer.set_adapter(self._wah_adapter_name)
         self._set_wah_lora_enabled(True)
         return True
 
@@ -1004,6 +1007,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         if isinstance(target_channel_fusion_state, dict):
             self.transformer.enable_target_channel_fusion()
             self.transformer.target_channel_fusion_mlp.load_state_dict(target_channel_fusion_state, strict=True)
+            self.transformer.target_channel_fusion_mlp.to(
+                device=self.transformer.device, dtype=self.transformer.dtype
+            )
 
     def _get_camera_warp_renderer(
         self,
@@ -2557,6 +2563,32 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                     current_target_channel_fusion_latents = None
                     if bool(state.get("use_primary_fire_event_condition", False)):
                         current_target_channel_fusion_latents = state.get("primary_fire_event_latents")
+                        if current_target_channel_fusion_latents is not None:
+                            # The event latents span the full video's latent frames, but each
+                            # autoregressive chunk only denoises WAH_NUM_LATENT_FRAMES_PER_CHUNK
+                            # latent frames. Slice the temporal window matching the current chunk
+                            # (fire windows are coarse, so chunk-level alignment is sufficient).
+                            chunk_latent_frames = int(latents.shape[2])
+                            if int(current_target_channel_fusion_latents.shape[2]) != chunk_latent_frames:
+                                chunk_idx_now = int(state.get("chunk_index", 0))
+                                offset = chunk_idx_now * WAH_NUM_LATENT_FRAMES_PER_CHUNK
+                                sliced = current_target_channel_fusion_latents[
+                                    :, :, offset : offset + chunk_latent_frames
+                                ]
+                                if int(sliced.shape[2]) < chunk_latent_frames:
+                                    pad = torch.zeros(
+                                        (
+                                            int(sliced.shape[0]),
+                                            int(sliced.shape[1]),
+                                            chunk_latent_frames - int(sliced.shape[2]),
+                                            int(sliced.shape[3]),
+                                            int(sliced.shape[4]),
+                                        ),
+                                        device=sliced.device,
+                                        dtype=sliced.dtype,
+                                    )
+                                    sliced = torch.cat([sliced, pad], dim=2)
+                                current_target_channel_fusion_latents = sliced
                         if current_target_channel_fusion_latents is not None and (
                             int(current_target_channel_fusion_latents.shape[-2]) != int(latents.shape[-2])
                             or int(current_target_channel_fusion_latents.shape[-1]) != int(latents.shape[-1])

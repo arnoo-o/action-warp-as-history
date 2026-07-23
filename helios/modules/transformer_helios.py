@@ -1390,8 +1390,32 @@ class HeliosTransformer3DModel(
         nn.init.zeros_(self.target_channel_fusion_mlp[0].bias)
         nn.init.zeros_(self.target_channel_fusion_mlp[2].weight)
         nn.init.zeros_(self.target_channel_fusion_mlp[2].bias)
+        # Fixed, gentle scale on the fusion delta. Bounds the per-frame perturbation to a
+        # fraction comparable to the old action pseudo-history bias (~0.035) so that even the
+        # fire frames cannot overwrite the hidden states outright.
+        self.target_channel_fusion_scale = 0.1
 
-    def fuse_target_channel_condition(self, hidden_states, condition_hidden_states):
+    @staticmethod
+    def _target_channel_fusion_gate(raw_condition_latents, num_frames_post, tokens_per_frame):
+        """Per-token fire gate derived from the raw (pre-patch) fusion latents.
+
+        The fusion latents encode the per-frame fire weight (0..1) broadcast across channels
+        and space. We recover the per-frame weight, align it to the post-patch temporal length,
+        and expand to per-token so that non-fire frames get an exactly-zero delta (leaving the
+        hidden states untouched), while fire frames pass the delta through.
+        """
+        # (B, C, T, H, W) -> (B, T)
+        per_frame = raw_condition_latents.detach().amax(dim=1).amax(dim=-1).amax(dim=-1)
+        per_frame = per_frame.clamp(0.0, 1.0).to(dtype=torch.float32)
+        if int(per_frame.shape[1]) != int(num_frames_post):
+            per_frame = F.interpolate(
+                per_frame.unsqueeze(1), size=int(num_frames_post), mode="nearest"
+            ).squeeze(1)
+        # tokens are laid out T-outer (frame index = token // tokens_per_frame)
+        gate = per_frame.repeat_interleave(int(tokens_per_frame), dim=1).unsqueeze(-1)  # (B, seq, 1)
+        return gate
+
+    def fuse_target_channel_condition(self, hidden_states, condition_hidden_states, gate=None):
         fusion_mlp = getattr(self, "target_channel_fusion_mlp", None)
         if fusion_mlp is None:
             raise ValueError("target_channel_fusion_latents were provided before enabling target_channel_fusion_mlp.")
@@ -1402,8 +1426,11 @@ class HeliosTransformer3DModel(
             )
         fusion_dtype = next(fusion_mlp.parameters()).dtype
         fusion_input = torch.cat([hidden_states, condition_hidden_states.to(hidden_states)], dim=-1).to(fusion_dtype)
-        fused_delta = fusion_mlp(fusion_input)
-        return hidden_states + fused_delta.to(hidden_states)
+        fused_delta = fusion_mlp(fusion_input).to(hidden_states)
+        fused_delta = float(getattr(self, "target_channel_fusion_scale", 0.1)) * fused_delta
+        if gate is not None:
+            fused_delta = fused_delta * gate.to(hidden_states)
+        return hidden_states + fused_delta
 
     @torch.no_grad()
     def initialize_weight_from_another_conv3d(self, another_layer):
@@ -1489,17 +1516,22 @@ class HeliosTransformer3DModel(
 
                 cur_hidden_states = cur_hidden_states.flatten(2).transpose(1, 2)
                 if target_channel_fusion_latents is not None:
-                    cur_condition = (
+                    cur_condition_raw = (
                         target_channel_fusion_latents[idx]
                         if isinstance(target_channel_fusion_latents, list)
                         else target_channel_fusion_latents
                     )
                     cur_condition = self.gradient_checkpointing_method(
                         self.patch_embedding,
-                        cur_condition.to(self.device, dtype=self.patch_embedding.weight.dtype),
+                        cur_condition_raw.to(self.device, dtype=self.patch_embedding.weight.dtype),
                     )
                     cur_condition = cur_condition.flatten(2).transpose(1, 2)
-                    cur_hidden_states = self.fuse_target_channel_condition(cur_hidden_states, cur_condition)
+                    fusion_gate = self._target_channel_fusion_gate(
+                        cur_condition_raw, num_frames_post=T, tokens_per_frame=H * W
+                    )
+                    cur_hidden_states = self.fuse_target_channel_condition(
+                        cur_hidden_states, cur_condition, gate=fusion_gate
+                    )
 
                 if indices_hidden_states is None:
                     indices_hidden_states = torch.arange(0, T).unsqueeze(0).expand(B, -1)
@@ -1550,7 +1582,12 @@ class HeliosTransformer3DModel(
                     ),
                 )
                 condition_hidden_states = condition_hidden_states.flatten(2).transpose(1, 2)
-                hidden_states = self.fuse_target_channel_condition(hidden_states, condition_hidden_states)
+                fusion_gate = self._target_channel_fusion_gate(
+                    target_channel_fusion_latents, num_frames_post=T, tokens_per_frame=H * W
+                )
+                hidden_states = self.fuse_target_channel_condition(
+                    hidden_states, condition_hidden_states, gate=fusion_gate
+                )
 
             rope_freqs = self.rope(
                 frame_indices=indices_hidden_states,
