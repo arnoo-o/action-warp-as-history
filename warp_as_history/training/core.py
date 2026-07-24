@@ -15,8 +15,10 @@ if str(REPO_ROOT) not in sys.path:
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
+from warp_as_history.training.loss_masks import valid_element_normalized_loss
 
 from diffusers import AutoencoderKLWan
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
@@ -78,6 +80,18 @@ DEFAULT_TRAINING_ARGS = {
     "num_frames": 33,
     "num_latent_frames_per_chunk": 9,
     "output_dir": "runs/warp_as_history_lora",
+    "use_minecraft_hud_mask": False,
+    "interaction_conditioning_mode": "router",
+    "interaction_router_temporal_loss_scale": 1.0,
+    "interaction_router_spatial_loss_scale": 1.0,
+    "interaction_router_negative_loss_scale": 0.25,
+    "interaction_router_sparsity_loss_scale": 0.01,
+    "base_train_steps": 1500,
+    "bidirectional_train_steps": 1500,
+    "enable_bidirectional_training": False,
+    "bidirectional_interval": 8,
+    "bidirectional_feedback_weight": 0.5,
+    "bidirectional_teacher_floor": 0.5,
     "overwrite": False,
     "prompt_cache_dir": "",
     "prompt_csv": "data/training/training_data.csv",
@@ -530,7 +544,15 @@ def make_histories(pipe, image_latents, fake_image_latents, args, device, video_
             sampled_ids = np.clip(sampled_ids, 0, mask.shape[0] - 1)
             sampled = torch.from_numpy(mask[sampled_ids]).to(device=device, dtype=torch.float32)
             sampled = sampled.unsqueeze(0).unsqueeze(0)
-            sampled = F.interpolate(sampled, size=(video_frames_count, h, w), mode="trilinear", align_corners=False)
+            if bool(getattr(args, "use_minecraft_hud_mask", False)):
+                sampled = F.interpolate(sampled, size=(video_frames_count, h, w), mode="nearest")
+            else:
+                sampled = F.interpolate(
+                    sampled,
+                    size=(video_frames_count, h, w),
+                    mode="trilinear",
+                    align_corners=False,
+                )
             sampled = sampled.clamp_(0.0, 1.0)
             return sampled
         return None
@@ -1059,6 +1081,15 @@ def visible_aux_state_dict(transformer):
         state["target_channel_fusion_mlp"] = {
             key: value.detach().cpu() for key, value in target_channel_fusion_mlp.state_dict().items()
         }
+    interaction_conditioning = getattr(transformer, "interaction_conditioning", None)
+    if interaction_conditioning is not None:
+        state["interaction_conditioning"] = {
+            key: value.detach().cpu() for key, value in interaction_conditioning.state_dict().items()
+        }
+        state["interaction_conditioning_config"] = {
+            "rank": int(interaction_conditioning.adapter.target_down.out_features),
+            "semantic_dim": int(interaction_conditioning.semantic_encoder.semantic_dim),
+        }
     return state
 
 
@@ -1067,6 +1098,13 @@ def ensure_target_channel_fusion(transformer):
         transformer.enable_target_channel_fusion()
         transformer.target_channel_fusion_mlp.to(device=transformer.device)
     return transformer.target_channel_fusion_mlp
+
+
+def ensure_interaction_conditioning(transformer, rank=64, semantic_dim=256):
+    if getattr(transformer, "interaction_conditioning", None) is None:
+        transformer.enable_interaction_conditioning(rank=rank, semantic_dim=semantic_dim)
+        transformer.interaction_conditioning.to(device=transformer.device)
+    return transformer.interaction_conditioning
 
 def downsample_latents_spatial_bilinear(latents, height, width, scale=1.0):
     batch_size, channels, latent_frames, _, _ = latents.shape
@@ -1236,6 +1274,90 @@ def flow_matching_train_exact_items(pipe, target_latents, args, device):
 
     return items
 
+def world_valid_normalized_loss(loss_map, world_valid_mask=None):
+    """Average a loss map over valid elements, including channel expansion."""
+    if world_valid_mask is None:
+        return valid_element_normalized_loss(loss_map)
+    valid = world_valid_mask.to(device=loss_map.device, dtype=loss_map.dtype)
+    if valid.shape[2:] != loss_map.shape[2:]:
+        valid = F.interpolate(valid, size=loss_map.shape[2:], mode="nearest")
+    valid = (valid > 0.5).to(dtype=loss_map.dtype)
+    return valid_element_normalized_loss(loss_map, valid)
+
+
+def save_interaction_debug(
+    output_dir,
+    teacher_map,
+    debug_items,
+    *,
+    improvement_map=None,
+    refined_teacher_map=None,
+):
+    if teacher_map is None or not debug_items:
+        return
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    debug = list(debug_items)[-1]
+    predicted = debug["predicted_gate"].detach().float().cpu()
+    injection = debug["interaction_injection_map"].detach().float().cpu()
+    teacher = F.interpolate(
+        teacher_map.detach().float().cpu(), size=predicted.shape[2:], mode="trilinear", align_corners=False
+    )
+
+    def save_map(name, value):
+        image = value[0, 0].amax(dim=0).numpy()
+        scale = max(float(image.max()), 1e-8)
+        Image.fromarray(np.rint(np.clip(image / scale, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L").save(
+            output_dir / name
+        )
+
+    save_map("residual_teacher_map.png", teacher)
+    save_map("predicted_gate.png", predicted)
+    save_map("interaction_injection_map.png", injection)
+    np.save(output_dir / "residual_teacher_map.npy", teacher.numpy())
+    np.save(output_dir / "predicted_gate.npy", predicted.numpy())
+    np.save(output_dir / "interaction_injection_map.npy", injection.numpy())
+    if improvement_map is not None:
+        improvement = F.interpolate(
+            improvement_map.detach().float().cpu(),
+            size=predicted.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        )
+        save_map("improvement_map.png", improvement)
+        np.save(output_dir / "improvement_map.npy", improvement.numpy())
+    if refined_teacher_map is not None:
+        refined = F.interpolate(
+            refined_teacher_map.detach().float().cpu(),
+            size=predicted.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        )
+        save_map("refined_teacher_map.png", refined)
+        np.save(output_dir / "refined_teacher_map.npy", refined.numpy())
+    (output_dir / "temporal_teacher_curve.json").write_text(
+        json.dumps(teacher[0, 0].mean(dim=(-1, -2)).tolist()), encoding="utf-8"
+    )
+    (output_dir / "temporal_pred_curve.json").write_text(
+        json.dumps(predicted[0, 0].mean(dim=(-1, -2)).tolist()), encoding="utf-8"
+    )
+
+
+def refine_interaction_teacher(
+    initial_teacher_map,
+    improvement_map,
+    *,
+    feedback_weight=0.5,
+    teacher_floor=0.5,
+):
+    feedback_weight = min(max(float(feedback_weight), 0.0), 1.0)
+    teacher_floor = min(max(float(teacher_floor), 0.0), 1.0)
+    initial = initial_teacher_map.float()
+    improvement = improvement_map.float().clamp(0.0, 1.0)
+    feedback_target = (1.0 - feedback_weight) * initial + feedback_weight * improvement
+    return torch.maximum(teacher_floor * initial, feedback_target).clamp(0.0, 1.0).detach()
+
+
 def flow_matching_loss_train_exact(
     pipe,
     prompt_embeds,
@@ -1244,7 +1366,14 @@ def flow_matching_loss_train_exact(
     args,
     device,
     loss_focus_mask=None,
+    world_valid_mask=None,
     target_channel_fusion_latents=None,
+    interaction_conditioning=None,
+    interaction_teacher_map=None,
+    interaction_adapter_enabled=True,
+    compute_bidirectional_feedback=False,
+    bidirectional_feedback_weight=0.5,
+    bidirectional_teacher_floor=0.5,
 ):
     stage_items = flow_matching_train_exact_items(pipe, target_latents, args, device)
     stage_losses = []
@@ -1281,6 +1410,19 @@ def flow_matching_loss_train_exact(
         }
         stats["history_visible_token_mode"] = history_visible_token_mode
 
+    stage_interaction = None
+    if interaction_conditioning is not None:
+        warp_pyramid = training_exact_pyramid_latents(
+            interaction_conditioning["warp_latents"], len(args.pyramid_num_inference_steps_list)
+        )
+        visibility_pyramid = training_exact_pyramid_latents(
+            interaction_conditioning["visibility"], len(args.pyramid_num_inference_steps_list)
+        )
+        stage_interaction = {
+            "payload": interaction_conditioning["payload"],
+            "warp_latents": [warp_pyramid[sid] for sid in stage_ids],
+            "visibility": [visibility_pyramid[sid] for sid in stage_ids],
+        }
     model_pred = transformer_model_forward(
         pipe,
         noisy_model_inputs,
@@ -1293,6 +1435,8 @@ def flow_matching_loss_train_exact(
             if target_channel_fusion_latents is not None
             else None
         ),
+        interaction_conditioning=stage_interaction,
+        interaction_adapter_enabled=bool(interaction_adapter_enabled),
         is_first_denoising_step=False,
     )
     if not isinstance(model_pred, list):
@@ -1302,19 +1446,62 @@ def flow_matching_loss_train_exact(
         )
     if len(model_pred) != len(stage_items):
         raise ValueError(f"NaViT prediction count mismatch: got {len(model_pred)}, expected {len(stage_items)}.")
+    enabled_interaction_debug = list(getattr(pipe.transformer, "_last_interaction_debug", []) or [])
+    improvement_map = None
+    refined_teacher_map = None
+    if bool(compute_bidirectional_feedback) and stage_interaction is not None and interaction_teacher_map is not None:
+        with torch.no_grad():
+            disabled_model_pred = transformer_model_forward(
+                pipe,
+                noisy_model_inputs,
+                timesteps,
+                prompt_embeds,
+                histories,
+                attention_kwargs=attention_kwargs,
+                target_channel_fusion_latents=None,
+                interaction_conditioning=stage_interaction,
+                interaction_adapter_enabled=False,
+                is_first_denoising_step=False,
+            )
+        pipe.transformer._last_interaction_debug = enabled_interaction_debug
+        improvement_stages = []
+        for enabled_pred, disabled_pred, target in zip(model_pred, disabled_model_pred, targets):
+            enabled_error = (enabled_pred.float() - target.float()).square().mean(dim=1, keepdim=True)
+            disabled_error = (disabled_pred.float() - target.float()).square().mean(dim=1, keepdim=True)
+            positive_improvement = (disabled_error - enabled_error).clamp_min(0.0)
+            scale = positive_improvement.flatten(1).mean(dim=1).view(-1, 1, 1, 1, 1).clamp_min(1e-6)
+            normalized = (positive_improvement / (3.0 * scale)).clamp(0.0, 1.0)
+            normalized = F.interpolate(
+                normalized,
+                size=interaction_teacher_map.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            )
+            improvement_stages.append(normalized)
+        if improvement_stages:
+            improvement_map = torch.stack(improvement_stages).mean(dim=0).detach()
+            refined_teacher_map = refine_interaction_teacher(
+                interaction_teacher_map,
+                improvement_map,
+                feedback_weight=bidirectional_feedback_weight,
+                teacher_floor=bidirectional_teacher_floor,
+            )
 
     for item, cur_model_pred, target, cur_sigmas in zip(stage_items, model_pred, targets, sigmas):
         stage_id = item["stage_id"]
         weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=cur_sigmas)
+        world_mask_now = None
+        if world_valid_mask is not None:
+            world_mask_now = world_valid_mask.to(device=target.device, dtype=torch.float32)
+            if world_mask_now.shape[2:] != target.shape[2:]:
+                world_mask_now = F.interpolate(world_mask_now, size=target.shape[2:], mode="nearest")
+            world_mask_now = (world_mask_now > 0.5).float()
         if loss_focus_mask is not None:
             focus_mask = loss_focus_mask.to(device=target.device, dtype=torch.float32)
             if focus_mask.shape[2:] != target.shape[2:]:
-                focus_mask = F.interpolate(
-                    focus_mask,
-                    size=(target.shape[2], target.shape[3], target.shape[4]),
-                    mode="trilinear",
-                    align_corners=False,
-                )
+                focus_mask = F.interpolate(focus_mask, size=target.shape[2:], mode="nearest")
+            if world_mask_now is not None:
+                focus_mask = focus_mask * world_mask_now
             focus_scale = float(getattr(args, "online_primary_fire_focus_loss_scale", 0.0) or 0.0)
             background_scale = float(getattr(args, "online_primary_fire_background_loss_scale", 1.0) or 1.0)
             if bool(getattr(args, "use_primary_fire_focus_loss", False)) and float(focus_mask.max()) > 0.0:
@@ -1326,16 +1513,25 @@ def flow_matching_loss_train_exact(
             elif bool(getattr(args, "use_primary_fire_focus_loss", False)):
                 stats[f"focus_mask_warning_stage{stage_id}"] = "empty_mask_fallback"
         loss_map = weighting.float() * (cur_model_pred.float() - target.float()) ** 2
-        stage_loss = torch.mean(loss_map.reshape(target.shape[0], -1), 1).mean()
+        if world_mask_now is not None:
+            loss_map = loss_map * world_mask_now
+        stage_loss = world_valid_normalized_loss(loss_map, world_mask_now)
         if loss_focus_mask is not None and bool(getattr(args, "use_primary_fire_focus_loss", False)):
             mask_now = focus_mask.float()
             if float(mask_now.max()) > 0.0:
-                focus_den = mask_now.sum().clamp_min(1.0)
-                bg_mask = 1.0 - mask_now
-                bg_den = bg_mask.sum().clamp_min(1.0)
-                stats[f"focus_loss_stage{stage_id}"] = (loss_map * mask_now).sum().detach() / focus_den
-                stats[f"background_loss_stage{stage_id}"] = (loss_map * bg_mask).sum().detach() / bg_den
-                stats[f"mask_coverage_stage{stage_id}"] = mask_now.detach().mean()
+                valid_for_stats = torch.ones_like(mask_now) if world_mask_now is None else world_mask_now
+                focus_elements = torch.broadcast_to(mask_now, loss_map.shape)
+                bg_mask = valid_for_stats * (1.0 - mask_now)
+                background_elements = torch.broadcast_to(bg_mask, loss_map.shape)
+                focus_den = focus_elements.sum().clamp_min(1.0)
+                bg_den = background_elements.sum().clamp_min(1.0)
+                stats[f"focus_loss_stage{stage_id}"] = (loss_map * focus_elements).sum().detach() / focus_den
+                stats[f"background_loss_stage{stage_id}"] = (
+                    (loss_map * background_elements).sum().detach() / bg_den
+                )
+                stats[f"mask_coverage_stage{stage_id}"] = (
+                    mask_now.sum().detach() / valid_for_stats.sum().clamp_min(1.0)
+                )
         stage_losses.append(stage_loss)
         stats[f"flow_mse_stage{stage_id}"] = stage_loss.detach()
         stats[f"target_flow_norm_stage{stage_id}"] = target.float().square().mean().sqrt().detach()
@@ -1347,9 +1543,55 @@ def flow_matching_loss_train_exact(
     # Helios stage2 post uses is_navit_pyramid=true: all pyramid stages are fed
     # to the transformer as a single list forward, then _flow_loss averages them.
     total_loss = torch.stack(stage_losses).mean()
+    interaction_aux_loss = None
+    router_teacher_map = refined_teacher_map if refined_teacher_map is not None else interaction_teacher_map
+    if router_teacher_map is not None and stage_interaction is not None:
+        debug_items = enabled_interaction_debug
+        teacher_pyramid = training_exact_pyramid_latents(
+            router_teacher_map, len(args.pyramid_num_inference_steps_list)
+        )
+        event_valid = stage_interaction["payload"]["event_valid"].float().mean()
+        temporal_losses = []
+        spatial_losses = []
+        negative_losses = []
+        sparse_losses = []
+        for debug, stage_id in zip(debug_items, stage_ids):
+            predicted_gate = debug["predicted_gate"].float()
+            teacher = teacher_pyramid[stage_id].float()
+            teacher = F.interpolate(teacher, size=predicted_gate.shape[2:], mode="trilinear", align_corners=False)
+            teacher = teacher.clamp(0.0, 1.0)
+            temporal_teacher = teacher.mean(dim=(-1, -2))
+            temporal_pred = predicted_gate.mean(dim=(-1, -2))
+            temporal_losses.append(F.mse_loss(temporal_pred, temporal_teacher) * event_valid)
+            spatial_losses.append(F.binary_cross_entropy(predicted_gate.clamp(1e-5, 1.0 - 1e-5), teacher) * event_valid)
+            negative_losses.append(predicted_gate.mean() * (1.0 - event_valid))
+            sparse_losses.append(predicted_gate.mean())
+            stats[f"interaction_gate_mean_stage{stage_id}"] = predicted_gate.detach().mean()
+            stats[f"interaction_teacher_mean_stage{stage_id}"] = teacher.detach().mean()
+        if temporal_losses:
+            temporal_loss = torch.stack(temporal_losses).mean()
+            spatial_loss = torch.stack(spatial_losses).mean()
+            negative_loss = torch.stack(negative_losses).mean()
+            sparsity_loss = torch.stack(sparse_losses).mean()
+            interaction_aux_loss = (
+                float(getattr(args, "interaction_router_temporal_loss_scale", 1.0)) * temporal_loss
+                + float(getattr(args, "interaction_router_spatial_loss_scale", 1.0)) * spatial_loss
+                + float(getattr(args, "interaction_router_negative_loss_scale", 0.25)) * negative_loss
+                + float(getattr(args, "interaction_router_sparsity_loss_scale", 0.01)) * sparsity_loss
+            )
+            total_loss = total_loss + interaction_aux_loss
+            stats["interaction_temporal_alignment_loss"] = temporal_loss.detach()
+            stats["interaction_spatial_mask_loss"] = spatial_loss.detach()
+            stats["interaction_negative_loss"] = negative_loss.detach()
+            stats["interaction_sparsity_loss"] = sparsity_loss.detach()
+            stats["interaction_aux_loss"] = interaction_aux_loss.detach()
     stats["flow_mse"] = total_loss.detach()
     stats["flow_mse_mean_stage"] = torch.stack([loss.detach() for loss in stage_losses]).mean()
-    return total_loss, stats, None
+    return total_loss, stats, {
+        "improvement_map": improvement_map,
+        "refined_teacher_map": refined_teacher_map,
+        "router_teacher_map": router_teacher_map,
+    }
 
 def flow_matching_loss(
     pipe,
@@ -1359,7 +1601,14 @@ def flow_matching_loss(
     args,
     device,
     loss_focus_mask=None,
+    world_valid_mask=None,
     target_channel_fusion_latents=None,
+    interaction_conditioning=None,
+    interaction_teacher_map=None,
+    interaction_adapter_enabled=True,
+    compute_bidirectional_feedback=False,
+    bidirectional_feedback_weight=0.5,
+    bidirectional_teacher_floor=0.5,
 ):
     return flow_matching_loss_train_exact(
         pipe,
@@ -1369,7 +1618,14 @@ def flow_matching_loss(
         args,
         device,
         loss_focus_mask=loss_focus_mask,
+        world_valid_mask=world_valid_mask,
         target_channel_fusion_latents=target_channel_fusion_latents,
+        interaction_conditioning=interaction_conditioning,
+        interaction_teacher_map=interaction_teacher_map,
+        interaction_adapter_enabled=interaction_adapter_enabled,
+        compute_bidirectional_feedback=compute_bidirectional_feedback,
+        bidirectional_feedback_weight=bidirectional_feedback_weight,
+        bidirectional_teacher_floor=bidirectional_teacher_floor,
     )
 
 def lora_target_modules(args):
@@ -1408,6 +1664,19 @@ def setup_visible_lora(transformer, args, seq):
             if id(param) not in trainable_ids:
                 trainable.append(param)
                 trainable_ids.add(id(param))
+    if str(getattr(args, "interaction_conditioning_mode", "router")) == "router":
+        interaction_stack = ensure_interaction_conditioning(
+            transformer,
+            rank=int(getattr(args, "interaction_adapter_rank", 64)),
+            semantic_dim=int(getattr(args, "interaction_semantic_dim", 256)),
+        )
+        interaction_stack.requires_grad_(optimize_lora_now)
+        for param in interaction_stack.parameters():
+            if optimize_lora_now:
+                param.data = param.data.float()
+            if id(param) not in trainable_ids:
+                trainable.append(param)
+                trainable_ids.add(id(param))
     if using_history_invisible_token(args):
         token = ensure_history_invisible_token(transformer)
         token.requires_grad_(optimize_lora_now)
@@ -1437,6 +1706,7 @@ def setup_visible_lora(transformer, args, seq):
         "lora_trainable_params": int(sum(p.numel() for p in trainable)),
         "history_invisible_token_mode": str(getattr(args, "history_invisible_token_mode", "none") or "none"),
         "use_primary_fire_event_condition": bool(getattr(args, "use_primary_fire_event_condition", False)),
+        "interaction_conditioning_mode": str(getattr(args, "interaction_conditioning_mode", "router")),
     }
     return adapter_name, trainable, stats
 
@@ -1447,6 +1717,7 @@ def assert_lora_only_trainable(
     *,
     allow_history_invisible_token=True,
     allow_target_channel_fusion=False,
+    allow_interaction_conditioning=False,
 ):
     trainable_ids = {id(param) for param in trainable}
     unexpected = []
@@ -1458,6 +1729,8 @@ def assert_lora_only_trainable(
         if allow_history_invisible_token and name == "history_invisible_token":
             continue
         if allow_target_channel_fusion and name.startswith("target_channel_fusion_mlp."):
+            continue
+        if allow_interaction_conditioning and name.startswith("interaction_conditioning."):
             continue
         unexpected.append(name)
     if unexpected:
@@ -1501,6 +1774,8 @@ def transformer_model_forward(
     histories,
     attention_kwargs,
     target_channel_fusion_latents=None,
+    interaction_conditioning=None,
+    interaction_adapter_enabled=True,
     is_first_denoising_step=False,
 ):
     return pipe.transformer(
@@ -1520,6 +1795,8 @@ def transformer_model_forward(
         history_visible_mask_mid=histories.get("history_visible_mask_mid"),
         history_visible_mask_long=histories.get("history_visible_mask_long"),
         target_channel_fusion_latents=target_channel_fusion_latents,
+        interaction_conditioning=interaction_conditioning,
+        interaction_adapter_enabled=interaction_adapter_enabled,
     )[0]
 
 def upsample_stage_latents(latents, reference):

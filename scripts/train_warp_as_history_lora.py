@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -62,6 +63,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pandas as pd
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -81,6 +83,40 @@ from warp_as_history.training.utils import (
 )
 
 DEFAULT_HELIOS_MODEL = "checkpoints/helios-distilled"
+
+
+def training_total_steps(base_train_steps, bidirectional_train_steps, enable_bidirectional_training):
+    base = max(int(base_train_steps), 0)
+    bidirectional = max(int(bidirectional_train_steps), 0) if bool(enable_bidirectional_training) else 0
+    return base + bidirectional
+
+
+def training_stage_for_step(step, base_train_steps, enable_bidirectional_training):
+    if bool(enable_bidirectional_training) and int(step) >= int(base_train_steps):
+        return "bidirectional"
+    return "base"
+
+
+def should_compute_bidirectional_feedback(
+    step,
+    base_train_steps,
+    enable_bidirectional_training,
+    bidirectional_interval,
+):
+    if training_stage_for_step(step, base_train_steps, enable_bidirectional_training) != "bidirectional":
+        return False
+    stage_step = int(step) - int(base_train_steps)
+    return stage_step % max(int(bidirectional_interval), 1) == 0
+
+
+def interaction_teacher_cache_key(item):
+    training = dict(item.get("training", {}) or {})
+    target_indices = ",".join(str(int(value)) for value in training.get("target_indices", []))
+    return (
+        f"{int(training.get('row_index', -1))}:"
+        f"{training.get('direction', 'forward')}:"
+        f"{target_indices}"
+    )
 
 
 def checkpoint_model_path(value, *, label):
@@ -153,6 +189,111 @@ def tensorboard_log_record(writer, record, step):
         tensorboard_add_scalar(writer, f"stats/{key}", value, step)
 
 
+def save_training_state(
+    path,
+    *,
+    transformer,
+    optimizer,
+    global_step,
+    args,
+    refined_teacher_cache,
+    losses,
+):
+    trainable_state = {
+        name: parameter.detach().cpu()
+        for name, parameter in transformer.named_parameters()
+        if parameter.requires_grad
+    }
+    completed_step = max(int(global_step) - 1, 0)
+    payload = {
+        "training_state_version": 1,
+        "trainable_state": trainable_state,
+        "optimizer": optimizer.state_dict(),
+        "global_step": int(global_step),
+        "current_stage": training_stage_for_step(
+            completed_step,
+            args.base_train_steps,
+            args.enable_bidirectional_training,
+        ),
+        "base_train_steps": int(args.base_train_steps),
+        "bidirectional_train_steps": int(args.bidirectional_train_steps),
+        "base_completed_steps": min(int(global_step), int(args.base_train_steps)),
+        "bidirectional_completed_steps": max(int(global_step) - int(args.base_train_steps), 0),
+        "enable_bidirectional_training": bool(args.enable_bidirectional_training),
+        "refined_teacher_cache": {
+            key: value.detach().cpu() for key, value in refined_teacher_cache.items()
+        },
+        "losses": list(losses),
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+
+
+def load_training_state(path, *, transformer, optimizer, device):
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or int(payload.get("training_state_version", 0)) < 1:
+        print(
+            json.dumps(
+                {
+                    "event": "legacy_checkpoint_no_training_state",
+                    "path": str(path),
+                    "resume_step": 0,
+                }
+            ),
+            flush=True,
+        )
+        return {"global_step": 0, "refined_teacher_cache": {}, "losses": []}
+    named_parameters = dict(transformer.named_parameters())
+    missing = []
+    for name, value in dict(payload.get("trainable_state", {})).items():
+        parameter = named_parameters.get(name)
+        if parameter is None:
+            missing.append(name)
+            continue
+        if tuple(parameter.shape) != tuple(value.shape):
+            raise ValueError(
+                f"Resume checkpoint shape mismatch for {name}: {tuple(value.shape)} != {tuple(parameter.shape)}."
+            )
+        parameter.data.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+    if missing:
+        raise ValueError(f"Resume checkpoint contains unknown trainable parameters: {missing[:10]}")
+    optimizer.load_state_dict(payload["optimizer"])
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device)
+    rng = dict(payload.get("rng_state", {}) or {})
+    if rng.get("python") is not None:
+        random.setstate(rng["python"])
+    if rng.get("numpy") is not None:
+        np.random.set_state(rng["numpy"])
+    if rng.get("torch") is not None:
+        torch.set_rng_state(rng["torch"])
+    if torch.cuda.is_available() and rng.get("cuda") is not None:
+        torch.cuda.set_rng_state_all(rng["cuda"])
+    return {
+        "global_step": int(payload.get("global_step", 0)),
+        "current_stage": str(payload.get("current_stage", "base")),
+        "base_train_steps": int(payload.get("base_train_steps", 0)),
+        "bidirectional_train_steps": int(payload.get("bidirectional_train_steps", 0)),
+        "enable_bidirectional_training": bool(payload.get("enable_bidirectional_training", False)),
+        "base_completed_steps": int(payload.get("base_completed_steps", 0)),
+        "bidirectional_completed_steps": int(payload.get("bidirectional_completed_steps", 0)),
+        "refined_teacher_cache": {
+            str(key): value.detach().cpu()
+            for key, value in dict(payload.get("refined_teacher_cache", {})).items()
+        },
+        "losses": list(payload.get("losses", [])),
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train the release Warp-as-History LoRA.")
     parser.add_argument("--base_model_path", default=DEFAULT_HELIOS_MODEL)
@@ -165,7 +306,18 @@ def parse_args():
     parser.add_argument("--prompt_csv", default="data/training/training_data.csv")
     parser.add_argument("--output_dir", default="runs/warp_as_history_lora")
     parser.add_argument("--limit", type=int, default=4)
-    parser.add_argument("--max_steps", type=int, default=1500)
+    parser.add_argument("--max_steps", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--base_train_steps", type=int, default=1500)
+    parser.add_argument("--bidirectional_train_steps", type=int, default=1500)
+    parser.add_argument(
+        "--enable_bidirectional_training",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--bidirectional_interval", type=int, default=8)
+    parser.add_argument("--bidirectional_feedback_weight", type=float, default=0.5)
+    parser.add_argument("--bidirectional_teacher_floor", type=float, default=0.5)
+    parser.add_argument("--resume_from_checkpoint", type=Path, default=None)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr_schedule", choices=["constant", "cosine", "linear"], default="constant")
     parser.add_argument("--lr_schedule_final_ratio", type=float, default=1.0)
@@ -215,6 +367,19 @@ def parse_args():
     parser.add_argument("--primary_fire_background_loss_scale", "--online_primary_fire_background_loss_scale", dest="primary_fire_background_loss_scale", type=float, default=1.0)
     parser.add_argument("--use_primary_fire_focus_loss", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_primary_fire_event_condition", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--interaction_conditioning_mode",
+        choices=["router", "binary", "off"],
+        default="router",
+        help="router is the default; binary preserves the old time-gate ablation.",
+    )
+    parser.add_argument("--interaction_adapter_rank", type=int, default=64)
+    parser.add_argument("--interaction_semantic_dim", type=int, default=256)
+    parser.add_argument("--interaction_router_temporal_loss_scale", type=float, default=1.0)
+    parser.add_argument("--interaction_router_spatial_loss_scale", type=float, default=1.0)
+    parser.add_argument("--interaction_router_negative_loss_scale", type=float, default=0.25)
+    parser.add_argument("--interaction_router_sparsity_loss_scale", type=float, default=0.01)
+    parser.add_argument("--use_minecraft_hud_mask", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--online_frame_stride", type=int, default=1)
     parser.add_argument("--online_primary_fire_window_probability", type=float, default=0.6)
     parser.add_argument("--online_max_video_frames", type=int, default=0)
@@ -290,7 +455,23 @@ def build_exact_args(args):
     exact.online_primary_fire_focus_loss_scale = float(args.primary_fire_focus_loss_scale)
     exact.online_primary_fire_background_loss_scale = float(args.primary_fire_background_loss_scale)
     exact.use_primary_fire_focus_loss = bool(args.use_primary_fire_focus_loss)
-    exact.use_primary_fire_event_condition = bool(args.use_primary_fire_event_condition)
+    exact.interaction_conditioning_mode = str(args.interaction_conditioning_mode)
+    exact.use_primary_fire_event_condition = bool(
+        args.use_primary_fire_event_condition and args.interaction_conditioning_mode == "binary"
+    )
+    exact.interaction_adapter_rank = int(args.interaction_adapter_rank)
+    exact.interaction_semantic_dim = int(args.interaction_semantic_dim)
+    exact.interaction_router_temporal_loss_scale = float(args.interaction_router_temporal_loss_scale)
+    exact.interaction_router_spatial_loss_scale = float(args.interaction_router_spatial_loss_scale)
+    exact.interaction_router_negative_loss_scale = float(args.interaction_router_negative_loss_scale)
+    exact.interaction_router_sparsity_loss_scale = float(args.interaction_router_sparsity_loss_scale)
+    exact.base_train_steps = int(args.base_train_steps)
+    exact.bidirectional_train_steps = int(args.bidirectional_train_steps)
+    exact.enable_bidirectional_training = bool(args.enable_bidirectional_training)
+    exact.bidirectional_interval = int(args.bidirectional_interval)
+    exact.bidirectional_feedback_weight = float(args.bidirectional_feedback_weight)
+    exact.bidirectional_teacher_floor = float(args.bidirectional_teacher_floor)
+    exact.use_minecraft_hud_mask = bool(args.use_minecraft_hud_mask)
     exact.online_direction_augmentation = bool(args.direction_augmentation)
     exact.online_direction_reverse_prob = float(args.direction_reverse_probability)
     exact.online_frame_stride = int(args.online_frame_stride)
@@ -348,9 +529,22 @@ def build_exact_args(args):
 
 def main():
     args = parse_args()
+    if args.max_steps is not None:
+        args.base_train_steps = int(args.max_steps)
+    if int(args.base_train_steps) < 0 or int(args.bidirectional_train_steps) < 0:
+        raise ValueError("Training stage steps must be non-negative.")
+    if int(args.bidirectional_interval) <= 0:
+        raise ValueError("--bidirectional_interval must be positive.")
+    args.max_steps = training_total_steps(
+        args.base_train_steps,
+        args.bidirectional_train_steps,
+        args.enable_bidirectional_training,
+    )
+    if int(args.max_steps) <= 0:
+        raise ValueError("Total training steps must be positive.")
     out_dir = Path(args.output_dir)
     loss_path = out_dir / "train_loss.json"
-    if loss_path.exists() and not args.overwrite:
+    if loss_path.exists() and not args.overwrite and args.resume_from_checkpoint is None:
         raise FileExistsError(f"{loss_path} exists. Use --overwrite to run again.")
     out_dir.mkdir(parents=True, exist_ok=True)
     disk_cache_arg = str(args.online_warp_disk_cache_dir or "").strip()
@@ -429,7 +623,8 @@ def main():
     opt.assert_lora_only_trainable(
         pipe.transformer,
         lora_params,
-        allow_target_channel_fusion=bool(args.use_primary_fire_event_condition),
+        allow_target_channel_fusion=str(args.interaction_conditioning_mode) == "binary",
+        allow_interaction_conditioning=str(args.interaction_conditioning_mode) == "router",
     )
     print(json.dumps(lora_stats), flush=True)
 
@@ -437,16 +632,84 @@ def main():
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
 
     losses = []
+    refined_teacher_cache = {}
+    start_step = 0
+    if args.resume_from_checkpoint is not None:
+        resume_state = load_training_state(
+            args.resume_from_checkpoint,
+            transformer=pipe.transformer,
+            optimizer=optimizer,
+            device=device,
+        )
+        start_step = int(resume_state["global_step"])
+        resume_schedule = (
+            int(resume_state.get("base_train_steps", args.base_train_steps)),
+            int(resume_state.get("bidirectional_train_steps", args.bidirectional_train_steps)),
+            bool(resume_state.get("enable_bidirectional_training", args.enable_bidirectional_training)),
+        )
+        configured_schedule = (
+            int(args.base_train_steps),
+            int(args.bidirectional_train_steps),
+            bool(args.enable_bidirectional_training),
+        )
+        if resume_schedule != configured_schedule:
+            raise ValueError(
+                f"Resume schedule {resume_schedule} does not match configured schedule {configured_schedule}."
+            )
+        refined_teacher_cache = dict(resume_state["refined_teacher_cache"])
+        losses = list(resume_state["losses"])
+        print(
+            json.dumps(
+                {
+                    "event": "training_resumed",
+                    "checkpoint": str(args.resume_from_checkpoint),
+                    "global_step": start_step,
+                    "current_stage": resume_state.get("current_stage", "base"),
+                    "base_completed_steps": resume_state.get("base_completed_steps", 0),
+                    "bidirectional_completed_steps": resume_state.get("bidirectional_completed_steps", 0),
+                }
+            ),
+            flush=True,
+        )
+    if start_step > int(args.max_steps):
+        raise ValueError(f"Checkpoint step {start_step} exceeds configured total steps {args.max_steps}.")
     start_time = time.perf_counter()
     index_iter = next_index_generator(len(items), args.max_steps, args.shuffle, args.seed)
-    for step in tqdm(range(args.max_steps), desc="train shared lora"):
+    for _ in range(start_step):
+        next(index_iter)
+    for step in tqdm(range(start_step, args.max_steps), desc="train shared lora"):
         item_idx = next(index_iter)
         item = items.get(item_idx)
         current_lr = current_train_lr(step, args.max_steps, args, exact_args)
+        training_stage = training_stage_for_step(
+            step,
+            args.base_train_steps,
+            args.enable_bidirectional_training,
+        )
+        compute_bidirectional_feedback = bool(
+            args.interaction_conditioning_mode == "router"
+            and should_compute_bidirectional_feedback(
+                step,
+                args.base_train_steps,
+                args.enable_bidirectional_training,
+                args.bidirectional_interval,
+            )
+        )
+        initial_teacher_map = item.get("initial_teacher_map", item.get("interaction_teacher_map"))
+        teacher_cache_key = interaction_teacher_cache_key(item)
+        cached_refined_teacher = refined_teacher_cache.get(teacher_cache_key)
+        if (
+            training_stage == "bidirectional"
+            and not compute_bidirectional_feedback
+            and cached_refined_teacher is not None
+        ):
+            router_teacher_map = cached_refined_teacher.to(device=device)
+        else:
+            router_teacher_map = initial_teacher_map
 
         opt.set_optimizer_lr(optimizer, current_lr)
         optimizer.zero_grad(set_to_none=True)
-        loss, stats, _ = opt.flow_matching_loss(
+        loss, stats, interaction_feedback = opt.flow_matching_loss(
             pipe,
             item["prompt_embeds"],
             item["target_latents"],
@@ -454,8 +717,34 @@ def main():
             exact_args,
             device,
             loss_focus_mask=item.get("loss_focus_mask_latents"),
+            world_valid_mask=item.get("world_valid_mask_latents"),
             target_channel_fusion_latents=item.get("primary_fire_event_latents"),
+            interaction_conditioning=item.get("interaction_conditioning"),
+            interaction_teacher_map=router_teacher_map,
+            interaction_adapter_enabled=True,
+            compute_bidirectional_feedback=compute_bidirectional_feedback,
+            bidirectional_feedback_weight=float(args.bidirectional_feedback_weight),
+            bidirectional_teacher_floor=float(args.bidirectional_teacher_floor),
         )
+        interaction_feedback = interaction_feedback or {}
+        new_refined_teacher = interaction_feedback.get("refined_teacher_map")
+        if new_refined_teacher is not None:
+            refined_teacher_cache[teacher_cache_key] = new_refined_teacher.detach().cpu()
+        active_refined_teacher = (
+            new_refined_teacher
+            if new_refined_teacher is not None
+            else cached_refined_teacher.to(device=device)
+            if cached_refined_teacher is not None and training_stage == "bidirectional"
+            else None
+        )
+        if step % max(int(args.log_every), 1) == 0:
+            opt.save_interaction_debug(
+                Path(args.output_dir) / "interaction_debug",
+                initial_teacher_map,
+                getattr(pipe.transformer, "_last_interaction_debug", None),
+                improvement_map=interaction_feedback.get("improvement_map"),
+                refined_teacher_map=active_refined_teacher,
+            )
         loss.backward()
         grad_norm = None
         if float(args.max_grad_norm) > 0:
@@ -465,6 +754,10 @@ def main():
 
         record = {
             "step": int(step),
+            "training_stage": training_stage,
+            "base_completed_steps": min(int(step + 1), int(args.base_train_steps)),
+            "bidirectional_completed_steps": max(int(step + 1) - int(args.base_train_steps), 0),
+            "bidirectional_feedback_computed": bool(compute_bidirectional_feedback),
             "seq": item["seq"],
             "loss": float(loss.detach().cpu()),
             "lr": current_lr,
@@ -492,13 +785,31 @@ def main():
                 tb_writer.flush()
         if do_save:
             save_lora(pipe, out_dir, adapter_name, f"visible_lora_state_step{step + 1:04d}.pt")
+            save_training_state(
+                out_dir / f"training_state_step{step + 1:04d}.pt",
+                transformer=pipe.transformer,
+                optimizer=optimizer,
+                global_step=step + 1,
+                args=args,
+                refined_teacher_cache=refined_teacher_cache,
+                losses=losses,
+            )
 
-        del loss, stats, item
+        del loss, stats, item, interaction_feedback
         if grad_norm is not None:
             del grad_norm
         release_cuda_cache()
 
     save_lora(pipe, out_dir, adapter_name, "visible_lora_state.pt")
+    save_training_state(
+        out_dir / "training_state.pt",
+        transformer=pipe.transformer,
+        optimizer=optimizer,
+        global_step=args.max_steps,
+        args=args,
+        refined_teacher_cache=refined_teacher_cache,
+        losses=losses,
+    )
     write_json(loss_path, losses)
     if tb_writer is not None:
         tb_writer.add_text("summary/prompt_cache_status", _json_text(items.prompt_cache_status_counts), args.max_steps)

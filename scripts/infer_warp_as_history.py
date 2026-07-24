@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
     parser.add_argument("--no_lora", action="store_true", help="Run without loading a Warp-as-History LoRA.")
     parser.add_argument("--use_primary_fire_event_condition", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--interaction_conditioning_mode",
+        choices=["router", "binary", "off"],
+        default="router",
+        help="router consumes event_frame/action_type/block_id; binary keeps the legacy time gate.",
+    )
     parser.add_argument("--use_primary_fire_focus_loss", action=argparse.BooleanOptionalAction, default=False, help=argparse.SUPPRESS)
     parser.add_argument("--primary_fire_focus_loss_scale", type=float, default=3.0, help=argparse.SUPPRESS)
     parser.add_argument("--primary_fire_background_loss_scale", type=float, default=1.0, help=argparse.SUPPRESS)
@@ -211,7 +217,47 @@ def load_demo_row(csv_path: Path) -> dict[str, Any]:
             csv_path,
         ),
         "primary_fire_event_path": _resolve_csv_path(_field(row, "primary_fire_event_path"), csv_path),
+        "interaction_event_path": _resolve_csv_path(
+            _field(row, "interaction_event_path", "mc_event_path", "primary_fire_event_path"), csv_path
+        ),
     }
+
+
+def load_interaction_payload(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if "event_frame" in payload and "action_type" in payload:
+        return {
+            "event_frame": int(payload["event_frame"]),
+            "action_type": str(payload["action_type"]),
+            "object_id": payload.get("object_id"),
+            "block_id": payload.get("block_id", payload.get("object_id")),
+            "event_valid": float(payload.get("event_valid", 1.0)),
+        }
+    events = list(payload.get("events", payload.get("selected_events", [])) or [])
+    if events:
+        event = events[0]
+        action_type = str(event.get("action_type", event.get("category", "none")))
+        if action_type == "mine":
+            action_type = "mine_complete"
+        return {
+            "event_frame": int(event.get("event_frame", event.get("local_frame", event.get("frame", 0)))),
+            "action_type": action_type,
+            "object_id": event.get("object_id"),
+            "block_id": event.get("block_id", event.get("object_id")),
+            "event_valid": 1.0,
+        }
+    click_frames = payload.get("click_frames_local", payload.get("click_frames_source", payload.get("click_frames", [])))
+    if click_frames:
+        return {
+            "event_frame": int(click_frames[0]),
+            "action_type": "primary_fire",
+            "object_id": "primary_fire",
+            "block_id": "primary_fire",
+            "event_valid": 1.0,
+        }
+    return None
 
 
 def build_primary_fire_event_latents(
@@ -466,6 +512,7 @@ def main() -> None:
     warp_visibility_mask = None
     camera_poses = None
     primary_fire_event_latents = None
+    interaction_payload = load_interaction_payload(sample.get("interaction_event_path"))
     conditioning_type = ""
     conditioning_frames = 0
     conditioning_fps = 16
@@ -548,7 +595,13 @@ def main() -> None:
         "camera_control_mesh_samples_per_axis": max(int(camera_mesh_samples_per_axis), 1),
         "warp_debug_dir": args.warp_debug_dir,
         "warp_debug_fps": fps,
-        "use_primary_fire_event_condition": bool(args.use_primary_fire_event_condition and sample["primary_fire_event_path"] is not None),
+        "use_primary_fire_event_condition": bool(
+            args.interaction_conditioning_mode == "binary"
+            and args.use_primary_fire_event_condition
+            and sample["primary_fire_event_path"] is not None
+        ),
+        "interaction_payload": interaction_payload if args.interaction_conditioning_mode == "router" else None,
+        "interaction_conditioning_mode": str(args.interaction_conditioning_mode),
     }
     if args.pyramid_num_inference_steps_list is not None:
         pipe_kwargs["pyramid_num_inference_steps_list"] = list(args.pyramid_num_inference_steps_list)
@@ -557,7 +610,11 @@ def main() -> None:
         pipe_kwargs["warp_visibility_mask"] = warp_visibility_mask
     else:
         pipe_kwargs["camera_poses"] = camera_poses
-    if bool(args.use_primary_fire_event_condition) and sample["primary_fire_event_path"] is not None:
+    if (
+        args.interaction_conditioning_mode == "binary"
+        and bool(args.use_primary_fire_event_condition)
+        and sample["primary_fire_event_path"] is not None
+    ):
         latent_frames = ((int(num_frames) - 1) // int(pipe.vae_scale_factor_temporal)) + 1
         latent_height = int(args.height) // int(pipe.vae_scale_factor_spatial)
         latent_width = int(args.width) // int(pipe.vae_scale_factor_spatial)
@@ -604,7 +661,13 @@ def main() -> None:
                 "conditioning_frames": conditioning_frames,
                 "num_frames": num_frames,
                 "fps": fps,
-                "use_primary_fire_event_condition": bool(args.use_primary_fire_event_condition and sample["primary_fire_event_path"] is not None),
+                "use_primary_fire_event_condition": bool(
+                    args.interaction_conditioning_mode == "binary"
+                    and args.use_primary_fire_event_condition
+                    and sample["primary_fire_event_path"] is not None
+                ),
+                "interaction_conditioning_mode": str(args.interaction_conditioning_mode),
+                "interaction_payload": interaction_payload,
             }
         ),
         flush=True,

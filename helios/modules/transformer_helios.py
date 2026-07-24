@@ -51,6 +51,7 @@ except ImportError:
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 
 from .helios_kernels import attn_varlen_func, create_navit_attention_masks
+from .interaction_conditioning import InteractionConditioningStack
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -1395,6 +1396,41 @@ class HeliosTransformer3DModel(
         # fire frames cannot overwrite the hidden states outright.
         self.target_channel_fusion_scale = 0.1
 
+    def enable_interaction_conditioning(self, rank=64, semantic_dim=256):
+        if getattr(self, "interaction_conditioning", None) is None:
+            self.interaction_conditioning = InteractionConditioningStack(
+                self.inner_dim, semantic_dim=int(semantic_dim), rank=int(rank)
+            )
+
+    def apply_interaction_conditioning(
+        self,
+        hidden_states,
+        raw_warp_latents,
+        payload,
+        visibility,
+        temporal,
+        height,
+        width,
+        interaction_adapter_enabled=True,
+    ):
+        stack = getattr(self, "interaction_conditioning", None)
+        if stack is None:
+            raise ValueError("interaction_conditioning was provided before enable_interaction_conditioning().")
+        warp_tokens = self.gradient_checkpointing_method(
+            self.patch_embedding,
+            raw_warp_latents.to(device=self.patch_embedding.weight.device, dtype=self.patch_embedding.weight.dtype),
+        ).flatten(2).transpose(1, 2)
+        return stack(
+            hidden_states,
+            warp_tokens,
+            payload,
+            visibility,
+            temporal,
+            height,
+            width,
+            interaction_adapter_enabled=interaction_adapter_enabled,
+        )
+
     @staticmethod
     def _target_channel_fusion_gate(raw_condition_latents, num_frames_post, tokens_per_frame):
         """Per-token fire gate derived from the raw (pre-patch) fusion latents.
@@ -1489,6 +1525,8 @@ class HeliosTransformer3DModel(
         history_visible_mask_mid=None,
         history_visible_mask_long=None,
         target_channel_fusion_latents=None,
+        interaction_conditioning=None,
+        interaction_adapter_enabled=True,
         attention_kwargs: Optional[dict[str, Any]] = None,
     ):
         history_threshold = 0.5
@@ -1504,6 +1542,7 @@ class HeliosTransformer3DModel(
         width_list = []
         temporal_list = []
         seq_list = []
+        interaction_debug = []
         if isinstance(latents, list):
             hidden_states = None
             rope_freqs = None
@@ -1515,6 +1554,28 @@ class HeliosTransformer3DModel(
                 B, C, T, H, W = cur_hidden_states.shape
 
                 cur_hidden_states = cur_hidden_states.flatten(2).transpose(1, 2)
+                if interaction_conditioning is not None:
+                    warp_values = interaction_conditioning["warp_latents"]
+                    visibility_values = interaction_conditioning.get("visibility")
+                    cur_warp = warp_values[idx] if isinstance(warp_values, list) else warp_values
+                    cur_visibility = (
+                        None
+                        if visibility_values is None
+                        else visibility_values[idx]
+                        if isinstance(visibility_values, list)
+                        else visibility_values
+                    )
+                    cur_hidden_states, cur_debug = self.apply_interaction_conditioning(
+                        cur_hidden_states,
+                        cur_warp,
+                        interaction_conditioning["payload"],
+                        cur_visibility,
+                        T,
+                        H,
+                        W,
+                        interaction_adapter_enabled=interaction_adapter_enabled,
+                    )
+                    interaction_debug.append(cur_debug)
                 if target_channel_fusion_latents is not None:
                     cur_condition_raw = (
                         target_channel_fusion_latents[idx]
@@ -1574,6 +1635,18 @@ class HeliosTransformer3DModel(
             hidden_states = hidden_states.flatten(2).transpose(
                 1, 2
             )  # torch.Size([1, 3072, 9, 44, 34]) -> torch.Size([1, 13464, 3072])
+            if interaction_conditioning is not None:
+                hidden_states, cur_debug = self.apply_interaction_conditioning(
+                    hidden_states,
+                    interaction_conditioning["warp_latents"],
+                    interaction_conditioning["payload"],
+                    interaction_conditioning.get("visibility"),
+                    T,
+                    H,
+                    W,
+                    interaction_adapter_enabled=interaction_adapter_enabled,
+                )
+                interaction_debug.append(cur_debug)
             if target_channel_fusion_latents is not None:
                 condition_hidden_states = self.gradient_checkpointing_method(
                     self.patch_embedding,
@@ -1734,6 +1807,7 @@ class HeliosTransformer3DModel(
             hidden_states = torch.cat([latents_history_long, hidden_states], dim=1)
             rope_freqs = torch.cat([rope_freqs_history_long, rope_freqs], dim=1)
 
+        self._last_interaction_debug = interaction_debug
         return (
             hidden_states,
             rope_freqs,
@@ -1817,6 +1891,8 @@ class HeliosTransformer3DModel(
         history_visible_mask_mid=None,
         history_visible_mask_long=None,
         target_channel_fusion_latents=None,
+        interaction_conditioning=None,
+        interaction_adapter_enabled=True,
         is_first_denoising_step: bool = False,
         # ------------ GAN ------------
         gan_mode: bool = False,
@@ -1883,6 +1959,8 @@ class HeliosTransformer3DModel(
             history_visible_mask_mid=history_visible_mask_mid,
             history_visible_mask_long=history_visible_mask_long,
             target_channel_fusion_latents=target_channel_fusion_latents,
+            interaction_conditioning=interaction_conditioning,
+            interaction_adapter_enabled=interaction_adapter_enabled,
             attention_kwargs=attention_kwargs,
         )  # hidden: [high, mid, low] -> [low, mid, high]
         post_patch_num_frames = sum(post_patch_num_frames_list)

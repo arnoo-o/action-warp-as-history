@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import imageio.v2 as imageio
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 
 from warp_as_history.camera_warp import (
     CAMERA_CONTROL_DEFAULT_MESH_BREAK_MODE,
@@ -31,6 +31,7 @@ from warp_as_history.camera_warp import (
 )
 from warp_as_history.training import core as opt
 from warp_as_history.training.utils import detach_tree
+from helios.modules.interaction_conditioning import interaction_action_id, interaction_block_id
 
 
 ONLINE_VIDEO_COLUMNS = ("video", "video_url", "url", "video_path", "path")
@@ -38,8 +39,124 @@ ONLINE_PROMPT_COLUMNS = ("prompt", "prompts", "caption", "text")
 ONLINE_INTERACTION_COLUMNS = ("interaction_history_path", "action_history_path", "frame_action_summary_path")
 ONLINE_PRIMARY_FIRE_EVENT_COLUMNS = ("primary_fire_event_path",)
 ONLINE_PRIMARY_FIRE_MASK_COLUMNS = ("primary_fire_loss_mask_path",)
+ONLINE_INTERACTION_EVENT_COLUMNS = ("interaction_event_path", "mc_event_path", "primary_fire_event_path")
 ONLINE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 PRIMARY_FIRE_CHAR = "["
+MC_HUD_SOURCE_SIZE = (640, 360)
+MC_HUD_RECTS = (
+    (226, 316, 316, 335),
+    (324, 414, 316, 335),
+    (224, 416, 330, 360),
+    (313, 328, 324, 347),
+)
+
+
+def minecraft_world_valid_mask(*, height=360, width=640):
+    """Build the Minecraft world mask using the exact video fit and nearest sampling."""
+    source_width, source_height = MC_HUD_SOURCE_SIZE
+    mask = np.ones((source_height, source_width), dtype=np.uint8) * 255
+    for x1, x2, y1, y2 in MC_HUD_RECTS:
+        mask[y1:y2, x1:x2] = 0
+    source = Image.fromarray(mask, mode="L")
+    return ImageOps.fit(
+        source,
+        (int(width), int(height)),
+        method=Image.Resampling.NEAREST,
+        centering=(0.5, 0.5),
+    )
+
+
+def _minecraft_hud_rect_masks(*, height, width):
+    source_width, source_height = MC_HUD_SOURCE_SIZE
+    masks = []
+    for x1, x2, y1, y2 in MC_HUD_RECTS:
+        rect = np.zeros((source_height, source_width), dtype=np.uint8)
+        rect[y1:y2, x1:x2] = 255
+        masks.append(
+            ImageOps.fit(
+                Image.fromarray(rect, mode="L"),
+                (int(width), int(height)),
+                method=Image.Resampling.NEAREST,
+                centering=(0.5, 0.5),
+            )
+        )
+    return masks
+
+
+def fill_minecraft_hud_for_pi3(frame):
+    """Fill only a Pi3 input copy; target/VAE pixels remain untouched."""
+    original = np.asarray(frame.convert("RGB"), dtype=np.uint8)
+    result = original.copy()
+    height, width = result.shape[:2]
+    for rect_mask in _minecraft_hud_rect_masks(height=height, width=width):
+        region = np.asarray(rect_mask, dtype=np.uint8) > 0
+        ys, xs = np.nonzero(region)
+        if not len(ys):
+            continue
+        source_y = max(0, int(ys.min()) - 1)
+        source_row = original[source_y]
+        for y in np.unique(ys):
+            columns = np.flatnonzero(region[y])
+            result[y, columns] = source_row[columns]
+    return Image.fromarray(result, mode="RGB")
+
+
+def multiply_mask_frames(mask_frames, world_valid_mask):
+    world = np.asarray(world_valid_mask.convert("L"), dtype=np.float32) / 255.0
+    result = []
+    for frame in mask_frames:
+        values = np.asarray(frame.convert("L"), dtype=np.float32) / 255.0
+        if values.shape != world.shape:
+            raise ValueError(f"Mask/world shape mismatch: {values.shape} != {world.shape}.")
+        result.append(Image.fromarray(np.rint(values * world * 255.0).astype(np.uint8), mode="L"))
+    return result
+
+
+def clear_minecraft_hud_geometry(geometry, world_valid_mask):
+    """Remove HUD pixels from every Pi3 geometry representation used by rendering."""
+    keyframes = geometry.get("keyframe_geometries")
+    geometries = list(keyframes) if keyframes is not None else [geometry]
+    for item in geometries:
+        render_height = int(item["render_height"])
+        render_width = int(item["render_width"])
+        valid_image = world_valid_mask.resize(
+            (render_width, render_height),
+            resample=Image.Resampling.NEAREST,
+        )
+        world_valid = np.asarray(valid_image, dtype=np.uint8) > 0
+        valid = np.asarray(item["valid_mask"], dtype=bool).copy()
+        valid &= world_valid
+        item["valid_mask"] = valid
+        if "conf_map" in item:
+            conf = np.asarray(item["conf_map"], dtype=np.float32).copy()
+            conf[~world_valid] = 0.0
+            item["conf_map"] = conf
+        if "depth_map" in item:
+            depth = np.asarray(item["depth_map"], dtype=np.float32).copy()
+            depth[~world_valid] = 0.0
+            item["depth_map"] = depth
+        if "point_map_world" in item:
+            points = np.asarray(item["point_map_world"], dtype=np.float32).copy()
+            points[~world_valid] = 0.0
+            item["point_map_world"] = points
+        item["minecraft_world_valid_mask"] = world_valid
+    if keyframes:
+        latest = keyframes[-1]
+        for name in ("valid_mask", "conf_map", "depth_map", "point_map_world"):
+            if name in latest:
+                geometry[name] = latest[name]
+    geometry["minecraft_hud_mask_applied"] = True
+    return geometry
+
+
+def _safe_debug_name(value):
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(value))
+
+
+def _save_mask_debug(path, frame):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.convert("L").save(path)
 
 
 def _online_infer_column(columns, requested, candidates, label):
@@ -80,6 +197,7 @@ def normalize_online_training_dataframe(df, exact_args):
     prompt_trigger = str(getattr(exact_args, "online_prompt_trigger", CAMERA_CONTROL_PROMPT_TRIGGER) or "")
     event_column = _online_optional_column(columns, "", ONLINE_PRIMARY_FIRE_EVENT_COLUMNS)
     loss_mask_column = _online_optional_column(columns, "", ONLINE_PRIMARY_FIRE_MASK_COLUMNS)
+    interaction_event_column = _online_optional_column(columns, "", ONLINE_INTERACTION_EVENT_COLUMNS)
     rows = []
     for row_index, (_, row) in enumerate(df.iterrows()):
         base = row.to_dict()
@@ -93,6 +211,8 @@ def normalize_online_training_dataframe(df, exact_args):
             base["primary_fire_event_path"] = base.get(event_column, "")
         if loss_mask_column:
             base["primary_fire_loss_mask_path"] = base.get(loss_mask_column, "")
+        if interaction_event_column:
+            base["interaction_event_path"] = base.get(interaction_event_column, "")
         rows.append(base)
     normalized = df.__class__(rows)
     meta = {
@@ -101,6 +221,7 @@ def normalize_online_training_dataframe(df, exact_args):
         "prompt_trigger": prompt_trigger,
         "primary_fire_event_column": event_column,
         "primary_fire_loss_mask_column": loss_mask_column,
+        "interaction_event_column": interaction_event_column,
         "rows": len(rows),
     }
     return normalized, meta
@@ -382,7 +503,15 @@ def build_primary_fire_focus_mask_frames(target_frames, warp_frames, supervision
     return mask_frames, stats
 
 
-def online_mask_frames_to_latent_mask(mask_frames, *, target_latents, num_frames, temporal_scale, device):
+def online_mask_frames_to_latent_mask(
+    mask_frames,
+    *,
+    target_latents,
+    num_frames,
+    temporal_scale,
+    device,
+    interpolation_mode="trilinear",
+):
     if not mask_frames:
         return None
     mask = np.stack([np.asarray(frame.convert("L"), dtype=np.float32) / 255.0 for frame in mask_frames], axis=0)
@@ -392,17 +521,132 @@ def online_mask_frames_to_latent_mask(mask_frames, *, target_latents, num_frames
     sampled_ids = np.clip(sampled_ids, 0, mask.shape[0] - 1)
     sampled = torch.from_numpy(mask[sampled_ids]).to(device=device, dtype=torch.float32)
     sampled = sampled.unsqueeze(0).unsqueeze(0)
-    sampled = torch.nn.functional.interpolate(
-        sampled,
-        size=(int(target_latents.shape[2]), int(target_latents.shape[3]), int(target_latents.shape[4])),
-        mode="trilinear",
-        align_corners=False,
-    )
+    interpolate_kwargs = {
+        "size": (int(target_latents.shape[2]), int(target_latents.shape[3]), int(target_latents.shape[4])),
+        "mode": str(interpolation_mode),
+    }
+    if str(interpolation_mode) != "nearest":
+        interpolate_kwargs["align_corners"] = False
+    sampled = torch.nn.functional.interpolate(sampled, **interpolate_kwargs)
     return sampled.clamp_(0.0, 1.0)
 
 
 def load_primary_fire_event_payload(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def canonical_interaction_events(payload):
+    events = []
+    for event in list(payload.get("events", payload.get("selected_events", [])) or []):
+        action_type = str(event.get("action_type", event.get("category", "none"))).strip().lower()
+        if action_type == "mine":
+            action_type = "mine_complete"
+        frame = event.get("event_frame", event.get("local_frame", event.get("frame")))
+        if frame is None:
+            continue
+        events.append(
+            {
+                "event_frame": int(frame),
+                "action_type": action_type,
+                "object_id": event.get("object_id"),
+                "block_id": event.get("block_id", event.get("object_id")),
+            }
+        )
+    if not events:
+        click_frames = payload.get("click_frames_local", payload.get("click_frames_source", payload.get("click_frames", [])))
+        for frame in click_frames:
+            events.append(
+                {
+                    "event_frame": int(frame),
+                    "action_type": "primary_fire",
+                    "object_id": "primary_fire",
+                    "block_id": "primary_fire",
+                }
+            )
+    return sorted(events, key=lambda item: int(item["event_frame"]))
+
+
+def choose_online_interaction_window(rng, num_frames, window_size, interaction_payload):
+    events = canonical_interaction_events(interaction_payload or {})
+    if not events:
+        return None
+    event = rng.choice(events)
+    event_offset = rng.randrange(max(int(window_size), 1))
+    start = min(max(int(event["event_frame"]) - event_offset, 0), int(num_frames) - int(window_size))
+    return list(range(start, start + int(window_size)))
+
+
+def crop_interaction_payload(interaction_payload, target_indices):
+    target_indices = [int(index) for index in target_indices]
+    index_to_local = {source: local for local, source in enumerate(target_indices)}
+    events = [
+        event
+        for event in canonical_interaction_events(interaction_payload or {})
+        if int(event["event_frame"]) in index_to_local
+    ]
+    if not events:
+        return {
+            "event_frame": 0,
+            "action_type": "none",
+            "object_id": None,
+            "block_id": None,
+            "event_valid": 0.0,
+            "num_frames": len(target_indices),
+        }
+    event = events[0]
+    return {
+        **event,
+        "event_frame_source": int(event["event_frame"]),
+        "event_frame": int(index_to_local[int(event["event_frame"])]),
+        "event_valid": 1.0,
+        "num_frames": len(target_indices),
+    }
+
+
+def interaction_payload_tensors(payload, device):
+    payload = payload or {}
+    return {
+        "action_ids": torch.tensor([interaction_action_id(payload.get("action_type"))], device=device, dtype=torch.long),
+        "block_ids": torch.tensor(
+            [interaction_block_id(payload.get("block_id", payload.get("object_id")))],
+            device=device,
+            dtype=torch.long,
+        ),
+        "event_frames": torch.tensor([float(payload.get("event_frame", 0))], device=device),
+        "total_frames": torch.tensor([float(payload.get("num_frames", 1))], device=device),
+        "event_valid": torch.tensor([float(payload.get("event_valid", 0.0))], device=device),
+    }
+
+
+def build_residual_teacher_map(target_latents, warp_latents, visibility, world_valid_mask=None):
+    """Soft full-video residual map; no event-centered temporal window is applied."""
+    warp = warp_latents.to(device=target_latents.device, dtype=target_latents.dtype)
+    if warp.shape[2:] != target_latents.shape[2:]:
+        warp = torch.nn.functional.interpolate(
+            warp.float(), size=target_latents.shape[2:], mode="trilinear", align_corners=False
+        ).to(target_latents)
+    residual = (target_latents.float() - warp.float()).abs().mean(dim=1, keepdim=True)
+    target_change = torch.zeros_like(residual)
+    warp_change = torch.zeros_like(residual)
+    if residual.shape[2] > 1:
+        target_change[:, :, 1:] = (target_latents[:, :, 1:].float() - target_latents[:, :, :-1].float()).abs().mean(
+            dim=1, keepdim=True
+        )
+        warp_change[:, :, 1:] = (warp[:, :, 1:].float() - warp[:, :, :-1].float()).abs().mean(dim=1, keepdim=True)
+    change = target_change + warp_change
+    residual_scale = residual.flatten(1).mean(dim=1).view(-1, 1, 1, 1, 1).clamp_min(1e-6)
+    change_scale = change.flatten(1).mean(dim=1).view(-1, 1, 1, 1, 1).clamp_min(1e-6)
+    teacher = (residual / (3.0 * residual_scale)).clamp(0.0, 1.0)
+    teacher = teacher * (0.25 + 0.75 * (change / (3.0 * change_scale)).clamp(0.0, 1.0))
+    if visibility is not None:
+        teacher = teacher * torch.nn.functional.interpolate(
+            visibility.float(), size=teacher.shape[2:], mode="nearest"
+        )
+    if world_valid_mask is not None:
+        teacher = teacher * torch.nn.functional.interpolate(
+            world_valid_mask.float(), size=teacher.shape[2:], mode="nearest"
+        )
+    return teacher.clamp(0.0, 1.0)
 
 
 def load_primary_fire_loss_mask_frames(path):
@@ -692,7 +936,7 @@ class OnlineWarpTrainingCache:
         return path
 
     def _cache_payload(self):
-        return {
+        payload = {
             "height": int(self.exact_args.height),
             "width": int(self.exact_args.width),
             "frame_stride": int(getattr(self.exact_args, "online_frame_stride", 1)),
@@ -720,6 +964,9 @@ class OnlineWarpTrainingCache:
                 getattr(self.exact_args, "online_mesh_normal_tol_deg", CAMERA_CONTROL_DEFAULT_MESH_NORMAL_TOL_DEG)
             ),
         }
+        if bool(getattr(self.exact_args, "use_minecraft_hud_mask", False)):
+            payload["minecraft_hud_mask"] = "mc_640x360_v1"
+        return payload
 
     def _geometry_cache_path(self, row_index, direction):
         if self.disk_cache_dir is None:
@@ -797,7 +1044,9 @@ class OnlineWarpTrainingCache:
         torch.save(payload, cache_path)
 
     def _estimate_geometry(self, row_index, row, direction, ref, frames):
-        tensors = [online_pil_to_tensor(frame).unsqueeze(0) for frame in frames]
+        use_hud_mask = bool(getattr(self.exact_args, "use_minecraft_hud_mask", False))
+        pi3_frames = [fill_minecraft_hud_for_pi3(frame) for frame in frames] if use_hud_mask else frames
+        tensors = [online_pil_to_tensor(frame).unsqueeze(0) for frame in pi3_frames]
         print(
             json.dumps(
                 {
@@ -813,8 +1062,16 @@ class OnlineWarpTrainingCache:
         )
         try:
             geometry = self.renderer.estimate_keyframe_geometry(tensors, device=self.device)
+            if use_hud_mask:
+                world_valid_mask = minecraft_world_valid_mask(
+                    height=int(self.exact_args.height),
+                    width=int(self.exact_args.width),
+                )
+                clear_minecraft_hud_geometry(geometry, world_valid_mask)
         finally:
             del tensors
+            if use_hud_mask:
+                del pi3_frames
             self.renderer._pi3x_runtime = None
             opt.clean_memory()
         return geometry
@@ -884,6 +1141,25 @@ class OnlineWarpTrainingCache:
         full_focus_mask_frames = (
             load_primary_fire_loss_mask_frames(loss_mask_path) if loss_mask_path is not None and loss_mask_path.is_file() else None
         )
+        interaction_path = resolve_optional_data_path(
+            row.get("interaction_event_path", ""), getattr(self.exact_args, "data_root", ".")
+        )
+        full_interaction_payload = (
+            load_primary_fire_event_payload(interaction_path)
+            if interaction_path is not None and interaction_path.is_file()
+            else full_event_payload
+        )
+        if str(row.get("action_type", row.get("category", "")) or "").strip():
+            full_interaction_payload = {
+                "events": [
+                    {
+                        "event_frame": int(row.get("event_frame", row.get("event_local_frame", 0))),
+                        "action_type": str(row.get("action_type", row.get("category", "none"))),
+                        "object_id": row.get("object_id"),
+                        "block_id": row.get("block_id", row.get("object_id")),
+                    }
+                ]
+            }
         frames = prepared["frames"]
         n = len(frames)
         num_frames = int(self.exact_args.num_frames)
@@ -892,7 +1168,10 @@ class OnlineWarpTrainingCache:
         sample_fire_prob = float(getattr(self.exact_args, "online_primary_fire_window_probability", 0.6) or 0.6)
         target_indices = None
         chunk_mode = "movement"
-        if full_event_payload is not None and rng.random() < sample_fire_prob:
+        if full_interaction_payload is not None and rng.random() < sample_fire_prob:
+            target_indices = choose_online_interaction_window(rng, n, num_frames, full_interaction_payload)
+            chunk_mode = "interaction"
+        if target_indices is None and full_event_payload is not None and rng.random() < sample_fire_prob:
             target_indices = choose_online_primary_fire_window(rng, n, num_frames, full_event_payload)
             chunk_mode = "primary_fire"
         if target_indices is None:
@@ -955,6 +1234,16 @@ class OnlineWarpTrainingCache:
             raise ValueError(
                 f"Online warp rendered {len(warp_frames)} frames/{len(warp_mask_frames)} masks, need {num_frames}."
             )
+        use_hud_mask = bool(getattr(self.exact_args, "use_minecraft_hud_mask", False))
+        world_valid_mask = None
+        visibility_before_hud = None
+        if use_hud_mask:
+            world_valid_mask = minecraft_world_valid_mask(
+                height=int(self.exact_args.height),
+                width=int(self.exact_args.width),
+            )
+            visibility_before_hud = [frame.copy() for frame in warp_mask_frames]
+            warp_mask_frames = multiply_mask_frames(warp_mask_frames, world_valid_mask)
         interaction_memory = summarize_multiscale_interaction_history(
             self.interaction_histories.get(row_index),
             history_indices,
@@ -962,6 +1251,7 @@ class OnlineWarpTrainingCache:
             max_items=int(getattr(self.exact_args, "online_interaction_max_items", 8)),
         )
         event_payload = crop_primary_fire_event_payload(full_event_payload, target_indices) if full_event_payload is not None else None
+        interaction_payload = crop_interaction_payload(full_interaction_payload, target_indices)
         focus_mask_frames = None
         focus_mask_stats = {}
         if event_payload is not None:
@@ -990,6 +1280,24 @@ class OnlineWarpTrainingCache:
                 residual_threshold=float(getattr(self.exact_args, "online_primary_fire_residual_threshold", 0.08)),
             )
         seq = f"{row['id']}:{direction}:{chunk_mode}:{int(prepare_index)}"
+        if world_valid_mask is not None:
+            focus_mask_frames = multiply_mask_frames(focus_mask_frames, world_valid_mask)
+            debug_dir = (
+                Path(getattr(self.exact_args, "output_dir", "runs/warp_as_history_lora"))
+                / "hud_debug"
+                / _safe_debug_name(seq)
+            )
+            _save_mask_debug(debug_dir / "hud_valid_mask.png", world_valid_mask)
+            fill_minecraft_hud_for_pi3(condition_frame).save(debug_dir / "pi3_input_hud_filled.png")
+            _save_mask_debug(debug_dir / "visibility_before_hud.png", visibility_before_hud[0])
+            _save_mask_debug(debug_dir / "visibility_after_hud.png", warp_mask_frames[0])
+            focus_debug = np.maximum.reduce(
+                [np.asarray(frame.convert("L"), dtype=np.uint8) for frame in focus_mask_frames]
+            )
+            _save_mask_debug(
+                debug_dir / "focus_mask_after_hud.png",
+                Image.fromarray(focus_debug, mode="L"),
+            )
         result = {
             "condition_frame": condition_frame,
             "direction": direction,
@@ -1014,6 +1322,7 @@ class OnlineWarpTrainingCache:
                 "interaction_memory": interaction_memory,
                 "primary_fire_supervision": primary_fire_supervision,
                 "primary_fire_event_payload": event_payload,
+                "interaction_payload": interaction_payload,
                 "focus_mask_stats": focus_mask_stats,
                 "sample_window_type": chunk_mode,
             },
@@ -1021,6 +1330,7 @@ class OnlineWarpTrainingCache:
             "interaction_memory": interaction_memory,
             "primary_fire_supervision": primary_fire_supervision,
             "primary_fire_event_payload": event_payload,
+            "interaction_payload": interaction_payload,
             "prompt": row["prompt"],
             "prompt_base": row["prompt"],
             "prompt_raw": row.get("prompt_raw", row["prompt"]),
@@ -1031,6 +1341,9 @@ class OnlineWarpTrainingCache:
             "warp_frames": warp_frames,
             "warp_mask_frames": warp_mask_frames,
             "focus_mask_frames": focus_mask_frames,
+            "world_valid_mask_frames": None
+            if world_valid_mask is None
+            else [world_valid_mask.copy() for _ in range(num_frames)],
         }
         del rendered, warp_video, warp_mask, geometry, poses
         self.renderer._pi3x_runtime = None
@@ -1119,8 +1432,11 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
     old_extra_mask = getattr(exact_args, "history_visibility_extra_mask_frames", None)
     exact_args.history_visibility_extra_mask_frames = mask_frames
     loss_focus_mask_latents = None
+    world_valid_mask_latents = None
     primary_fire_event_latents = None
     primary_fire_event_debug = None
+    interaction_teacher_map = None
+    interaction_conditioning = None
 
     try:
         with torch.no_grad():
@@ -1160,6 +1476,40 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
                 temporal_scale=int(pipe.vae_scale_factor_temporal),
                 device=device,
             )
+            world_valid_mask_latents = online_mask_frames_to_latent_mask(
+                case.get("world_valid_mask_frames"),
+                target_latents=target_latents,
+                num_frames=int(exact_args.num_frames),
+                temporal_scale=int(pipe.vae_scale_factor_temporal),
+                device=device,
+                interpolation_mode="nearest",
+            )
+            visibility_latents = online_mask_frames_to_latent_mask(
+                case.get("warp_mask_frames"),
+                target_latents=target_latents,
+                num_frames=int(exact_args.num_frames),
+                temporal_scale=int(pipe.vae_scale_factor_temporal),
+                device=device,
+                interpolation_mode="nearest",
+            )
+            interaction_payload = case.get("interaction_payload") or {
+                "event_frame": 0,
+                "action_type": "none",
+                "event_valid": 0.0,
+                "num_frames": int(exact_args.num_frames),
+            }
+            if str(getattr(exact_args, "interaction_conditioning_mode", "router")) == "router":
+                interaction_teacher_map = build_residual_teacher_map(
+                    target_latents,
+                    video_latents,
+                    visibility_latents,
+                    world_valid_mask_latents,
+                )
+                interaction_conditioning = {
+                    "payload": interaction_payload_tensors(interaction_payload, device),
+                    "warp_latents": video_latents.detach(),
+                    "visibility": visibility_latents.detach(),
+                }
             if bool(getattr(exact_args, "use_primary_fire_event_condition", False)):
                 event_payload = case.get("primary_fire_event_payload") or {
                     "click_frames": case.get("primary_fire_supervision", {}).get("click_frames", []),
@@ -1197,10 +1547,21 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
         else list(case["primary_fire_event_payload"].get("time_mask", [])),
         "primary_fire_event": case.get("primary_fire_event_payload"),
         "loss_focus_mask_latents": None if loss_focus_mask_latents is None else loss_focus_mask_latents.detach(),
+        "world_valid_mask_latents": None
+        if world_valid_mask_latents is None
+        else world_valid_mask_latents.detach(),
         "primary_fire_event_latents": None
         if primary_fire_event_latents is None
         else primary_fire_event_latents.detach(),
         "primary_fire_event_debug": primary_fire_event_debug,
+        "interaction_payload": case.get("interaction_payload"),
+        "interaction_conditioning": detach_tree(interaction_conditioning),
+        "interaction_teacher_map": None
+        if interaction_teacher_map is None
+        else interaction_teacher_map.detach(),
+        "initial_teacher_map": None
+        if interaction_teacher_map is None
+        else interaction_teacher_map.detach(),
     }
     if keep_frames:
         item["target_frames"] = [frame.resize((exact_args.width, exact_args.height)) for frame in target_frames]
