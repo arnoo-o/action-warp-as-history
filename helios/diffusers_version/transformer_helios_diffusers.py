@@ -41,6 +41,7 @@ except ImportError:
             return fn
         return decorator
 from diffusers.utils.torch_utils import maybe_allow_in_graph
+from helios.modules.interaction_conditioning import InteractionConditioningStack
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -704,6 +705,7 @@ class HeliosTransformer3DModel(
         has_multi_term_memory_patch: bool = True,
         is_amplify_history: bool = False,
         history_scale_mode: str = "per_head",  # [scalar, per_head]
+        image_dim: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -777,8 +779,39 @@ class HeliosTransformer3DModel(
         nn.init.zeros_(self.target_channel_fusion_mlp[0].bias)
         nn.init.zeros_(self.target_channel_fusion_mlp[2].weight)
         nn.init.zeros_(self.target_channel_fusion_mlp[2].bias)
+        # Fixed, gentle scale on the fusion delta (mirrors training transformer). Bounds the
+        # per-frame perturbation so fire frames cannot overwrite the hidden states outright.
+        self.target_channel_fusion_scale = 0.1
 
-    def fuse_target_channel_condition(self, hidden_states, condition_hidden_states):
+    def enable_interaction_conditioning(self, rank=64, semantic_dim=256):
+        if getattr(self, "interaction_conditioning", None) is None:
+            self.interaction_conditioning = InteractionConditioningStack(
+                self.inner_dim, semantic_dim=int(semantic_dim), rank=int(rank)
+            )
+
+    def apply_interaction_conditioning(self, hidden_states, raw_warp_latents, payload, visibility, temporal, height, width):
+        stack = getattr(self, "interaction_conditioning", None)
+        if stack is None:
+            raise ValueError("interaction_conditioning was provided before enable_interaction_conditioning().")
+        warp_tokens = self.patch_embedding(
+            raw_warp_latents.to(device=self.patch_embedding.weight.device, dtype=self.patch_embedding.weight.dtype)
+        ).flatten(2).transpose(1, 2)
+        return stack(hidden_states, warp_tokens, payload, visibility, temporal, height, width)
+
+    @staticmethod
+    def _target_channel_fusion_gate(raw_condition_latents, num_frames_post, tokens_per_frame):
+        """Per-token fire gate derived from the raw (pre-patch) fusion latents. Non-fire frames
+        (fire weight 0) yield an exactly-zero delta, leaving hidden states untouched."""
+        per_frame = raw_condition_latents.detach().amax(dim=1).amax(dim=-1).amax(dim=-1)
+        per_frame = per_frame.clamp(0.0, 1.0).to(dtype=torch.float32)
+        if int(per_frame.shape[1]) != int(num_frames_post):
+            per_frame = F.interpolate(
+                per_frame.unsqueeze(1), size=int(num_frames_post), mode="nearest"
+            ).squeeze(1)
+        gate = per_frame.repeat_interleave(int(tokens_per_frame), dim=1).unsqueeze(-1)
+        return gate
+
+    def fuse_target_channel_condition(self, hidden_states, condition_hidden_states, gate=None):
         fusion_mlp = getattr(self, "target_channel_fusion_mlp", None)
         if fusion_mlp is None:
             raise ValueError("target_channel_fusion_latents were provided before enabling target_channel_fusion_mlp.")
@@ -789,8 +822,11 @@ class HeliosTransformer3DModel(
             )
         fusion_dtype = next(fusion_mlp.parameters()).dtype
         fusion_input = torch.cat([hidden_states, condition_hidden_states.to(hidden_states)], dim=-1).to(fusion_dtype)
-        fused_delta = fusion_mlp(fusion_input)
-        return hidden_states + fused_delta.to(hidden_states)
+        fused_delta = fusion_mlp(fusion_input).to(hidden_states)
+        fused_delta = float(getattr(self, "target_channel_fusion_scale", 0.1)) * fused_delta
+        if gate is not None:
+            fused_delta = fused_delta * gate.to(hidden_states)
+        return hidden_states + fused_delta
 
     def _maybe_apply_learned_rope_delta(
         self,
@@ -851,6 +887,7 @@ class HeliosTransformer3DModel(
         history_visible_mask_mid=None,
         history_visible_mask_long=None,
         target_channel_fusion_latents=None,
+        interaction_conditioning=None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
@@ -885,6 +922,18 @@ class HeliosTransformer3DModel(
             indices_hidden_states = torch.arange(0, post_patch_num_frames).unsqueeze(0).expand(batch_size, -1)
 
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        self._last_interaction_debug = []
+        if interaction_conditioning is not None:
+            hidden_states, interaction_debug = self.apply_interaction_conditioning(
+                hidden_states,
+                interaction_conditioning["warp_latents"],
+                interaction_conditioning["payload"],
+                interaction_conditioning.get("visibility"),
+                post_patch_num_frames,
+                post_patch_height,
+                post_patch_width,
+            )
+            self._last_interaction_debug.append(interaction_debug)
         if target_channel_fusion_latents is not None:
             condition_hidden_states = self.patch_embedding(
                 target_channel_fusion_latents.to(
@@ -892,7 +941,14 @@ class HeliosTransformer3DModel(
                 )
             )
             condition_hidden_states = condition_hidden_states.flatten(2).transpose(1, 2)
-            hidden_states = self.fuse_target_channel_condition(hidden_states, condition_hidden_states)
+            fusion_gate = self._target_channel_fusion_gate(
+                target_channel_fusion_latents,
+                num_frames_post=post_patch_num_frames,
+                tokens_per_frame=post_patch_height * post_patch_width,
+            )
+            hidden_states = self.fuse_target_channel_condition(
+                hidden_states, condition_hidden_states, gate=fusion_gate
+            )
         rotary_emb = self.rope(
             frame_indices=indices_hidden_states,
             height=post_patch_height,
