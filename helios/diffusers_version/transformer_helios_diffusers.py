@@ -783,20 +783,51 @@ class HeliosTransformer3DModel(
         # per-frame perturbation so fire frames cannot overwrite the hidden states outright.
         self.target_channel_fusion_scale = 0.1
 
-    def enable_interaction_conditioning(self, rank=64, semantic_dim=256):
+    def enable_interaction_conditioning(
+        self,
+        rank=64,
+        semantic_dim=256,
+        stage_warp_scales=(1.0, 0.5, 0.25),
+        stage_adapter_scales=(1.0, 0.5, 0.25),
+    ):
         if getattr(self, "interaction_conditioning", None) is None:
             self.interaction_conditioning = InteractionConditioningStack(
-                self.inner_dim, semantic_dim=int(semantic_dim), rank=int(rank)
+                self.inner_dim,
+                semantic_dim=int(semantic_dim),
+                rank=int(rank),
+                stage_warp_scales=stage_warp_scales,
+                stage_adapter_scales=stage_adapter_scales,
             )
 
-    def apply_interaction_conditioning(self, hidden_states, raw_warp_latents, payload, visibility, temporal, height, width):
+    def apply_interaction_conditioning(
+        self,
+        hidden_states,
+        raw_warp_latents,
+        payload,
+        visibility,
+        temporal,
+        height,
+        width,
+        stage_id=0,
+        previous_gate=None,
+    ):
         stack = getattr(self, "interaction_conditioning", None)
         if stack is None:
             raise ValueError("interaction_conditioning was provided before enable_interaction_conditioning().")
         warp_tokens = self.patch_embedding(
             raw_warp_latents.to(device=self.patch_embedding.weight.device, dtype=self.patch_embedding.weight.dtype)
         ).flatten(2).transpose(1, 2)
-        return stack(hidden_states, warp_tokens, payload, visibility, temporal, height, width)
+        return stack(
+            hidden_states,
+            warp_tokens,
+            payload,
+            visibility,
+            temporal,
+            height,
+            width,
+            stage_id=stage_id,
+            previous_gate=previous_gate,
+        )
 
     @staticmethod
     def _target_channel_fusion_gate(raw_condition_latents, num_frames_post, tokens_per_frame):
@@ -932,6 +963,8 @@ class HeliosTransformer3DModel(
                 post_patch_num_frames,
                 post_patch_height,
                 post_patch_width,
+                stage_id=int(interaction_conditioning.get("stage_id", 0)),
+                previous_gate=interaction_conditioning.get("previous_gate"),
             )
             self._last_interaction_debug.append(interaction_debug)
         if target_channel_fusion_latents is not None:

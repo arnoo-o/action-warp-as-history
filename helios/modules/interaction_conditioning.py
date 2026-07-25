@@ -11,6 +11,9 @@ import torch.nn.functional as F
 INTERACTION_ACTIONS = ("none", "place", "mine_active", "mine_complete", "primary_fire")
 INTERACTION_ACTION_TO_ID = {name: index for index, name in enumerate(INTERACTION_ACTIONS)}
 INTERACTION_BLOCK_BUCKETS = 4096
+INTERACTION_PYRAMID_STAGES = 3
+DEFAULT_STAGE_WARP_SCALES = (1.0, 0.5, 0.25)
+DEFAULT_STAGE_ADAPTER_SCALES = (1.0, 0.5, 0.25)
 
 
 def interaction_action_id(action_type: str | None) -> int:
@@ -97,6 +100,9 @@ class InteractionRouter(nn.Module):
         frame_positions,
         event_positions,
         event_valid,
+        previous_gate=None,
+        previous_support=None,
+        is_refinement=False,
     ):
         relative = frame_positions.float() - event_positions.float().unsqueeze(1)
         temporal_features = torch.stack(
@@ -115,7 +121,17 @@ class InteractionRouter(nn.Module):
             + self.semantic_projection(interaction_token).unsqueeze(1)
             + self.temporal_projection(temporal_features)
         )
-        gate = torch.sigmoid(self.output(F.silu(routed)))
+        logits = self.output(F.silu(routed))
+        if bool(is_refinement):
+            if previous_gate is None:
+                raise ValueError("coarse-to-fine interaction refinement requires previous_gate.")
+            previous_gate = previous_gate.to(device=logits.device, dtype=torch.float32)
+            if previous_support is None:
+                raise ValueError("coarse-to-fine interaction refinement requires previous_support.")
+            delta = 0.25 * torch.tanh(logits) * previous_support.to(logits)
+            gate = (previous_gate + delta).clamp(0.0, 1.0)
+        else:
+            gate = torch.sigmoid(logits)
         return gate * visibility.float() * event_valid.float().view(-1, 1, 1)
 
 
@@ -130,23 +146,43 @@ class InteractionAdapter(nn.Module):
         self.scale = float(scale)
         nn.init.zeros_(self.up.weight)
 
-    def forward(self, target_tokens, warp_tokens, interaction_token, gate):
+    def forward(self, target_tokens, warp_tokens, interaction_token, gate, stage_scale=1.0):
         low_rank = (
             self.target_down(target_tokens)
             + self.warp_down(warp_tokens)
             + self.semantic_down(interaction_token).unsqueeze(1)
         )
         delta = self.up(F.silu(low_rank)).to(target_tokens)
-        injection = self.scale * gate.to(target_tokens) * delta
+        injection = self.scale * stage_scale.to(target_tokens) * gate.to(target_tokens) * delta
         return target_tokens + injection, injection
 
 
 class InteractionConditioningStack(nn.Module):
-    def __init__(self, hidden_dim: int, semantic_dim: int = 256, rank: int = 64):
+    def __init__(
+        self,
+        hidden_dim: int,
+        semantic_dim: int = 256,
+        rank: int = 64,
+        stage_warp_scales=DEFAULT_STAGE_WARP_SCALES,
+        stage_adapter_scales=DEFAULT_STAGE_ADAPTER_SCALES,
+    ):
         super().__init__()
         self.semantic_encoder = InteractionSemanticEncoder(hidden_dim, semantic_dim=semantic_dim)
+        self.stage_embedding = nn.Embedding(INTERACTION_PYRAMID_STAGES, self.semantic_encoder.semantic_dim)
+        nn.init.zeros_(self.stage_embedding.weight)
         self.router = InteractionRouter(hidden_dim, semantic_dim=semantic_dim, rank=rank)
         self.adapter = InteractionAdapter(hidden_dim, semantic_dim=semantic_dim, rank=rank)
+        self.stage_warp_scales = nn.Parameter(self._stage_scale_tensor(stage_warp_scales, "stage_warp_scales"))
+        self.stage_adapter_scales = nn.Parameter(
+            self._stage_scale_tensor(stage_adapter_scales, "stage_adapter_scales")
+        )
+
+    @staticmethod
+    def _stage_scale_tensor(values, name):
+        values = tuple(float(value) for value in values)
+        if len(values) != INTERACTION_PYRAMID_STAGES:
+            raise ValueError(f"{name} must contain {INTERACTION_PYRAMID_STAGES} values, got {values}.")
+        return torch.tensor(values, dtype=torch.float32)
 
     @staticmethod
     def _payload_tensor(payload, name, batch_size, device, dtype, default):
@@ -168,6 +204,8 @@ class InteractionConditioningStack(nn.Module):
         height,
         width,
         interaction_adapter_enabled=True,
+        stage_id=0,
+        previous_gate=None,
     ):
         batch_size = target_tokens.shape[0]
         device = target_tokens.device
@@ -178,7 +216,12 @@ class InteractionConditioningStack(nn.Module):
             payload, "total_frames", batch_size, device, torch.float32, max(int(temporal), 1)
         )
         event_valid = self._payload_tensor(payload, "event_valid", batch_size, device, torch.float32, 0.0)
+        stage_id = int(stage_id)
+        if stage_id < 0 or stage_id >= INTERACTION_PYRAMID_STAGES:
+            raise ValueError(f"interaction stage_id must be in [0, {INTERACTION_PYRAMID_STAGES - 1}].")
         semantic = self.semantic_encoder(action_ids, block_ids, event_frames, total_frames, event_valid)
+        stage_ids = torch.full((batch_size,), stage_id, device=device, dtype=torch.long)
+        semantic = semantic + self.stage_embedding(stage_ids) * event_valid.float().unsqueeze(-1)
 
         if visibility is None:
             visibility = torch.ones(batch_size, 1, temporal, height, width, device=device, dtype=torch.float32)
@@ -186,9 +229,28 @@ class InteractionConditioningStack(nn.Module):
             visibility = visibility.to(device=device, dtype=torch.float32)
             visibility = F.interpolate(visibility, size=(temporal, height, width), mode="nearest")
         visibility_tokens = visibility.flatten(2).transpose(1, 2)
+        warp_tokens = warp_tokens * self.stage_warp_scales[stage_id].to(warp_tokens)
         frame_axis = torch.linspace(0.0, 1.0, temporal, device=device, dtype=torch.float32)
         frame_positions = frame_axis.repeat_interleave(height * width).unsqueeze(0).expand(batch_size, -1)
         event_positions = event_frames / (total_frames - 1.0).clamp_min(1.0)
+        previous_gate_tokens = None
+        previous_support_tokens = None
+        if stage_id > 0:
+            if previous_gate is None:
+                raise ValueError(f"interaction stage {stage_id} requires the previous stage predicted_gate.")
+            previous_gate = F.interpolate(
+                previous_gate.to(device=device, dtype=torch.float32),
+                size=(temporal, height, width),
+                mode="trilinear",
+                align_corners=False,
+            ).clamp(0.0, 1.0)
+            previous_gate_tokens = previous_gate.flatten(2).transpose(1, 2)
+            previous_support_tokens = F.max_pool3d(
+                previous_gate,
+                kernel_size=(1, 3, 3),
+                stride=1,
+                padding=(0, 1, 1),
+            ).flatten(2).transpose(1, 2)
         gate = self.router(
             semantic,
             warp_tokens,
@@ -197,17 +259,34 @@ class InteractionConditioningStack(nn.Module):
             frame_positions,
             event_positions,
             event_valid,
+            previous_gate=previous_gate_tokens,
+            previous_support=previous_support_tokens,
+            is_refinement=stage_id > 0,
         )
         if bool(interaction_adapter_enabled):
-            output, injection = self.adapter(target_tokens, warp_tokens, semantic, gate)
+            output, injection = self.adapter(
+                target_tokens,
+                warp_tokens,
+                semantic,
+                gate,
+                stage_scale=self.stage_adapter_scales[stage_id],
+            )
         else:
             output = target_tokens
             injection = torch.zeros_like(target_tokens)
+        predicted_gate = gate.transpose(1, 2).reshape(batch_size, 1, temporal, height, width)
+        injection_map = injection.float().square().mean(dim=-1, keepdim=True).sqrt().transpose(1, 2).reshape(
+            batch_size, 1, temporal, height, width
+        )
         debug = {
+            "stage_id": stage_id,
             "interaction_token": semantic,
-            "predicted_gate": gate.transpose(1, 2).reshape(batch_size, 1, temporal, height, width),
-            "interaction_injection_map": injection.float().square().mean(dim=-1, keepdim=True).sqrt()
-            .transpose(1, 2)
-            .reshape(batch_size, 1, temporal, height, width),
+            "predicted_gate": predicted_gate,
+            f"predicted_gate_stage{stage_id}": predicted_gate,
+            "interaction_injection_map": injection_map,
+            f"interaction_injection_map_stage{stage_id}": injection_map,
+            "previous_gate": previous_gate,
+            "stage_warp_scale": self.stage_warp_scales[stage_id],
+            "stage_adapter_scale": self.stage_adapter_scales[stage_id],
         }
         return output, debug

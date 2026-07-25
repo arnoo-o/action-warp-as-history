@@ -1396,10 +1396,20 @@ class HeliosTransformer3DModel(
         # fire frames cannot overwrite the hidden states outright.
         self.target_channel_fusion_scale = 0.1
 
-    def enable_interaction_conditioning(self, rank=64, semantic_dim=256):
+    def enable_interaction_conditioning(
+        self,
+        rank=64,
+        semantic_dim=256,
+        stage_warp_scales=(1.0, 0.5, 0.25),
+        stage_adapter_scales=(1.0, 0.5, 0.25),
+    ):
         if getattr(self, "interaction_conditioning", None) is None:
             self.interaction_conditioning = InteractionConditioningStack(
-                self.inner_dim, semantic_dim=int(semantic_dim), rank=int(rank)
+                self.inner_dim,
+                semantic_dim=int(semantic_dim),
+                rank=int(rank),
+                stage_warp_scales=stage_warp_scales,
+                stage_adapter_scales=stage_adapter_scales,
             )
 
     def apply_interaction_conditioning(
@@ -1412,6 +1422,8 @@ class HeliosTransformer3DModel(
         height,
         width,
         interaction_adapter_enabled=True,
+        stage_id=0,
+        previous_gate=None,
     ):
         stack = getattr(self, "interaction_conditioning", None)
         if stack is None:
@@ -1429,6 +1441,8 @@ class HeliosTransformer3DModel(
             height,
             width,
             interaction_adapter_enabled=interaction_adapter_enabled,
+            stage_id=stage_id,
+            previous_gate=previous_gate,
         )
 
     @staticmethod
@@ -1546,6 +1560,14 @@ class HeliosTransformer3DModel(
         if isinstance(latents, list):
             hidden_states = None
             rope_freqs = None
+            previous_interaction_gate = (
+                None if interaction_conditioning is None else interaction_conditioning.get("previous_gate")
+            )
+            interaction_stage_ids = (
+                list(range(len(latents)))
+                if interaction_conditioning is None
+                else list(interaction_conditioning.get("stage_ids", range(len(latents))))
+            )
             for idx, cur_hidden_states in enumerate(latents):
                 cur_hidden_states = self.gradient_checkpointing_method(
                     self.patch_embedding,
@@ -1574,8 +1596,11 @@ class HeliosTransformer3DModel(
                         H,
                         W,
                         interaction_adapter_enabled=interaction_adapter_enabled,
+                        stage_id=int(interaction_stage_ids[idx]),
+                        previous_gate=previous_interaction_gate,
                     )
                     interaction_debug.append(cur_debug)
+                    previous_interaction_gate = cur_debug["predicted_gate"]
                 if target_channel_fusion_latents is not None:
                     cur_condition_raw = (
                         target_channel_fusion_latents[idx]
@@ -1645,6 +1670,8 @@ class HeliosTransformer3DModel(
                     H,
                     W,
                     interaction_adapter_enabled=interaction_adapter_enabled,
+                    stage_id=int(interaction_conditioning.get("stage_id", 0)),
+                    previous_gate=interaction_conditioning.get("previous_gate"),
                 )
                 interaction_debug.append(cur_debug)
             if target_channel_fusion_latents is not None:

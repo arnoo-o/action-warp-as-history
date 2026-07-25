@@ -5,6 +5,7 @@ import gc
 import hashlib
 import json
 import random
+import copy
 from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1469,6 +1470,17 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
                 video_latents=video_latents,
                 seq=seq,
             )
+            base_history_args = copy.copy(exact_args)
+            base_history_args.use_warp_as_history = False
+            base_histories = opt.make_histories(
+                pipe,
+                image_latents,
+                fake_image_latents,
+                base_history_args,
+                device,
+                video_latents=video_latents,
+                seq=f"{seq}:helios_base",
+            )
             loss_focus_mask_latents = online_mask_frames_to_latent_mask(
                 case.get("focus_mask_frames"),
                 target_latents=target_latents,
@@ -1538,6 +1550,7 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
         "target_latents": target_latents,
         "prompt_embeds": prompt_embeds.detach(),
         "histories": detach_tree(histories),
+        "base_histories": detach_tree(base_histories),
         "prompt_cache_status": prompt_cache_status,
         "training": case["metadata"],
         "interaction_memory": case.get("interaction_memory"),

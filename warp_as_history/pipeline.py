@@ -1017,8 +1017,31 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             self.transformer.enable_interaction_conditioning(
                 rank=int(interaction_config.get("rank", 64)),
                 semantic_dim=int(interaction_config.get("semantic_dim", 256)),
+                stage_warp_scales=interaction_config.get("stage_warp_scales", (1.0, 0.5, 0.25)),
+                stage_adapter_scales=interaction_config.get("stage_adapter_scales", (1.0, 0.5, 0.25)),
             )
-            self.transformer.interaction_conditioning.load_state_dict(interaction_state, strict=True)
+            incompatible = self.transformer.interaction_conditioning.load_state_dict(
+                interaction_state, strict=False
+            )
+            if incompatible.unexpected_keys:
+                raise ValueError(
+                    "Interaction checkpoint contains unsupported parameters: "
+                    + ", ".join(incompatible.unexpected_keys[:20])
+                )
+            if incompatible.missing_keys:
+                print(
+                    json.dumps(
+                        {
+                            "event": "interaction_checkpoint_default_initialized",
+                            "message": (
+                                "Legacy checkpoint is missing coarse-to-fine parameters; "
+                                "using default initialization."
+                            ),
+                            "missing_keys": list(incompatible.missing_keys),
+                        }
+                    ),
+                    flush=True,
+                )
             self.transformer.interaction_conditioning.to(
                 device=self.transformer.device, dtype=self.transformer.dtype
             )
@@ -1069,6 +1092,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         debug = list(debug_items)[-1]
         predicted = debug["predicted_gate"].detach().float().cpu()
         injection = debug["interaction_injection_map"].detach().float().cpu()
+        stage_id = int(debug.get("stage_id", 0))
 
         def save_map(name, value):
             image = value[0, 0].amax(dim=0).numpy()
@@ -1079,8 +1103,12 @@ class WarpAsHistoryPipeline(HeliosPipeline):
 
         save_map("predicted_gate.png", predicted)
         save_map("interaction_injection_map.png", injection)
+        save_map(f"predicted_gate_stage{stage_id}.png", predicted)
+        save_map(f"interaction_injection_map_stage{stage_id}.png", injection)
         np.save(output_dir / "predicted_gate.npy", predicted.numpy())
         np.save(output_dir / "interaction_injection_map.npy", injection.numpy())
+        np.save(output_dir / f"predicted_gate_stage{stage_id}.npy", predicted.numpy())
+        np.save(output_dir / f"interaction_injection_map_stage{stage_id}.npy", injection.numpy())
         (output_dir / "temporal_pred_curve.json").write_text(
             json.dumps(predicted[0, 0].mean(dim=(-1, -2)).tolist()), encoding="utf-8"
         )
@@ -1487,6 +1515,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         use_primary_fire_event_condition: bool = False,
         interaction_payload: dict[str, Any] | None = None,
         interaction_conditioning_mode: str = "router",
+        interaction_stage_warp_scales: tuple[float, float, float] = (1.0, 0.5, 0.25),
+        interaction_stage_adapter_scales: tuple[float, float, float] = (1.0, 0.5, 0.25),
         return_warp_debug: bool = False,
         warp_debug_dir: str | Path | None = None,
         warp_debug_fps: int = 16,
@@ -1515,7 +1545,10 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         if interaction_conditioning_mode not in {"router", "binary", "off"}:
             raise ValueError("interaction_conditioning_mode must be router, binary, or off.")
         if interaction_conditioning_mode == "router" and interaction_payload is not None:
-            self.transformer.enable_interaction_conditioning()
+            self.transformer.enable_interaction_conditioning(
+                stage_warp_scales=interaction_stage_warp_scales,
+                stage_adapter_scales=interaction_stage_adapter_scales,
+            )
         if lora_prompt_embeds is not None and lora_prompt_embeds.shape[0] != 1:
             raise ValueError("WarpAsHistoryPipeline currently supports lora_prompt_embeds batch size 1.")
         if lora_prompt_embeds is not None and not lora_active:
@@ -2256,6 +2289,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         use_primary_fire_event_condition: bool = False,
         interaction_payload: dict[str, Any] | None = None,
         interaction_conditioning_mode: str = "router",
+        interaction_stage_warp_scales: tuple[float, float, float] = (1.0, 0.5, 0.25),
+        interaction_stage_adapter_scales: tuple[float, float, float] = (1.0, 0.5, 0.25),
         return_warp_debug: bool = False,
         warp_debug_dir: str | Path | None = None,
         warp_debug_fps: int = 16,
@@ -2351,6 +2386,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             use_primary_fire_event_condition=bool(use_primary_fire_event_condition),
             interaction_payload=interaction_payload,
             interaction_conditioning_mode=str(interaction_conditioning_mode),
+            interaction_stage_warp_scales=interaction_stage_warp_scales,
+            interaction_stage_adapter_scales=interaction_stage_adapter_scales,
             return_warp_debug=bool(return_warp_debug),
             warp_debug_dir=warp_debug_dir,
             warp_debug_fps=int(warp_debug_fps),
@@ -2524,6 +2561,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             start_point_list = [latents]
 
         i = 0
+        previous_stage_interaction_gate = None
         try:
             for i_s in range(pyramid_num_stages):
                 use_wah_lora = bool(state["lora_active"]) and i_s == 0
@@ -2596,6 +2634,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                         base_latents_history_short=latents_history_short,
                     )
 
+                stage_previous_interaction_gate = previous_stage_interaction_gate
+                last_stage_interaction_gate = None
                 for idx, t in enumerate(timesteps):
                     if i_s == 0:
                         current_indices_hidden_states = pyramid_base_histories["indices_hidden_states"]
@@ -2721,6 +2761,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                             "payload": payload_tensors,
                             "warp_latents": warp_for_router,
                             "visibility": visibility_for_router,
+                            "stage_id": int(i_s),
+                            "previous_gate": stage_previous_interaction_gate,
                         }
 
                     timestep = t.expand(latents.shape[0]).to(torch.int64)
@@ -2755,6 +2797,13 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                             ),
                             interaction_conditioning=current_interaction_conditioning,
                         )[0]
+                    if current_interaction_conditioning is not None:
+                        interaction_debug = list(
+                            getattr(self.transformer, "_last_interaction_debug", []) or []
+                        )
+                        if not interaction_debug:
+                            raise RuntimeError(f"interaction stage {i_s} did not produce a predicted gate.")
+                        last_stage_interaction_gate = interaction_debug[-1]["predicted_gate"].detach()
                     if state.get("warp_debug_dir") and current_interaction_conditioning is not None:
                         self._save_interaction_router_debug(
                             Path(state["warp_debug_dir"]) / "interaction_debug",
@@ -2836,6 +2885,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                         xm.mark_step()
 
                     i += 1
+                previous_stage_interaction_gate = last_stage_interaction_gate
         finally:
             self._unfuse_wah_lora()
             self._set_wah_lora_enabled(bool(state["lora_active"]))

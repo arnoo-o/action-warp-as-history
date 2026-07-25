@@ -251,8 +251,9 @@ def load_training_state(path, *, transformer, optimizer, device):
         )
         return {"global_step": 0, "refined_teacher_cache": {}, "losses": []}
     named_parameters = dict(transformer.named_parameters())
+    checkpoint_trainable_state = dict(payload.get("trainable_state", {}))
     missing = []
-    for name, value in dict(payload.get("trainable_state", {})).items():
+    for name, value in checkpoint_trainable_state.items():
         parameter = named_parameters.get(name)
         if parameter is None:
             missing.append(name)
@@ -264,11 +265,41 @@ def load_training_state(path, *, transformer, optimizer, device):
         parameter.data.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
     if missing:
         raise ValueError(f"Resume checkpoint contains unknown trainable parameters: {missing[:10]}")
-    optimizer.load_state_dict(payload["optimizer"])
-    for state in optimizer.state.values():
-        for key, value in state.items():
-            if torch.is_tensor(value):
-                state[key] = value.to(device=device)
+    default_initialized = [
+        name
+        for name, parameter in named_parameters.items()
+        if parameter.requires_grad and name not in checkpoint_trainable_state
+    ]
+    if default_initialized:
+        print(
+            json.dumps(
+                {
+                    "event": "training_checkpoint_default_initialized",
+                    "message": "Legacy checkpoint is missing coarse-to-fine parameters; using defaults.",
+                    "missing_keys": default_initialized,
+                }
+            ),
+            flush=True,
+        )
+    try:
+        optimizer.load_state_dict(payload["optimizer"])
+    except ValueError as exc:
+        if not default_initialized:
+            raise
+        print(
+            json.dumps(
+                {
+                    "event": "legacy_optimizer_state_reset",
+                    "message": str(exc),
+                }
+            ),
+            flush=True,
+        )
+    else:
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device=device)
     rng = dict(payload.get("rng_state", {}) or {})
     if rng.get("python") is not None:
         random.setstate(rng["python"])
@@ -375,6 +406,9 @@ def parse_args():
     )
     parser.add_argument("--interaction_adapter_rank", type=int, default=64)
     parser.add_argument("--interaction_semantic_dim", type=int, default=256)
+    parser.add_argument("--interaction_stage_warp_scales", type=float, nargs=3, default=[1.0, 0.5, 0.25])
+    parser.add_argument("--interaction_stage_adapter_scales", type=float, nargs=3, default=[1.0, 0.5, 0.25])
+    parser.add_argument("--interaction_cross_stage_consistency_loss_scale", type=float, default=0.1)
     parser.add_argument("--interaction_router_temporal_loss_scale", type=float, default=1.0)
     parser.add_argument("--interaction_router_spatial_loss_scale", type=float, default=1.0)
     parser.add_argument("--interaction_router_negative_loss_scale", type=float, default=0.25)
@@ -461,6 +495,11 @@ def build_exact_args(args):
     )
     exact.interaction_adapter_rank = int(args.interaction_adapter_rank)
     exact.interaction_semantic_dim = int(args.interaction_semantic_dim)
+    exact.interaction_stage_warp_scales = [float(value) for value in args.interaction_stage_warp_scales]
+    exact.interaction_stage_adapter_scales = [float(value) for value in args.interaction_stage_adapter_scales]
+    exact.interaction_cross_stage_consistency_loss_scale = float(
+        args.interaction_cross_stage_consistency_loss_scale
+    )
     exact.interaction_router_temporal_loss_scale = float(args.interaction_router_temporal_loss_scale)
     exact.interaction_router_spatial_loss_scale = float(args.interaction_router_spatial_loss_scale)
     exact.interaction_router_negative_loss_scale = float(args.interaction_router_negative_loss_scale)
@@ -716,6 +755,7 @@ def main():
             item["histories"],
             exact_args,
             device,
+            base_histories=item.get("base_histories"),
             loss_focus_mask=item.get("loss_focus_mask_latents"),
             world_valid_mask=item.get("world_valid_mask_latents"),
             target_channel_fusion_latents=item.get("primary_fire_event_latents"),

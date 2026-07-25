@@ -86,6 +86,9 @@ DEFAULT_TRAINING_ARGS = {
     "interaction_router_spatial_loss_scale": 1.0,
     "interaction_router_negative_loss_scale": 0.25,
     "interaction_router_sparsity_loss_scale": 0.01,
+    "interaction_stage_warp_scales": [1.0, 0.5, 0.25],
+    "interaction_stage_adapter_scales": [1.0, 0.5, 0.25],
+    "interaction_cross_stage_consistency_loss_scale": 0.1,
     "base_train_steps": 1500,
     "bidirectional_train_steps": 1500,
     "enable_bidirectional_training": False,
@@ -1089,6 +1092,8 @@ def visible_aux_state_dict(transformer):
         state["interaction_conditioning_config"] = {
             "rank": int(interaction_conditioning.adapter.target_down.out_features),
             "semantic_dim": int(interaction_conditioning.semantic_encoder.semantic_dim),
+            "stage_warp_scales": interaction_conditioning.stage_warp_scales.detach().cpu().tolist(),
+            "stage_adapter_scales": interaction_conditioning.stage_adapter_scales.detach().cpu().tolist(),
         }
     return state
 
@@ -1100,9 +1105,20 @@ def ensure_target_channel_fusion(transformer):
     return transformer.target_channel_fusion_mlp
 
 
-def ensure_interaction_conditioning(transformer, rank=64, semantic_dim=256):
+def ensure_interaction_conditioning(
+    transformer,
+    rank=64,
+    semantic_dim=256,
+    stage_warp_scales=(1.0, 0.5, 0.25),
+    stage_adapter_scales=(1.0, 0.5, 0.25),
+):
     if getattr(transformer, "interaction_conditioning", None) is None:
-        transformer.enable_interaction_conditioning(rank=rank, semantic_dim=semantic_dim)
+        transformer.enable_interaction_conditioning(
+            rank=rank,
+            semantic_dim=semantic_dim,
+            stage_warp_scales=stage_warp_scales,
+            stage_adapter_scales=stage_adapter_scales,
+        )
         transformer.interaction_conditioning.to(device=transformer.device)
     return transformer.interaction_conditioning
 
@@ -1297,13 +1313,6 @@ def save_interaction_debug(
         return
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    debug = list(debug_items)[-1]
-    predicted = debug["predicted_gate"].detach().float().cpu()
-    injection = debug["interaction_injection_map"].detach().float().cpu()
-    teacher = F.interpolate(
-        teacher_map.detach().float().cpu(), size=predicted.shape[2:], mode="trilinear", align_corners=False
-    )
-
     def save_map(name, value):
         image = value[0, 0].amax(dim=0).numpy()
         scale = max(float(image.max()), 1e-8)
@@ -1311,6 +1320,29 @@ def save_interaction_debug(
             output_dir / name
         )
 
+    debug_items = list(debug_items)
+    for index, debug in enumerate(debug_items):
+        stage_id = int(debug.get("stage_id", index))
+        predicted = debug["predicted_gate"].detach().float().cpu()
+        injection = debug["interaction_injection_map"].detach().float().cpu()
+        teacher = F.interpolate(
+            teacher_map.detach().float().cpu(),
+            size=predicted.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        )
+        save_map(f"residual_teacher_map_stage{stage_id}.png", teacher)
+        save_map(f"predicted_gate_stage{stage_id}.png", predicted)
+        save_map(f"interaction_injection_map_stage{stage_id}.png", injection)
+        np.save(output_dir / f"residual_teacher_map_stage{stage_id}.npy", teacher.numpy())
+        np.save(output_dir / f"predicted_gate_stage{stage_id}.npy", predicted.numpy())
+        np.save(output_dir / f"interaction_injection_map_stage{stage_id}.npy", injection.numpy())
+    debug = debug_items[-1]
+    predicted = debug["predicted_gate"].detach().float().cpu()
+    injection = debug["interaction_injection_map"].detach().float().cpu()
+    teacher = F.interpolate(
+        teacher_map.detach().float().cpu(), size=predicted.shape[2:], mode="trilinear", align_corners=False
+    )
     save_map("residual_teacher_map.png", teacher)
     save_map("predicted_gate.png", predicted)
     save_map("interaction_injection_map.png", injection)
@@ -1358,6 +1390,83 @@ def refine_interaction_teacher(
     return torch.maximum(teacher_floor * initial, feedback_target).clamp(0.0, 1.0).detach()
 
 
+def set_training_wah_lora_enabled(transformer, enabled):
+    peft_config = getattr(transformer, "peft_config", None)
+    if not isinstance(peft_config, dict) or not peft_config:
+        return
+    method_name = "enable_adapters" if bool(enabled) else "disable_adapters"
+    method = getattr(transformer, method_name, None)
+    if method is None:
+        raise RuntimeError(
+            f"PEFT transformer does not expose {method_name}(); stage-specific WAH LoRA cannot be enforced."
+        )
+    method()
+
+
+def pyramid_stage_model_forward(
+    pipe,
+    noisy_model_inputs,
+    timesteps,
+    prompt_embeds,
+    wah_histories,
+    base_histories,
+    stage_ids,
+    *,
+    attention_kwargs,
+    target_channel_fusion_latents,
+    stage_interaction,
+    interaction_adapter_enabled,
+):
+    predictions = []
+    debug_items = []
+    previous_gate = None
+    base_histories = base_histories or wah_histories
+    try:
+        for index, (latents, timestep, stage_id) in enumerate(
+            zip(noisy_model_inputs, timesteps, stage_ids)
+        ):
+            stage_id = int(stage_id)
+            set_training_wah_lora_enabled(pipe.transformer, stage_id == 0)
+            current_interaction = None
+            if stage_interaction is not None:
+                current_interaction = {
+                    "payload": stage_interaction["payload"],
+                    "warp_latents": stage_interaction["warp_latents"][index],
+                    "visibility": stage_interaction["visibility"][index],
+                    "stage_id": stage_id,
+                    "previous_gate": previous_gate,
+                }
+            current_fusion = (
+                None
+                if target_channel_fusion_latents is None
+                else target_channel_fusion_latents[index]
+            )
+            prediction = transformer_model_forward(
+                pipe,
+                latents,
+                timestep,
+                prompt_embeds,
+                wah_histories if stage_id == 0 else base_histories,
+                attention_kwargs=attention_kwargs,
+                target_channel_fusion_latents=current_fusion,
+                interaction_conditioning=current_interaction,
+                interaction_adapter_enabled=interaction_adapter_enabled,
+                is_first_denoising_step=False,
+            )
+            predictions.append(prediction)
+            if current_interaction is not None:
+                current_debug = list(getattr(pipe.transformer, "_last_interaction_debug", []) or [])
+                if not current_debug:
+                    raise RuntimeError(f"interaction stage {stage_id} did not produce router debug output.")
+                debug = current_debug[-1]
+                debug_items.append(debug)
+                previous_gate = debug["predicted_gate"]
+    finally:
+        set_training_wah_lora_enabled(pipe.transformer, True)
+    pipe.transformer._last_interaction_debug = debug_items
+    return predictions, debug_items
+
+
 def flow_matching_loss_train_exact(
     pipe,
     prompt_embeds,
@@ -1365,6 +1474,7 @@ def flow_matching_loss_train_exact(
     histories,
     args,
     device,
+    base_histories=None,
     loss_focus_mask=None,
     world_valid_mask=None,
     target_channel_fusion_latents=None,
@@ -1423,45 +1533,50 @@ def flow_matching_loss_train_exact(
             "warp_latents": [warp_pyramid[sid] for sid in stage_ids],
             "visibility": [visibility_pyramid[sid] for sid in stage_ids],
         }
-    model_pred = transformer_model_forward(
+    stage_target_channel_fusion = (
+        [
+            training_exact_pyramid_latents(
+                target_channel_fusion_latents, len(args.pyramid_num_inference_steps_list)
+            )[sid]
+            for sid in stage_ids
+        ]
+        if target_channel_fusion_latents is not None
+        else None
+    )
+    model_pred, enabled_interaction_debug = pyramid_stage_model_forward(
         pipe,
         noisy_model_inputs,
         timesteps,
         prompt_embeds,
         histories,
+        base_histories,
+        stage_ids,
         attention_kwargs=attention_kwargs,
-        target_channel_fusion_latents=(
-            [training_exact_pyramid_latents(target_channel_fusion_latents, len(args.pyramid_num_inference_steps_list))[sid] for sid in stage_ids]
-            if target_channel_fusion_latents is not None
-            else None
-        ),
-        interaction_conditioning=stage_interaction,
+        target_channel_fusion_latents=stage_target_channel_fusion,
+        stage_interaction=stage_interaction,
         interaction_adapter_enabled=bool(interaction_adapter_enabled),
-        is_first_denoising_step=False,
     )
-    if not isinstance(model_pred, list):
-        raise TypeError(
-            "--flow_matching_mode train_exact expects a NaViT list prediction. "
-            "Use the training_modules transformer implementation for Helios stage2-post parity."
-        )
     if len(model_pred) != len(stage_items):
-        raise ValueError(f"NaViT prediction count mismatch: got {len(model_pred)}, expected {len(stage_items)}.")
-    enabled_interaction_debug = list(getattr(pipe.transformer, "_last_interaction_debug", []) or [])
+        raise ValueError(f"Pyramid prediction count mismatch: got {len(model_pred)}, expected {len(stage_items)}.")
+    stats["flow_matching_navit_forward"] = False
+    stats["flow_matching_stagewise_forward"] = True
+    stats["wah_lora_stage0_only"] = True
     improvement_map = None
     refined_teacher_map = None
     if bool(compute_bidirectional_feedback) and stage_interaction is not None and interaction_teacher_map is not None:
         with torch.no_grad():
-            disabled_model_pred = transformer_model_forward(
+            disabled_model_pred, _disabled_debug = pyramid_stage_model_forward(
                 pipe,
                 noisy_model_inputs,
                 timesteps,
                 prompt_embeds,
                 histories,
+                base_histories,
+                stage_ids,
                 attention_kwargs=attention_kwargs,
                 target_channel_fusion_latents=None,
-                interaction_conditioning=stage_interaction,
+                stage_interaction=stage_interaction,
                 interaction_adapter_enabled=False,
-                is_first_denoising_step=False,
             )
         pipe.transformer._last_interaction_debug = enabled_interaction_debug
         improvement_stages = []
@@ -1540,8 +1655,8 @@ def flow_matching_loss_train_exact(
         stats[f"timestep_stage{stage_id}"] = item["timesteps"].detach().float().mean()
         stats[f"timestep_index_stage{stage_id}"] = item["indices"].float().mean()
 
-    # Helios stage2 post uses is_navit_pyramid=true: all pyramid stages are fed
-    # to the transformer as a single list forward, then _flow_loss averages them.
+    # Stagewise forward is required so PEFT can be active only on the coarse stage.
+    # The optimization objective remains the mean of the three Helios pyramid losses.
     total_loss = torch.stack(stage_losses).mean()
     interaction_aux_loss = None
     router_teacher_map = refined_teacher_map if refined_teacher_map is not None else interaction_teacher_map
@@ -1555,6 +1670,8 @@ def flow_matching_loss_train_exact(
         spatial_losses = []
         negative_losses = []
         sparse_losses = []
+        consistency_losses = []
+        previous_predicted_gate = None
         for debug, stage_id in zip(debug_items, stage_ids):
             predicted_gate = debug["predicted_gate"].float()
             teacher = teacher_pyramid[stage_id].float()
@@ -1566,6 +1683,18 @@ def flow_matching_loss_train_exact(
             spatial_losses.append(F.binary_cross_entropy(predicted_gate.clamp(1e-5, 1.0 - 1e-5), teacher) * event_valid)
             negative_losses.append(predicted_gate.mean() * (1.0 - event_valid))
             sparse_losses.append(predicted_gate.mean())
+            if previous_predicted_gate is not None:
+                previous_resized = F.interpolate(
+                    previous_predicted_gate,
+                    size=predicted_gate.shape[2:],
+                    mode="trilinear",
+                    align_corners=False,
+                )
+                consistency_losses.append(F.smooth_l1_loss(predicted_gate, previous_resized) * event_valid)
+                stats[f"interaction_cross_stage_consistency_stage{stage_id}"] = (
+                    consistency_losses[-1].detach()
+                )
+            previous_predicted_gate = predicted_gate
             stats[f"interaction_gate_mean_stage{stage_id}"] = predicted_gate.detach().mean()
             stats[f"interaction_teacher_mean_stage{stage_id}"] = teacher.detach().mean()
         if temporal_losses:
@@ -1573,17 +1702,25 @@ def flow_matching_loss_train_exact(
             spatial_loss = torch.stack(spatial_losses).mean()
             negative_loss = torch.stack(negative_losses).mean()
             sparsity_loss = torch.stack(sparse_losses).mean()
+            consistency_loss = (
+                torch.stack(consistency_losses).mean()
+                if consistency_losses
+                else torch.zeros((), device=temporal_loss.device, dtype=temporal_loss.dtype)
+            )
             interaction_aux_loss = (
                 float(getattr(args, "interaction_router_temporal_loss_scale", 1.0)) * temporal_loss
                 + float(getattr(args, "interaction_router_spatial_loss_scale", 1.0)) * spatial_loss
                 + float(getattr(args, "interaction_router_negative_loss_scale", 0.25)) * negative_loss
                 + float(getattr(args, "interaction_router_sparsity_loss_scale", 0.01)) * sparsity_loss
+                + float(getattr(args, "interaction_cross_stage_consistency_loss_scale", 0.1))
+                * consistency_loss
             )
             total_loss = total_loss + interaction_aux_loss
             stats["interaction_temporal_alignment_loss"] = temporal_loss.detach()
             stats["interaction_spatial_mask_loss"] = spatial_loss.detach()
             stats["interaction_negative_loss"] = negative_loss.detach()
             stats["interaction_sparsity_loss"] = sparsity_loss.detach()
+            stats["interaction_cross_stage_consistency_loss"] = consistency_loss.detach()
             stats["interaction_aux_loss"] = interaction_aux_loss.detach()
     stats["flow_mse"] = total_loss.detach()
     stats["flow_mse_mean_stage"] = torch.stack([loss.detach() for loss in stage_losses]).mean()
@@ -1600,6 +1737,7 @@ def flow_matching_loss(
     histories,
     args,
     device,
+    base_histories=None,
     loss_focus_mask=None,
     world_valid_mask=None,
     target_channel_fusion_latents=None,
@@ -1617,6 +1755,7 @@ def flow_matching_loss(
         histories,
         args,
         device,
+        base_histories=base_histories,
         loss_focus_mask=loss_focus_mask,
         world_valid_mask=world_valid_mask,
         target_channel_fusion_latents=target_channel_fusion_latents,
@@ -1669,6 +1808,8 @@ def setup_visible_lora(transformer, args, seq):
             transformer,
             rank=int(getattr(args, "interaction_adapter_rank", 64)),
             semantic_dim=int(getattr(args, "interaction_semantic_dim", 256)),
+            stage_warp_scales=getattr(args, "interaction_stage_warp_scales", (1.0, 0.5, 0.25)),
+            stage_adapter_scales=getattr(args, "interaction_stage_adapter_scales", (1.0, 0.5, 0.25)),
         )
         interaction_stack.requires_grad_(optimize_lora_now)
         for param in interaction_stack.parameters():
