@@ -911,6 +911,26 @@ class OnlineWarpTrainingCache:
         self._load_interaction_histories()
         if self.disk_cache_dir is not None:
             self.disk_cache_dir.mkdir(parents=True, exist_ok=True)
+            unique_sources = {
+                self._video_source_digest(
+                    resolve_online_video_ref(row["video_path"], getattr(self.exact_args, "data_root", "."))
+                )
+                for row in self.rows
+            }
+            print(
+                json.dumps(
+                    {
+                        "event": "online_warp_cache_plan",
+                        "rows": len(self.rows),
+                        "unique_video_sources": len(unique_sources),
+                        "max_geometry_entries": len(unique_sources)
+                        * (2 if bool(getattr(self.exact_args, "online_direction_augmentation", True)) else 1),
+                        "cache_key": "video_content_direction_config_v2",
+                        "disk_cache_dir": str(self.disk_cache_dir),
+                    }
+                ),
+                flush=True,
+            )
 
     def _load_interaction_histories(self):
         columns = []
@@ -938,6 +958,7 @@ class OnlineWarpTrainingCache:
 
     def _cache_payload(self):
         payload = {
+            "cache_schema": 2,
             "height": int(self.exact_args.height),
             "width": int(self.exact_args.width),
             "frame_stride": int(getattr(self.exact_args, "online_frame_stride", 1)),
@@ -969,19 +990,58 @@ class OnlineWarpTrainingCache:
             payload["minecraft_hud_mask"] = "mc_640x360_v1"
         return payload
 
-    def _geometry_cache_path(self, row_index, direction):
-        if self.disk_cache_dir is None:
-            return None
-        row = self.rows[int(row_index)]
+    def _video_source_payload(self, ref):
+        if not isinstance(ref, Path):
+            return {"kind": "uri", "value": str(ref)}
+
+        path = ref.expanduser().resolve(strict=False)
+        payload = {"kind": "directory" if path.is_dir() else "file", "path": str(path)}
+        if path.is_file():
+            stat = path.stat()
+            payload.update({"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)})
+        elif path.is_dir():
+            files = []
+            for image_path in _iter_online_image_files(path):
+                stat = image_path.stat()
+                files.append(
+                    {
+                        "name": image_path.name,
+                        "size": int(stat.st_size),
+                        "mtime_ns": int(stat.st_mtime_ns),
+                    }
+                )
+            payload["files_digest"] = hashlib.sha256(
+                json.dumps(files, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            payload["file_count"] = len(files)
+        else:
+            payload["missing"] = True
+        return payload
+
+    def _video_source_digest(self, ref):
+        payload = self._video_source_payload(ref)
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+    def _geometry_cache_digest(self, ref, direction):
         payload = {
-            "row_index": int(row_index),
-            "row_id": str(row.get("id", row_index)),
+            "source": self._video_source_payload(ref),
             "direction": str(direction),
-            "video_path": str(row["video_path"]),
             "config": self._cache_payload(),
         }
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
-        return self.disk_cache_dir / f"{int(row_index):05d}_{direction}_{digest}.pt"
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+    def _geometry_cache_path(self, ref, direction):
+        if self.disk_cache_dir is None:
+            return None
+        digest = self._geometry_cache_digest(ref, direction)[:24]
+        return self.disk_cache_dir / f"geometry_{direction}_{digest}.pt"
+
+    def _record_cache_key(self, ref, direction):
+        return str(direction), self._geometry_cache_digest(ref, direction)
 
     def _load_frames(self, ref, direction):
         frames = load_online_video_frames(
@@ -1077,12 +1137,13 @@ class OnlineWarpTrainingCache:
             opt.clean_memory()
         return geometry
 
-    def _build_record(self, row_index, direction):
+    def _build_record(self, row_index, direction, ref=None):
         row_index = int(row_index)
         row = self.rows[row_index]
-        ref = resolve_online_video_ref(row["video_path"], getattr(self.exact_args, "data_root", "."))
+        if ref is None:
+            ref = resolve_online_video_ref(row["video_path"], getattr(self.exact_args, "data_root", "."))
         frames = self._load_frames(ref, direction)
-        cache_path = self._geometry_cache_path(row_index, direction)
+        cache_path = self._geometry_cache_path(ref, direction)
         geometry = self._load_geometry_from_disk(cache_path)
         if geometry is None:
             geometry = self._estimate_geometry(row_index, row, direction, ref, frames)
@@ -1097,7 +1158,10 @@ class OnlineWarpTrainingCache:
         }
 
     def _get_record(self, row_index, direction):
-        key = (int(row_index), str(direction))
+        row_index = int(row_index)
+        row = self.rows[row_index]
+        ref = resolve_online_video_ref(row["video_path"], getattr(self.exact_args, "data_root", "."))
+        key = self._record_cache_key(ref, direction)
         cached = self.records.get(key)
         if cached is not None:
             self.records.move_to_end(key)
@@ -1107,15 +1171,16 @@ class OnlineWarpTrainingCache:
                         "event": "online_warp_record_cache_hit",
                         "cache": "memory",
                         "row_index": int(row_index),
-                        "seq": str(self.rows[int(row_index)].get("id", row_index)),
+                        "seq": str(row.get("id", row_index)),
                         "direction": str(direction),
+                        "video": str(ref),
                     }
                 ),
                 flush=True,
             )
             return cached
 
-        record = self._build_record(row_index, direction)
+        record = self._build_record(row_index, direction, ref=ref)
         self.records[key] = record
         while len(self.records) > self.memory_cache_size:
             _old_key, old_record = self.records.popitem(last=False)
