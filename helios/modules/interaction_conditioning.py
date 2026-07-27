@@ -63,7 +63,10 @@ class InteractionSemanticEncoder(nn.Module):
     def forward(self, action_ids, block_ids, event_frames, total_frames, event_valid):
         denominator = (total_frames.float() - 1.0).clamp_min(1.0)
         event_position = event_frames.float() / denominator
-        time_embedding = self.time_projection(sinusoidal_scalar(event_position, self.semantic_dim))
+        module_dtype = self.action_embedding.weight.dtype
+        time_embedding = self.time_projection(
+            sinusoidal_scalar(event_position, self.semantic_dim).to(dtype=module_dtype)
+        )
         token = self.fusion(
             torch.cat(
                 [
@@ -74,7 +77,7 @@ class InteractionSemanticEncoder(nn.Module):
                 dim=-1,
             )
         )
-        return token * event_valid.float().unsqueeze(-1)
+        return token * event_valid.to(token).unsqueeze(-1)
 
 
 class InteractionRouter(nn.Module):
@@ -114,7 +117,7 @@ class InteractionRouter(nn.Module):
                 visibility.squeeze(-1).float(),
             ],
             dim=-1,
-        )
+        ).to(dtype=self.temporal_projection[0].weight.dtype)
         routed = (
             self.target_projection(target_tokens)
             + self.warp_projection(warp_tokens)
@@ -125,14 +128,14 @@ class InteractionRouter(nn.Module):
         if bool(is_refinement):
             if previous_gate is None:
                 raise ValueError("coarse-to-fine interaction refinement requires previous_gate.")
-            previous_gate = previous_gate.to(device=logits.device, dtype=torch.float32)
+            previous_gate = previous_gate.to(device=logits.device, dtype=logits.dtype)
             if previous_support is None:
                 raise ValueError("coarse-to-fine interaction refinement requires previous_support.")
             delta = 0.25 * torch.tanh(logits) * previous_support.to(logits)
             gate = (previous_gate + delta).clamp(0.0, 1.0)
         else:
             gate = torch.sigmoid(logits)
-        return gate * visibility.float() * event_valid.float().view(-1, 1, 1)
+        return gate * visibility.to(gate) * event_valid.to(gate).view(-1, 1, 1)
 
 
 class InteractionAdapter(nn.Module):
@@ -221,7 +224,7 @@ class InteractionConditioningStack(nn.Module):
             raise ValueError(f"interaction stage_id must be in [0, {INTERACTION_PYRAMID_STAGES - 1}].")
         semantic = self.semantic_encoder(action_ids, block_ids, event_frames, total_frames, event_valid)
         stage_ids = torch.full((batch_size,), stage_id, device=device, dtype=torch.long)
-        semantic = semantic + self.stage_embedding(stage_ids) * event_valid.float().unsqueeze(-1)
+        semantic = semantic + self.stage_embedding(stage_ids) * event_valid.to(semantic).unsqueeze(-1)
 
         if visibility is None:
             visibility = torch.ones(batch_size, 1, temporal, height, width, device=device, dtype=torch.float32)

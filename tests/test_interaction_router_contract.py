@@ -9,6 +9,7 @@ MODULE_PATH = REPO_ROOT / "helios" / "modules" / "interaction_conditioning.py"
 TRAIN_TRANSFORMER = REPO_ROOT / "helios" / "modules" / "transformer_helios.py"
 INFER_TRANSFORMER = REPO_ROOT / "helios" / "diffusers_version" / "transformer_helios_diffusers.py"
 DATA_PATH = REPO_ROOT / "warp_as_history" / "training" / "data.py"
+CORE_PATH = REPO_ROOT / "warp_as_history" / "training" / "core.py"
 
 
 def optional_torch_module():
@@ -50,6 +51,13 @@ class InteractionRouterStaticContractTest(unittest.TestCase):
             self.assertIn("enable_interaction_conditioning", source)
             self.assertIn("interaction_conditioning=None", source)
 
+    def test_interaction_stack_inherits_transformer_dtype(self):
+        core_source = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "transformer.interaction_conditioning.to(device=transformer.device, dtype=transformer.dtype)",
+            core_source,
+        )
+
 
 @unittest.skipIf(TORCH is None, "PyTorch is not installed in the local test environment")
 class InteractionRouterTorchTest(unittest.TestCase):
@@ -87,6 +95,22 @@ class InteractionRouterTorchTest(unittest.TestCase):
             second_payload["event_valid"],
         )
         self.assertFalse(TORCH.allclose(first, second))
+
+    def test_bfloat16_stack_accepts_float_payload_and_visibility(self):
+        stack = INTERACTION.InteractionConditioningStack(hidden_dim=32, semantic_dim=16, rank=8).to(
+            dtype=TORCH.bfloat16
+        )
+        output, debug = stack(
+            self.target.to(dtype=TORCH.bfloat16),
+            self.warp.to(dtype=TORCH.bfloat16),
+            self.payload(),
+            self.visibility,
+            temporal=2,
+            height=2,
+            width=2,
+        )
+        self.assertEqual(output.dtype, TORCH.bfloat16)
+        self.assertEqual(debug["predicted_gate"].dtype, TORCH.bfloat16)
 
     def test_event_frame_changes_router_temporal_output(self):
         _, first = self.stack(self.target, self.warp, self.payload(event_frame=0.0), self.visibility, 2, 2, 2)

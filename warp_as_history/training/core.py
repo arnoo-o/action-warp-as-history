@@ -1101,7 +1101,7 @@ def visible_aux_state_dict(transformer):
 def ensure_target_channel_fusion(transformer):
     if getattr(transformer, "target_channel_fusion_mlp", None) is None:
         transformer.enable_target_channel_fusion()
-        transformer.target_channel_fusion_mlp.to(device=transformer.device)
+    transformer.target_channel_fusion_mlp.to(device=transformer.device, dtype=transformer.dtype)
     return transformer.target_channel_fusion_mlp
 
 
@@ -1119,7 +1119,7 @@ def ensure_interaction_conditioning(
             stage_warp_scales=stage_warp_scales,
             stage_adapter_scales=stage_adapter_scales,
         )
-        transformer.interaction_conditioning.to(device=transformer.device)
+    transformer.interaction_conditioning.to(device=transformer.device, dtype=transformer.dtype)
     return transformer.interaction_conditioning
 
 def downsample_latents_spatial_bilinear(latents, height, width, scale=1.0):
