@@ -118,10 +118,14 @@ class InteractionRouter(nn.Module):
             ],
             dim=-1,
         ).to(dtype=self.temporal_projection[0].weight.dtype)
+        projection_dtype = self.target_projection.weight.dtype
+        target_for_projection = target_tokens.to(dtype=projection_dtype)
+        warp_for_projection = warp_tokens.to(dtype=projection_dtype)
+        semantic_for_projection = interaction_token.to(dtype=projection_dtype)
         routed = (
-            self.target_projection(target_tokens)
-            + self.warp_projection(warp_tokens)
-            + self.semantic_projection(interaction_token).unsqueeze(1)
+            self.target_projection(target_for_projection)
+            + self.warp_projection(warp_for_projection)
+            + self.semantic_projection(semantic_for_projection).unsqueeze(1)
             + self.temporal_projection(temporal_features)
         )
         logits = self.output(F.silu(routed))
@@ -150,10 +154,11 @@ class InteractionAdapter(nn.Module):
         nn.init.zeros_(self.up.weight)
 
     def forward(self, target_tokens, warp_tokens, interaction_token, gate, stage_scale=1.0):
+        projection_dtype = self.target_down.weight.dtype
         low_rank = (
-            self.target_down(target_tokens)
-            + self.warp_down(warp_tokens)
-            + self.semantic_down(interaction_token).unsqueeze(1)
+            self.target_down(target_tokens.to(dtype=projection_dtype))
+            + self.warp_down(warp_tokens.to(dtype=projection_dtype))
+            + self.semantic_down(interaction_token.to(dtype=projection_dtype)).unsqueeze(1)
         )
         delta = self.up(F.silu(low_rank)).to(target_tokens)
         injection = self.scale * stage_scale.to(target_tokens) * gate.to(target_tokens) * delta

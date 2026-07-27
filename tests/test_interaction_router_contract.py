@@ -112,6 +112,19 @@ class InteractionRouterTorchTest(unittest.TestCase):
         self.assertEqual(output.dtype, TORCH.bfloat16)
         self.assertEqual(debug["predicted_gate"].dtype, TORCH.bfloat16)
 
+    def test_float_master_weights_accept_bfloat16_hidden_states(self):
+        output, debug = self.stack(
+            self.target.to(dtype=TORCH.bfloat16),
+            self.warp.to(dtype=TORCH.bfloat16),
+            self.payload(),
+            self.visibility,
+            temporal=2,
+            height=2,
+            width=2,
+        )
+        self.assertEqual(output.dtype, TORCH.bfloat16)
+        self.assertEqual(debug["predicted_gate"].dtype, TORCH.float32)
+
     def test_event_frame_changes_router_temporal_output(self):
         _, first = self.stack(self.target, self.warp, self.payload(event_frame=0.0), self.visibility, 2, 2, 2)
         _, second = self.stack(self.target, self.warp, self.payload(event_frame=4.0), self.visibility, 2, 2, 2)
