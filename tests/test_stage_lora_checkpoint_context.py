@@ -44,6 +44,7 @@ class StageLoraCheckpointContextTest(unittest.TestCase):
         self.assertIn("torch.utils.checkpoint.checkpoint(", source)
         self.assertIn("stage_stable_forward", source)
         self.assertIn("use_reentrant=True", source)
+        self.assertNotIn("hidden_states = self._gradient_checkpointing_func(", source)
 
     def test_checkpoint_context_restores_stage_lora_state(self):
         transformer = DummyTransformer()

@@ -2130,7 +2130,7 @@ class HeliosTransformer3DModel(
         rotary_emb = rotary_emb.contiguous()
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for iidx, block in enumerate(self.blocks):
-                hidden_states = self._gradient_checkpointing_func(
+                hidden_states = self.gradient_checkpointing_method(
                     block,
                     hidden_states,
                     encoder_hidden_states,
