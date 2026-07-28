@@ -18,6 +18,7 @@ import glob
 import json
 import math
 import os
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -1378,6 +1379,7 @@ class HeliosTransformer3DModel(
                 self.gan_final_head = Discriminator3DHead(out_channels, gan_cond_map_dim)
 
         self.gradient_checkpointing = False
+        self._wah_lora_runtime_enabled = True
 
     def enable_target_channel_fusion(self):
         if getattr(self, "target_channel_fusion_mlp", None) is not None:
@@ -1503,9 +1505,34 @@ class HeliosTransformer3DModel(
 
         self.load_state_dict(sd, strict=False)
 
+    def _set_wah_lora_runtime_enabled(self, enabled):
+        enabled = bool(enabled)
+        method_name = "enable_adapters" if enabled else "disable_adapters"
+        method = getattr(self, method_name, None)
+        if method is not None:
+            method()
+        self._wah_lora_runtime_enabled = enabled
+
+    @contextmanager
+    def _wah_lora_checkpoint_context(self, enabled):
+        previous = bool(getattr(self, "_wah_lora_runtime_enabled", True))
+        self._set_wah_lora_runtime_enabled(enabled)
+        try:
+            yield
+        finally:
+            self._set_wah_lora_runtime_enabled(previous)
+
     def gradient_checkpointing_method(self, block, *args):
         if torch.is_grad_enabled() and self.gradient_checkpointing:
-            result = self._gradient_checkpointing_func(block, *args)
+            wah_lora_enabled = bool(getattr(self, "_wah_lora_runtime_enabled", True))
+
+            def context_fn():
+                return (
+                    self._wah_lora_checkpoint_context(wah_lora_enabled),
+                    self._wah_lora_checkpoint_context(wah_lora_enabled),
+                )
+
+            result = self._gradient_checkpointing_func(block, *args, context_fn=context_fn)
         else:
             result = block(*args)
         return result

@@ -1396,6 +1396,10 @@ def refine_interaction_teacher(
 
 
 def set_training_wah_lora_enabled(transformer, enabled):
+    runtime_setter = getattr(transformer, "_set_wah_lora_runtime_enabled", None)
+    if runtime_setter is not None:
+        runtime_setter(bool(enabled))
+        return
     peft_config = getattr(transformer, "peft_config", None)
     if not isinstance(peft_config, dict) or not peft_config:
         return
