@@ -799,33 +799,135 @@ def _iter_online_image_files(path):
     return sorted(p for p in Path(path).iterdir() if p.suffix.lower() in ONLINE_IMAGE_EXTS)
 
 
-def load_online_video_frames(ref, *, height, width, frame_stride=1, max_video_frames=0):
+def _online_resample_indices(source_fps, target_fps, max_source_frames):
+    source_fps = float(source_fps or 0.0)
+    target_fps = float(target_fps or 0.0)
+    max_source_frames = int(max_source_frames)
+    if source_fps <= 0.0 or target_fps <= 0.0:
+        return None
+    if target_fps > source_fps + 1.0e-6:
+        raise ValueError(f"Online target fps {target_fps:g} exceeds source fps {source_fps:g}.")
+    count = max(1, int(np.floor((max_source_frames - 1) * target_fps / source_fps)) + 1)
+    return np.rint(np.arange(count, dtype=np.float64) * source_fps / target_fps).astype(np.int64)
+
+
+def load_online_video_frames(
+    ref,
+    *,
+    height,
+    width,
+    frame_stride=1,
+    max_video_frames=0,
+    target_fps=0.0,
+    source_fps=0.0,
+    return_source_indices=False,
+):
     frame_stride = max(1, int(frame_stride))
     max_video_frames = int(max_video_frames)
     frames = []
+    source_indices = []
+    selected_indices = None
     if isinstance(ref, Path) and ref.is_dir():
-        for src_idx, path in enumerate(_iter_online_image_files(ref)):
-            if src_idx % frame_stride != 0:
+        image_files = _iter_online_image_files(ref)
+        selected_indices = _online_resample_indices(source_fps, target_fps, len(image_files))
+        selected_set = set(selected_indices.tolist()) if selected_indices is not None else None
+        for src_idx, path in enumerate(image_files):
+            if selected_set is not None and src_idx not in selected_set:
+                continue
+            if selected_set is None and src_idx % frame_stride != 0:
                 continue
             frame = Image.open(path).convert("RGB")
             frames.append(center_crop_resize_first_frame(frame, int(height), int(width)))
+            source_indices.append(int(src_idx))
             if max_video_frames > 0 and len(frames) >= max_video_frames:
                 break
     else:
         reader = imageio.get_reader(str(ref))
         try:
+            metadata = reader.get_meta_data()
+            detected_fps = float(source_fps or metadata.get("fps") or 0.0)
+            selected_cursor = 0
+            use_target_fps = float(target_fps or 0.0) > 0.0
+            if use_target_fps and detected_fps <= 0.0:
+                raise ValueError(f"Could not determine source fps for {ref}.")
+            if use_target_fps and float(target_fps) > detected_fps + 1.0e-6:
+                raise ValueError(f"Online target fps {float(target_fps):g} exceeds source fps {detected_fps:g}.")
             for src_idx, array in enumerate(reader):
-                if src_idx % frame_stride != 0:
+                if use_target_fps:
+                    desired_source = int(round(selected_cursor * detected_fps / float(target_fps)))
+                    while desired_source < src_idx:
+                        selected_cursor += 1
+                        desired_source = int(round(selected_cursor * detected_fps / float(target_fps)))
+                    if desired_source != src_idx:
+                        continue
+                    selected_cursor += 1
+                elif src_idx % frame_stride != 0:
                     continue
                 frame = Image.fromarray(np.asarray(array)).convert("RGB")
                 frames.append(center_crop_resize_first_frame(frame, int(height), int(width)))
+                source_indices.append(int(src_idx))
                 if max_video_frames > 0 and len(frames) >= max_video_frames:
                     break
         finally:
             reader.close()
     if not frames:
         raise ValueError(f"No frames decoded from online training video {ref}.")
+    if return_source_indices:
+        return frames, source_indices
     return frames
+
+
+def load_vpt_pose_rows(path, source_indices):
+    wanted = set(int(index) for index in source_indices)
+    rows_by_index = {}
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_index, line in enumerate(handle):
+            payload = json.loads(line)
+            segment_frame = int(payload.get("segment_frame", line_index))
+            if segment_frame in wanted:
+                rows_by_index[segment_frame] = payload
+            if len(rows_by_index) == len(wanted):
+                break
+    missing = [index for index in source_indices if int(index) not in rows_by_index]
+    if missing:
+        raise ValueError(f"VPT telemetry {path} is missing source frames {missing[:8]}.")
+    required = ("xpos", "ypos", "zpos", "yaw", "pitch")
+    rows = [rows_by_index[int(index)] for index in source_indices]
+    if any(any(key not in row for key in required) for row in rows):
+        raise ValueError(f"VPT telemetry {path} lacks one of {required}.")
+    return rows
+
+
+def vpt_relative_camera_poses(pose_rows, source_index, target_indices, translation_scale=1.0):
+    source = pose_rows[int(source_index)]
+    source_yaw = np.deg2rad(float(source["yaw"]))
+    right = np.asarray([-np.cos(source_yaw), 0.0, -np.sin(source_yaw)], dtype=np.float32)
+    forward = np.asarray([-np.sin(source_yaw), 0.0, np.cos(source_yaw)], dtype=np.float32)
+    source_position = np.asarray(
+        [float(source["xpos"]), float(source["ypos"]), float(source["zpos"])],
+        dtype=np.float32,
+    )
+    poses = []
+    for target_index in target_indices:
+        target = pose_rows[int(target_index)]
+        delta = np.asarray(
+            [float(target["xpos"]), float(target["ypos"]), float(target["zpos"])],
+            dtype=np.float32,
+        ) - source_position
+        yaw = np.deg2rad(((float(target["yaw"]) - float(source["yaw"]) + 180.0) % 360.0) - 180.0)
+        pitch = np.deg2rad(float(target["pitch"]) - float(source["pitch"]))
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        rotation_y = np.asarray([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float32)
+        rotation_x = np.asarray([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]], dtype=np.float32)
+        pose = np.eye(4, dtype=np.float32)
+        pose[:3, :3] = rotation_y @ rotation_x
+        pose[:3, 3] = (
+            np.asarray([np.dot(delta, right), delta[1], np.dot(delta, forward)], dtype=np.float32)
+            * float(translation_scale)
+        )
+        poses.append(pose)
+    return np.stack(poses, axis=0)
 
 
 def online_pil_to_tensor(frame):
@@ -958,10 +1060,15 @@ class OnlineWarpTrainingCache:
 
     def _cache_payload(self):
         payload = {
-            "cache_schema": 2,
+            "cache_schema": 3,
             "height": int(self.exact_args.height),
             "width": int(self.exact_args.width),
             "frame_stride": int(getattr(self.exact_args, "online_frame_stride", 1)),
+            "target_fps": float(getattr(self.exact_args, "online_target_fps", 0.0)),
+            "use_vpt_camera_poses": bool(getattr(self.exact_args, "online_use_vpt_camera_poses", False)),
+            "geometry_keyframe_stride": int(
+                getattr(self.exact_args, "online_geometry_keyframe_stride", 1)
+            ),
             "max_video_frames": int(getattr(self.exact_args, "online_max_video_frames", 0)),
             "pi3_pixel_limit": int(getattr(self.exact_args, "online_pi3_pixel_limit", CAMERA_CONTROL_PI3_PIXEL_LIMIT)),
             "pi3_conf_threshold": float(getattr(self.exact_args, "online_pi3_conf_threshold", 0.1)),
@@ -1044,16 +1151,19 @@ class OnlineWarpTrainingCache:
         return str(direction), self._geometry_cache_digest(ref, direction)
 
     def _load_frames(self, ref, direction):
-        frames = load_online_video_frames(
+        frames, source_indices = load_online_video_frames(
             ref,
             height=int(self.exact_args.height),
             width=int(self.exact_args.width),
             frame_stride=int(getattr(self.exact_args, "online_frame_stride", 1)),
             max_video_frames=int(getattr(self.exact_args, "online_max_video_frames", 0)),
+            target_fps=float(getattr(self.exact_args, "online_target_fps", 0.0)),
+            return_source_indices=True,
         )
         if direction == "reverse":
             frames = list(reversed(frames))
-        return frames
+            source_indices = list(reversed(source_indices))
+        return frames, source_indices
 
     def _release_record(self, record):
         if not record:
@@ -1106,7 +1216,18 @@ class OnlineWarpTrainingCache:
 
     def _estimate_geometry(self, row_index, row, direction, ref, frames):
         use_hud_mask = bool(getattr(self.exact_args, "use_minecraft_hud_mask", False))
-        pi3_frames = [fill_minecraft_hud_for_pi3(frame) for frame in frames] if use_hud_mask else frames
+        geometry_stride = max(1, int(getattr(self.exact_args, "online_geometry_keyframe_stride", 1)))
+        if geometry_stride > 1 and not bool(getattr(self.exact_args, "online_use_vpt_camera_poses", False)):
+            raise ValueError("Sparse Pi3X geometry requires --online_use_vpt_camera_poses.")
+        geometry_frame_indices = list(range(0, len(frames), geometry_stride))
+        if geometry_frame_indices[-1] != len(frames) - 1:
+            geometry_frame_indices.append(len(frames) - 1)
+        geometry_frames = [frames[index] for index in geometry_frame_indices]
+        pi3_frames = (
+            [fill_minecraft_hud_for_pi3(frame) for frame in geometry_frames]
+            if use_hud_mask
+            else geometry_frames
+        )
         tensors = [online_pil_to_tensor(frame).unsqueeze(0) for frame in pi3_frames]
         print(
             json.dumps(
@@ -1116,6 +1237,8 @@ class OnlineWarpTrainingCache:
                     "seq": str(row["id"]),
                     "direction": direction,
                     "frames": len(frames),
+                    "geometry_frames": len(geometry_frames),
+                    "geometry_keyframe_stride": geometry_stride,
                     "video": str(ref),
                 }
             ),
@@ -1123,6 +1246,7 @@ class OnlineWarpTrainingCache:
         )
         try:
             geometry = self.renderer.estimate_keyframe_geometry(tensors, device=self.device)
+            geometry["training_frame_indices"] = geometry_frame_indices
             if use_hud_mask:
                 world_valid_mask = minecraft_world_valid_mask(
                     height=int(self.exact_args.height),
@@ -1142,15 +1266,26 @@ class OnlineWarpTrainingCache:
         row = self.rows[row_index]
         if ref is None:
             ref = resolve_online_video_ref(row["video_path"], getattr(self.exact_args, "data_root", "."))
-        frames = self._load_frames(ref, direction)
+        frames, source_indices = self._load_frames(ref, direction)
         cache_path = self._geometry_cache_path(ref, direction)
         geometry = self._load_geometry_from_disk(cache_path)
         if geometry is None:
             geometry = self._estimate_geometry(row_index, row, direction, ref, frames)
             self._save_geometry_to_disk(cache_path, geometry, row_index, direction, ref, frames)
+        pose_rows = None
+        if bool(getattr(self.exact_args, "online_use_vpt_camera_poses", False)):
+            actions_path = resolve_online_video_ref(
+                row.get("actions_path", ""),
+                getattr(self.exact_args, "data_root", "."),
+            )
+            if not isinstance(actions_path, Path) or not actions_path.is_file():
+                raise FileNotFoundError(f"Missing VPT telemetry for {row.get('id', row_index)}: {actions_path}")
+            pose_rows = load_vpt_pose_rows(actions_path, source_indices)
         return {
             "direction": direction,
             "frames": frames,
+            "source_indices": source_indices,
+            "pose_rows": pose_rows,
             "geometry": geometry,
             "row": row,
             "row_index": row_index,
@@ -1188,6 +1323,8 @@ class OnlineWarpTrainingCache:
         return record
 
     def choose_direction(self, rng):
+        if bool(getattr(self.exact_args, "online_use_vpt_camera_poses", False)):
+            return "forward"
         if not bool(getattr(self.exact_args, "online_direction_augmentation", True)):
             return "forward"
         reverse_prob = float(getattr(self.exact_args, "online_direction_reverse_prob", 0.5))
@@ -1227,6 +1364,16 @@ class OnlineWarpTrainingCache:
                 ]
             }
         frames = prepared["frames"]
+        geometry_frame_indices = [
+            int(index)
+            for index in prepared["geometry"].get(
+                "training_frame_indices",
+                range(len(prepared["geometry"]["keyframe_geometries"])),
+            )
+        ]
+        geometry_position_by_frame = {
+            frame_index: position for position, frame_index in enumerate(geometry_frame_indices)
+        }
         n = len(frames)
         num_frames = int(self.exact_args.num_frames)
         if n < num_frames:
@@ -1234,7 +1381,11 @@ class OnlineWarpTrainingCache:
         sample_fire_prob = float(getattr(self.exact_args, "online_primary_fire_window_probability", 0.6) or 0.6)
         target_indices = None
         chunk_mode = "movement"
-        if full_interaction_payload is not None and rng.random() < sample_fire_prob:
+        first_chunk_prob = float(getattr(self.exact_args, "online_first_chunk_prob", 0.0) or 0.0)
+        if rng.random() < first_chunk_prob:
+            target_indices = list(range(num_frames))
+            chunk_mode = "first"
+        if target_indices is None and full_interaction_payload is not None and rng.random() < sample_fire_prob:
             target_indices = choose_online_interaction_window(rng, n, num_frames, full_interaction_payload)
             chunk_mode = "interaction"
         if target_indices is None and full_event_payload is not None and rng.random() < sample_fire_prob:
@@ -1247,7 +1398,8 @@ class OnlineWarpTrainingCache:
             chunk_mode = "first" if chunk_mode == "movement" else f"{chunk_mode}_first"
             source_idx = int(target_start)
             history_indices = []
-            keyframe_indices = [source_idx]
+            geometry_keyframe_frames = [source_idx]
+            keyframe_indices = [geometry_position_by_frame[source_idx]]
             render_pose_indices = target_indices
             future_keyframe_indices = []
             drop_renderer_source = False
@@ -1260,13 +1412,34 @@ class OnlineWarpTrainingCache:
             history_indices = list(range(target_start - history_len, target_start))
             future_keyframe_indices = []
             keyframe_policy = "history_only"
-            keyframe_indices = sorted(set(history_indices + future_keyframe_indices))
-            render_pose_indices = [keyframe_indices[-1], *target_indices]
+            geometry_keyframe_frames = [
+                frame_index
+                for frame_index in geometry_frame_indices
+                if history_indices[0] <= frame_index < target_start
+            ]
+            if not geometry_keyframe_frames:
+                geometry_keyframe_frames = [max(frame_index for frame_index in geometry_frame_indices if frame_index < target_start)]
+            keyframe_indices = [geometry_position_by_frame[index] for index in geometry_keyframe_frames]
+            render_pose_indices = [geometry_keyframe_frames[-1], *target_indices]
             drop_renderer_source = True
-            condition_frame = frames[history_indices[-1]]
+            condition_frame = frames[geometry_keyframe_frames[-1]]
 
         geometry = subset_online_geometry(prepared["geometry"], keyframe_indices)
-        poses = online_relative_poses(prepared["geometry"], geometry["source_pose"], render_pose_indices)
+        if prepared.get("pose_rows") is not None:
+            pose_source_index = int(render_pose_indices[0])
+            depth_scale = self.renderer.estimate_first_frame_depth_scale(geometry)
+            effective_scale = float(getattr(self.exact_args, "online_vpt_translation_scale", 0.1)) * depth_scale
+            poses = vpt_relative_camera_poses(
+                prepared["pose_rows"],
+                pose_source_index,
+                render_pose_indices,
+                translation_scale=effective_scale,
+            )
+            pose_source = "vpt_telemetry"
+        else:
+            poses = online_relative_poses(prepared["geometry"], geometry["source_pose"], render_pose_indices)
+            effective_scale = 1.0
+            pose_source = "pi3x"
         rendered = self.renderer.render_from_geometry(
             geometry,
             poses,
@@ -1402,6 +1575,8 @@ class OnlineWarpTrainingCache:
             "prompt_raw": row.get("prompt_raw", row["prompt"]),
             "row": row,
             "seq": seq,
+            "camera_pose_source": pose_source,
+            "camera_translation_scale": float(effective_scale),
             "target_frames": [frames[idx] for idx in target_indices],
             "target_indices": target_indices,
             "warp_frames": warp_frames,

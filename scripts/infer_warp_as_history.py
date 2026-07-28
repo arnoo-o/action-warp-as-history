@@ -53,7 +53,13 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Defaults to the warp video frame count or the number of frames in camera_poses.npz.",
     )
-    parser.add_argument("--fps", type=int, default=0, help="Defaults to warp video fps, camera pose fps, or 16.")
+    parser.add_argument("--fps", type=float, default=0.0, help="Defaults to warp video fps, camera pose fps, or 16.")
+    parser.add_argument(
+        "--minecraft_16fps_multichunk",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require 16 fps and more than one 33-frame WAH chunk for Minecraft inference.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
@@ -301,20 +307,20 @@ def build_primary_fire_event_latents(
     return latents.astype(np.float32), mapping
 
 
-def load_camera_poses(path: Path, key: str) -> tuple[np.ndarray, int]:
+def load_camera_poses(path: Path, key: str) -> tuple[np.ndarray, float]:
     if not path.is_file():
         raise FileNotFoundError(f"Missing camera pose file: {path}")
     with np.load(path) as data:
         if key not in data:
             raise KeyError(f"{path} does not contain key {key!r}. Available keys: {list(data.files)}")
         poses = np.asarray(data[key], dtype=np.float32)
-        fps = int(round(float(data["fps"]))) if "fps" in data else 16
+        fps = float(data["fps"]) if "fps" in data else 16.0
     if poses.ndim != 3 or poses.shape[-2:] != (4, 4):
         raise ValueError(f"Expected camera poses with shape [T, 4, 4], got {poses.shape}")
     return poses, fps
 
 
-def load_video_frames(path: Path) -> tuple[list[np.ndarray], int]:
+def load_video_frames(path: Path) -> tuple[list[np.ndarray], float]:
     if not path.is_file():
         raise FileNotFoundError(f"Missing video file: {path}")
     reader = imageio.get_reader(str(path))
@@ -325,7 +331,7 @@ def load_video_frames(path: Path) -> tuple[list[np.ndarray], int]:
         reader.close()
     if not frames:
         raise ValueError(f"{path} contains no frames")
-    fps = int(round(float(meta.get("fps") or 16)))
+    fps = float(meta.get("fps") or 16.0)
     return frames, fps
 
 
@@ -377,9 +383,9 @@ def frame_to_uint8(frame: Any) -> np.ndarray:
     return arr
 
 
-def write_video(path: Path, frames: list[Any], fps: int) -> None:
+def write_video(path: Path, frames: list[Any], fps: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with imageio.get_writer(str(path), fps=int(fps), codec="libx264", macro_block_size=1) as writer:
+    with imageio.get_writer(str(path), fps=float(fps), codec="libx264", macro_block_size=1) as writer:
         for frame in frames:
             writer.append_data(frame_to_uint8(frame))
 
@@ -515,7 +521,7 @@ def main() -> None:
     interaction_payload = load_interaction_payload(sample.get("interaction_event_path"))
     conditioning_type = ""
     conditioning_frames = 0
-    conditioning_fps = 16
+    conditioning_fps = 16.0
     if sample["warp_video_path"] is not None:
         warp_video, conditioning_fps = load_video_frames(sample["warp_video_path"])
         conditioning_type = "warp_video"
@@ -527,7 +533,7 @@ def main() -> None:
                     f"warp visibility mask has {len(warp_visibility_mask)} frames, "
                     f"but warp video has {conditioning_frames} frames"
                 )
-            if int(args.fps) <= 0:
+            if float(args.fps) <= 0:
                 conditioning_fps = mask_fps or conditioning_fps
     elif sample["camera_poses_path"] is not None:
         camera_poses, conditioning_fps = load_camera_poses(sample["camera_poses_path"], args.camera_key)
@@ -536,8 +542,13 @@ def main() -> None:
     else:
         raise ValueError(f"{csv_path} must provide either warp_video_path or camera_poses_path")
 
-    fps = int(args.fps) if int(args.fps) > 0 else int(conditioning_fps)
+    fps = float(args.fps) if float(args.fps) > 0 else float(conditioning_fps)
     num_frames = int(args.num_frames) if int(args.num_frames) > 0 else int(conditioning_frames)
+    if bool(args.minecraft_16fps_multichunk):
+        if abs(fps - 16.0) > 1.0e-6:
+            raise ValueError("--minecraft_16fps_multichunk requires --fps 16 (or 16-fps conditioning metadata).")
+        if num_frames <= 33:
+            raise ValueError("--minecraft_16fps_multichunk requires more than 33 input frames.")
     if conditioning_type == "camera_poses" and num_frames > conditioning_frames:
         raise ValueError(f"--num_frames={num_frames} exceeds camera pose length {conditioning_frames}")
 

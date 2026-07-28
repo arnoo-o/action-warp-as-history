@@ -403,6 +403,34 @@ and pass it as `--lora_path checkpoints/warp-as-history/visible_lora_state_step1
 The training script writes `train_config.json`, `train_loss.json`,
 `visible_lora_state.pt`, and step checkpoints when `--save_every` is enabled.
 
+### Minecraft VPT at 16 FPS
+
+Minecraft training uses every 16-fps RGB target frame while caching Pi3X
+geometry sparsely. VPT telemetry supplies camera translation and rotation;
+Pi3X supplies depth/geometry only. The profile also requires the Minecraft HUD
+mask, so HUD pixels do not contribute to flow matching, interaction masks,
+history tokens, or Pi3X point geometry.
+
+```bash
+python scripts/train_warp_as_history_lora.py \
+  --prompt_csv data/vpt_9x_100/wah_mc_training/mc_training_16fps.csv \
+  --minecraft_training_profile \
+  --online_target_fps 16 \
+  --online_frame_stride 1 \
+  --online_use_vpt_camera_poses \
+  --online_geometry_keyframe_stride 8 \
+  --use_minecraft_hud_mask \
+  --online_first_chunk_prob 0.5 \
+  --online_max_video_frames 256 \
+  --interaction_conditioning_mode router \
+  --base_train_steps 1500
+```
+
+For inference, use `--fps 16 --minecraft_16fps_multichunk` and provide more
+than 33 camera poses. The pipeline generates successive 33-frame chunks and
+concatenates them; interaction events are active only in the chunk containing
+their global `event_frame`.
+
 ## GPU memory
 
 The numbers below were measured on a clean single GPU with Helios-Distilled,

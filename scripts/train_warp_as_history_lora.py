@@ -415,6 +415,31 @@ def parse_args():
     parser.add_argument("--interaction_router_sparsity_loss_scale", type=float, default=0.01)
     parser.add_argument("--use_minecraft_hud_mask", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--online_frame_stride", type=int, default=1)
+    parser.add_argument(
+        "--online_target_fps",
+        type=float,
+        default=0.0,
+        help="Timestamp-resample online videos to this fps. Use 16 for Minecraft; 0 keeps stride sampling.",
+    )
+    parser.add_argument(
+        "--online_use_vpt_camera_poses",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use x/y/z/yaw/pitch from the row actions_path instead of Pi3X-estimated camera motion.",
+    )
+    parser.add_argument("--online_vpt_translation_scale", type=float, default=0.1)
+    parser.add_argument(
+        "--online_geometry_keyframe_stride",
+        type=int,
+        default=1,
+        help="Estimate/cache Pi3X geometry every N target-fps frames; RGB targets remain full fps.",
+    )
+    parser.add_argument(
+        "--minecraft_training_profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require 16 fps, VPT poses, HUD masking, and multi-chunk-compatible 33-frame windows.",
+    )
     parser.add_argument("--online_primary_fire_window_probability", type=float, default=0.6)
     parser.add_argument("--online_max_video_frames", type=int, default=0)
     parser.add_argument("--online_warp_memory_cache_size", type=int, default=2)
@@ -452,6 +477,15 @@ def parse_args():
 
 
 def build_exact_args(args):
+    if bool(args.minecraft_training_profile):
+        if abs(float(args.online_target_fps) - 16.0) > 1.0e-6:
+            raise ValueError("--minecraft_training_profile requires --online_target_fps 16.")
+        if not bool(args.online_use_vpt_camera_poses):
+            raise ValueError("--minecraft_training_profile requires --online_use_vpt_camera_poses.")
+        if not bool(args.use_minecraft_hud_mask):
+            raise ValueError("--minecraft_training_profile requires --use_minecraft_hud_mask.")
+        if int(args.online_frame_stride) != 1:
+            raise ValueError("--minecraft_training_profile forbids temporal frame stride; use --online_frame_stride 1.")
     exact = opt.parse_args([])
     exact.base_model_path = checkpoint_model_path(args.base_model_path, label="--base_model_path")
     exact.transformer_path = checkpoint_model_path(
@@ -514,6 +548,11 @@ def build_exact_args(args):
     exact.online_direction_augmentation = bool(args.direction_augmentation)
     exact.online_direction_reverse_prob = float(args.direction_reverse_probability)
     exact.online_frame_stride = int(args.online_frame_stride)
+    exact.online_target_fps = float(args.online_target_fps)
+    exact.online_use_vpt_camera_poses = bool(args.online_use_vpt_camera_poses)
+    exact.online_vpt_translation_scale = float(args.online_vpt_translation_scale)
+    exact.online_geometry_keyframe_stride = max(1, int(args.online_geometry_keyframe_stride))
+    exact.minecraft_training_profile = bool(args.minecraft_training_profile)
     exact.online_primary_fire_window_probability = float(args.online_primary_fire_window_probability)
     exact.online_max_video_frames = int(args.online_max_video_frames)
     exact.online_warp_memory_cache_size = int(args.online_warp_memory_cache_size)

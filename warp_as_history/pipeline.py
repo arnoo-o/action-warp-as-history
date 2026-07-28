@@ -2739,6 +2739,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                             )
                         chunk_frame_offset = int(state.get("chunk_index", 0)) * int(state["window_num_frames"])
                         event_frame = float(interaction_payload.get("event_frame", 0)) - float(chunk_frame_offset)
+                        event_in_chunk = 0.0 <= event_frame < float(state["window_num_frames"])
+                        event_valid = float(interaction_payload.get("event_valid", 1.0)) * float(event_in_chunk)
                         payload_tensors = {
                             "action_ids": torch.tensor(
                                 [interaction_action_id(interaction_payload.get("action_type"))], device=device
@@ -2754,7 +2756,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                             "event_frames": torch.tensor([event_frame], device=device),
                             "total_frames": torch.tensor([float(state["window_num_frames"])], device=device),
                             "event_valid": torch.tensor(
-                                [float(interaction_payload.get("event_valid", 1.0))], device=device
+                                [event_valid], device=device
                             ),
                         }
                         current_interaction_conditioning = {
