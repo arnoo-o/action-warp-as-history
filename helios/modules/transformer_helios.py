@@ -26,6 +26,7 @@ import einops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from einops import rearrange
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -1532,7 +1533,12 @@ class HeliosTransformer3DModel(
                     self._wah_lora_checkpoint_context(wah_lora_enabled),
                 )
 
-            result = self._gradient_checkpointing_func(block, *args, context_fn=context_fn)
+            result = torch.utils.checkpoint.checkpoint(
+                block.__call__,
+                *args,
+                use_reentrant=False,
+                context_fn=context_fn,
+            )
         else:
             result = block(*args)
         return result
