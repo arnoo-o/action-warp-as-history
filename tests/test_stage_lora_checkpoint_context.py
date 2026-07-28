@@ -39,11 +39,11 @@ load_methods()
 
 
 class StageLoraCheckpointContextTest(unittest.TestCase):
-    def test_transformer_uses_native_non_reentrant_checkpoint_context(self):
+    def test_transformer_uses_stage_stable_reentrant_checkpoint(self):
         source = TRANSFORMER_SOURCE.read_text(encoding="utf-8")
         self.assertIn("torch.utils.checkpoint.checkpoint(", source)
-        self.assertIn("use_reentrant=False", source)
-        self.assertIn("context_fn=context_fn", source)
+        self.assertIn("stage_stable_forward", source)
+        self.assertIn("use_reentrant=True", source)
 
     def test_checkpoint_context_restores_stage_lora_state(self):
         transformer = DummyTransformer()

@@ -1527,18 +1527,14 @@ class HeliosTransformer3DModel(
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             wah_lora_enabled = bool(getattr(self, "_wah_lora_runtime_enabled", True))
 
-            def context_fn():
-                return (
-                    self._wah_lora_checkpoint_context(wah_lora_enabled),
-                    self._wah_lora_checkpoint_context(wah_lora_enabled),
-                )
+            def stage_stable_forward(*checkpoint_args):
+                with self._wah_lora_checkpoint_context(wah_lora_enabled):
+                    return block(*checkpoint_args)
 
-            result = torch.utils.checkpoint.checkpoint(
-                block.__call__,
-                *args,
-                use_reentrant=False,
-                context_fn=context_fn,
-            )
+            # PEFT adapter enable/disable changes the autograd parameter graph.
+            # Reentrant checkpointing reruns the same stage-stable closure without
+            # applying non-reentrant saved-tensor metadata matching across stages.
+            result = torch.utils.checkpoint.checkpoint(stage_stable_forward, *args, use_reentrant=True)
         else:
             result = block(*args)
         return result
