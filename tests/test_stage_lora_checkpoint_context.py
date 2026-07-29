@@ -3,6 +3,11 @@ import contextlib
 import unittest
 from pathlib import Path
 
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TRANSFORMER_SOURCE = REPO_ROOT / "helios" / "modules" / "transformer_helios.py"
@@ -27,12 +32,18 @@ def load_methods():
         node
         for node in class_node.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in {"_set_wah_lora_runtime_enabled", "_wah_lora_checkpoint_context"}
+        and node.name
+        in {
+            "_set_wah_lora_runtime_enabled",
+            "_wah_lora_checkpoint_context",
+            "gradient_checkpointing_method",
+        }
     ]
-    namespace = {"contextmanager": contextlib.contextmanager}
+    namespace = {"contextmanager": contextlib.contextmanager, "torch": torch}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(TRANSFORMER_SOURCE), "exec"), namespace)
     DummyTransformer._set_wah_lora_runtime_enabled = namespace["_set_wah_lora_runtime_enabled"]
     DummyTransformer._wah_lora_checkpoint_context = namespace["_wah_lora_checkpoint_context"]
+    DummyTransformer.gradient_checkpointing_method = namespace["gradient_checkpointing_method"]
 
 
 load_methods()
@@ -59,6 +70,19 @@ class StageLoraCheckpointContextTest(unittest.TestCase):
         with transformer._wah_lora_checkpoint_context(True):
             self.assertTrue(transformer._wah_lora_runtime_enabled)
         self.assertFalse(transformer._wah_lora_runtime_enabled)
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed in the local test environment")
+    def test_frozen_movement_hidden_gets_checkpoint_gradient_anchor(self):
+        transformer = DummyTransformer()
+        transformer.gradient_checkpointing = True
+        scale = torch.nn.Parameter(torch.tensor(2.0))
+        hidden = torch.ones(3)
+
+        output = transformer.gradient_checkpointing_method(lambda value: value * scale, hidden)
+        output.sum().backward()
+
+        self.assertIsNotNone(scale.grad)
+        self.assertGreater(float(scale.grad), 0.0)
 
 
 if __name__ == "__main__":

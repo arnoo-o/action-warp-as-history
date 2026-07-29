@@ -1526,6 +1526,18 @@ class HeliosTransformer3DModel(
     def gradient_checkpointing_method(self, block, *args):
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             wah_lora_enabled = bool(getattr(self, "_wah_lora_runtime_enabled", True))
+            checkpoint_args = list(args)
+            has_grad_anchor = any(
+                torch.is_tensor(value) and value.requires_grad for value in checkpoint_args
+            )
+            if wah_lora_enabled and not has_grad_anchor:
+                for index, value in enumerate(checkpoint_args):
+                    if torch.is_tensor(value) and (value.is_floating_point() or value.is_complex()):
+                        # Reentrant checkpointing drops parameter gradients when
+                        # every input is frozen. WAH trains LoRA on stage 0 even
+                        # for movement samples that intentionally bypass Router.
+                        checkpoint_args[index] = value.detach().requires_grad_(True)
+                        break
 
             def stage_stable_forward(*checkpoint_args):
                 with self._wah_lora_checkpoint_context(wah_lora_enabled):
@@ -1534,7 +1546,11 @@ class HeliosTransformer3DModel(
             # PEFT adapter enable/disable changes the autograd parameter graph.
             # Reentrant checkpointing reruns the same stage-stable closure without
             # applying non-reentrant saved-tensor metadata matching across stages.
-            result = torch.utils.checkpoint.checkpoint(stage_stable_forward, *args, use_reentrant=True)
+            result = torch.utils.checkpoint.checkpoint(
+                stage_stable_forward,
+                *checkpoint_args,
+                use_reentrant=True,
+            )
         else:
             result = block(*args)
         return result
