@@ -1531,7 +1531,10 @@ class HeliosTransformer3DModel(
             has_grad_anchor = any(
                 torch.is_tensor(value) and value.requires_grad for value in checkpoint_args
             )
-            if wah_lora_enabled and not has_grad_anchor:
+            block_has_trainable_parameters = isinstance(block, torch.nn.Module) and any(
+                parameter.requires_grad for parameter in block.parameters()
+            )
+            if wah_lora_enabled and block_has_trainable_parameters and not has_grad_anchor:
                 for index, value in enumerate(checkpoint_args):
                     if torch.is_tensor(value) and (value.is_floating_point() or value.is_complex()):
                         # Reentrant checkpointing drops parameter gradients when

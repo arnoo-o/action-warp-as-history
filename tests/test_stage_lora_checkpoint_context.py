@@ -74,16 +74,24 @@ class StageLoraCheckpointContextTest(unittest.TestCase):
 
     @unittest.skipIf(torch is None, "PyTorch is not installed in the local test environment")
     def test_frozen_movement_hidden_gets_checkpoint_gradient_anchor(self):
+        class TrainableBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.tensor(2.0))
+
+            def forward(self, value):
+                return value * self.scale
+
         transformer = DummyTransformer()
         transformer.gradient_checkpointing = True
-        scale = torch.nn.Parameter(torch.tensor(2.0))
+        block = TrainableBlock()
         hidden = torch.ones(3)
 
-        output = transformer.gradient_checkpointing_method(lambda value: value * scale, hidden)
+        output = transformer.gradient_checkpointing_method(block, hidden)
         output.sum().backward()
 
-        self.assertIsNotNone(scale.grad)
-        self.assertGreater(float(scale.grad), 0.0)
+        self.assertIsNotNone(block.scale.grad)
+        self.assertGreater(float(block.scale.grad), 0.0)
 
 
 if __name__ == "__main__":
