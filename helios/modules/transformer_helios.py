@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import einops
 import torch
+import torch.utils.checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
