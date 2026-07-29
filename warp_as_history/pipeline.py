@@ -60,6 +60,7 @@ from .defaults import (
     WAH_PYRAMID_STEPS,
     WAH_VISIBLE_TOKEN_THRESHOLD,
 )
+from .minecraft_sampling import interaction_payload_for_chunk
 
 
 LORA_AUTO_VALUES = frozenset({"auto", "default"})
@@ -760,7 +761,11 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 and pi3x_keyframe_images is not None
                 and len(pi3x_keyframe_images) > 1
             ):
-                max_keyframes_for_geometry = max(int(CAMERA_CONTROL_PI3X_KEYFRAME_RENDER_MAX_PREVIOUS) + 1, 1)
+                max_keyframes_for_geometry = max(
+                    int(state.get("camera_keyframe_max_previous", CAMERA_CONTROL_PI3X_KEYFRAME_RENDER_MAX_PREVIOUS))
+                    + 1,
+                    1,
+                )
                 selected_pi3x_keyframe_images = list(pi3x_keyframe_images)
                 if len(selected_pi3x_keyframe_images) > max_keyframes_for_geometry:
                     selected_pi3x_keyframe_images = selected_pi3x_keyframe_images[-max_keyframes_for_geometry:]
@@ -933,6 +938,18 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 self._delete_wah_adapter()
             self.load_lora_weights(adapter_path, adapter_name=self._wah_adapter_name)
             self._apply_wah_extra_state(lora_path)
+            if not self._wah_has_loaded_adapters():
+                raise ValueError(f"PEFT LoRA failed to load from {lora_path}.")
+            print(
+                json.dumps(
+                    {
+                        "event": "wah_peft_lora_loaded",
+                        "path": str(lora_path),
+                        "adapter": self._wah_adapter_name,
+                    }
+                ),
+                flush=True,
+            )
             self._wah_loaded_lora_path = lora_path
 
         if hasattr(self, "set_adapters"):
@@ -987,14 +1004,28 @@ class WarpAsHistoryPipeline(HeliosPipeline):
 
     def _apply_wah_extra_state(self, lora_path: str | Path) -> None:
         path = Path(lora_path).expanduser().resolve()
+        requires_interaction = bool(getattr(self.transformer, "_wah_require_interaction_checkpoint", False))
         if path.suffix == ".safetensors" or not path.is_file():
+            if requires_interaction:
+                raise ValueError("Router inference requires a .pt checkpoint with interaction extra_state, not a safetensors-only LoRA.")
             return
         loaded = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(loaded, dict):
             return
         extra_state = loaded.get("extra_state")
         if not isinstance(extra_state, dict):
+            if requires_interaction:
+                raise ValueError("Router inference checkpoint is missing interaction extra_state.")
             return
+        checkpoint_recipe = extra_state.get("wah_recipe")
+        runtime_recipe = getattr(self.transformer, "_wah_runtime_recipe", None)
+        if isinstance(checkpoint_recipe, dict) and isinstance(runtime_recipe, dict):
+            from warp_as_history.minecraft_recipe import format_recipe_warning, recipe_mismatches
+
+            mismatches = recipe_mismatches(checkpoint_recipe, runtime_recipe)
+            if mismatches:
+                print(format_recipe_warning(mismatches), flush=True)
+                print(json.dumps({"event": "wah_recipe_mismatch", "checkpoint": checkpoint_recipe, "runtime": runtime_recipe, "mismatches": mismatches}), flush=True)
         history_invisible_token = extra_state.get("history_invisible_token")
         if torch.is_tensor(history_invisible_token):
             if getattr(self.transformer, "history_invisible_token", None) is None:
@@ -1014,6 +1045,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         interaction_state = extra_state.get("interaction_conditioning")
         if isinstance(interaction_state, dict):
             interaction_config = dict(extra_state.get("interaction_conditioning_config", {}) or {})
+            if requires_interaction and not interaction_config:
+                raise ValueError("Router inference checkpoint is missing interaction_conditioning_config.")
             self.transformer.enable_interaction_conditioning(
                 rank=int(interaction_config.get("rank", 64)),
                 semantic_dim=int(interaction_config.get("semantic_dim", 256)),
@@ -1029,6 +1062,11 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                     + ", ".join(incompatible.unexpected_keys[:20])
                 )
             if incompatible.missing_keys:
+                if requires_interaction:
+                    raise ValueError(
+                        "Router inference checkpoint is missing interaction parameters: "
+                        + ", ".join(incompatible.missing_keys[:20])
+                    )
                 print(
                     json.dumps(
                         {
@@ -1045,6 +1083,19 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             self.transformer.interaction_conditioning.to(
                 device=self.transformer.device, dtype=self.transformer.dtype
             )
+            print(
+                json.dumps(
+                    {
+                        "event": "interaction_checkpoint_loaded",
+                        "missing_keys": list(incompatible.missing_keys),
+                        "unexpected_keys": list(incompatible.unexpected_keys),
+                        "parameter_count": len(interaction_state),
+                    }
+                ),
+                flush=True,
+            )
+        elif requires_interaction:
+            raise ValueError("Router inference requires interaction_conditioning weights in the selected checkpoint.")
 
     def _get_camera_warp_renderer(
         self,
@@ -1493,7 +1544,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         add_noise_to_warp_latents: bool = True,
         warp_noise_sigma_min: float = 0.111,
         warp_noise_sigma_max: float = 0.135,
-        is_amplify_first_chunk: bool = True,
+        is_amplify_first_chunk: bool = False,
         pyramid_num_inference_steps_list: list[int] | tuple[int, ...] | None = None,
         lora_prompt_trigger: str | None = None,
         prev_chunk_history_sizes: list[int] | tuple[int, int, int] = WAH_PREV_CHUNK_HISTORY_SIZES,
@@ -1511,6 +1562,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         camera_control_pi3_pixel_limit: int = CAMERA_CONTROL_PI3_PIXEL_LIMIT,
         camera_control_mesh_samples_per_axis: int = CAMERA_CONTROL_MESH_SAMPLES_PER_AXIS,
         camera_control_pi3x_keyframe_memory: bool = CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY,
+        camera_keyframe_max_previous: int = CAMERA_CONTROL_PI3X_KEYFRAME_RENDER_MAX_PREVIOUS,
+        visible_token_threshold: float = WAH_VISIBLE_TOKEN_THRESHOLD,
+        target_fps: float = 16.0,
         primary_fire_event_latents: torch.Tensor | None = None,
         use_primary_fire_event_condition: bool = False,
         interaction_payload: dict[str, Any] | None = None,
@@ -1538,6 +1592,29 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         )
 
         normalized_lora_path = _normalize_optional_lora_path(lora_path)
+        from warp_as_history.minecraft_recipe import minecraft_wah_recipe
+
+        runtime_recipe = minecraft_wah_recipe(
+            target_fps=float(target_fps),
+            num_frames=33,
+            warp_history_downsample_mode=str(warp_history_downsample_mode),
+            camera_warp_render_mode=str(camera_control_warp_render_mode),
+            camera_control_translation_scale=float(camera_control_translation_scale),
+            camera_multiply_translation_by_depth=bool(
+                camera_control_translation_scale_use_first_frame_depth
+            ),
+            camera_mesh_samples_per_axis=int(camera_control_mesh_samples_per_axis),
+            camera_keyframe_max_previous=int(camera_keyframe_max_previous),
+            visible_token_threshold=float(visible_token_threshold),
+            amplify_first_chunk=bool(is_amplify_first_chunk),
+            history_sizes=list(WAH_HISTORY_SIZES),
+            pose_convention="opencv_c2w_relative",
+        )
+        self.transformer._wah_runtime_recipe = runtime_recipe
+        self.transformer._wah_require_interaction_checkpoint = bool(
+            str(interaction_conditioning_mode or "router") == "router"
+            and interaction_payload is not None
+        )
         lora_active = self._configure_wah_lora(normalized_lora_path)
         if bool(use_primary_fire_event_condition) and getattr(self.transformer, "target_channel_fusion_mlp", None) is None:
             self.transformer.enable_target_channel_fusion()
@@ -1569,7 +1646,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         if warp_history_downsample_mode not in {"short", "patch_mid"}:
             raise ValueError("warp_history_downsample_mode must be one of: short, patch_mid.")
         attention_kwargs = (
-            {"history_visible_token_threshold": WAH_VISIBLE_TOKEN_THRESHOLD} if bool(visible_token_drop) else None
+            {"history_visible_token_threshold": float(visible_token_threshold)} if bool(visible_token_drop) else None
         )
 
         self._guidance_scale = 1.0
@@ -1772,6 +1849,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 "use_primary_fire_event_condition": bool(use_primary_fire_event_condition),
                 "interaction_payload": interaction_payload,
                 "interaction_conditioning_mode": interaction_conditioning_mode,
+                "consumed_interaction_event_frames": [],
+                "wah_recipe": runtime_recipe,
             }
         )
 
@@ -1805,6 +1884,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                     "camera_control_mesh_break_mode": str(camera_control_mesh_break_mode),
                     "camera_control_pi3_pixel_limit": max(int(camera_control_pi3_pixel_limit), 1),
                     "camera_control_mesh_samples_per_axis": max(int(camera_control_mesh_samples_per_axis), 1),
+                    "camera_keyframe_max_previous": max(int(camera_keyframe_max_previous), 0),
                     "pi3x_keyframe_images": [source_image_tensor.detach().float().cpu()]
                     if bool(camera_control_pi3x_keyframe_memory)
                     else None,
@@ -2267,7 +2347,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         add_noise_to_warp_latents: bool = True,
         warp_noise_sigma_min: float = 0.111,
         warp_noise_sigma_max: float = 0.135,
-        is_amplify_first_chunk: bool = True,
+        is_amplify_first_chunk: bool = False,
         pyramid_num_inference_steps_list: list[int] | tuple[int, ...] | None = None,
         lora_prompt_trigger: str | None = None,
         prev_chunk_history_sizes: list[int] | tuple[int, int, int] = WAH_PREV_CHUNK_HISTORY_SIZES,
@@ -2285,6 +2365,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         camera_control_pi3_pixel_limit: int = CAMERA_CONTROL_PI3_PIXEL_LIMIT,
         camera_control_mesh_samples_per_axis: int = CAMERA_CONTROL_MESH_SAMPLES_PER_AXIS,
         camera_control_pi3x_keyframe_memory: bool = CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY,
+        camera_keyframe_max_previous: int = CAMERA_CONTROL_PI3X_KEYFRAME_RENDER_MAX_PREVIOUS,
+        visible_token_threshold: float = WAH_VISIBLE_TOKEN_THRESHOLD,
+        target_fps: float = 16.0,
         primary_fire_event_latents: torch.Tensor | None = None,
         use_primary_fire_event_condition: bool = False,
         interaction_payload: dict[str, Any] | None = None,
@@ -2382,6 +2465,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             camera_control_pi3_pixel_limit=max(int(camera_control_pi3_pixel_limit), 1),
             camera_control_mesh_samples_per_axis=max(int(camera_control_mesh_samples_per_axis), 1),
             camera_control_pi3x_keyframe_memory=bool(camera_control_pi3x_keyframe_memory),
+            camera_keyframe_max_previous=max(int(camera_keyframe_max_previous), 0),
+            visible_token_threshold=float(visible_token_threshold),
+            target_fps=float(target_fps),
             primary_fire_event_latents=primary_fire_event_latents,
             use_primary_fire_event_condition=bool(use_primary_fire_event_condition),
             interaction_payload=interaction_payload,
@@ -2722,9 +2808,15 @@ class WarpAsHistoryPipeline(HeliosPipeline):
 
                     current_interaction_conditioning = None
                     interaction_payload = state.get("interaction_payload")
+                    routed_interaction_payload = interaction_payload_for_chunk(
+                        interaction_payload,
+                        chunk_index=int(state.get("chunk_index", 0)),
+                        window_frames=int(state["window_num_frames"]),
+                        consumed_event_frames=state.get("consumed_interaction_event_frames", []),
+                    )
                     if (
                         str(state.get("interaction_conditioning_mode", "router")) == "router"
-                        and interaction_payload is not None
+                        and routed_interaction_payload is not None
                     ):
                         warp_for_router = state.get("interaction_warp_latents")
                         visibility_for_router = state.get("interaction_visibility_latents")
@@ -2737,35 +2829,34 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                             visibility_for_router = F.interpolate(
                                 visibility_for_router.float(), size=latents.shape[2:], mode="nearest"
                             )
-                        chunk_frame_offset = int(state.get("chunk_index", 0)) * int(state["window_num_frames"])
-                        event_frame = float(interaction_payload.get("event_frame", 0)) - float(chunk_frame_offset)
-                        event_in_chunk = 0.0 <= event_frame < float(state["window_num_frames"])
-                        event_valid = float(interaction_payload.get("event_valid", 1.0)) * float(event_in_chunk)
-                        payload_tensors = {
-                            "action_ids": torch.tensor(
-                                [interaction_action_id(interaction_payload.get("action_type"))], device=device
-                            ),
-                            "block_ids": torch.tensor(
-                                [
-                                    interaction_block_id(
-                                        interaction_payload.get("block_id", interaction_payload.get("object_id"))
-                                    )
-                                ],
-                                device=device,
-                            ),
-                            "event_frames": torch.tensor([event_frame], device=device),
-                            "total_frames": torch.tensor([float(state["window_num_frames"])], device=device),
-                            "event_valid": torch.tensor(
-                                [event_valid], device=device
-                            ),
-                        }
-                        current_interaction_conditioning = {
-                            "payload": payload_tensors,
-                            "warp_latents": warp_for_router,
-                            "visibility": visibility_for_router,
-                            "stage_id": int(i_s),
-                            "previous_gate": stage_previous_interaction_gate,
-                        }
+                        event_frame = float(routed_interaction_payload["event_frame"])
+                        event_valid = float(routed_interaction_payload.get("event_valid", 1.0))
+                        if event_valid > 0.0:
+                            payload_tensors = {
+                                "action_ids": torch.tensor(
+                                    [interaction_action_id(routed_interaction_payload.get("action_type"))], device=device
+                                ),
+                                "block_ids": torch.tensor(
+                                    [
+                                        interaction_block_id(
+                                            routed_interaction_payload.get(
+                                                "block_id", routed_interaction_payload.get("object_id")
+                                            )
+                                        )
+                                    ],
+                                    device=device,
+                                ),
+                                "event_frames": torch.tensor([event_frame], device=device),
+                                "total_frames": torch.tensor([float(state["window_num_frames"])], device=device),
+                                "event_valid": torch.tensor([event_valid], device=device),
+                            }
+                            current_interaction_conditioning = {
+                                "payload": payload_tensors,
+                                "warp_latents": warp_for_router,
+                                "visibility": visibility_for_router,
+                                "stage_id": int(i_s),
+                                "previous_gate": stage_previous_interaction_gate,
+                            }
 
                     timestep = t.expand(latents.shape[0]).to(torch.int64)
                     model_latents = latents.to(transformer_dtype)
@@ -2808,7 +2899,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                         last_stage_interaction_gate = interaction_debug[-1]["predicted_gate"].detach()
                     if state.get("warp_debug_dir") and current_interaction_conditioning is not None:
                         self._save_interaction_router_debug(
-                            Path(state["warp_debug_dir"]) / "interaction_debug",
+                            Path(state["warp_debug_dir"])
+                            / "interaction_debug"
+                            / f"chunk_{int(state.get('chunk_index', 0)):03d}",
                             getattr(self.transformer, "_last_interaction_debug", None),
                         )
 
@@ -2900,5 +2993,14 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 prev_history = prev_history.to(device=current_history.device, dtype=current_history.dtype)
                 current_history = torch.cat([prev_history, current_history], dim=2)
             state["prev_history_latent_window"] = current_history[:, :, -total_prev_history:].detach()
+        interaction_payload = state.get("interaction_payload")
+        if interaction_payload is not None:
+            current_chunk = int(state.get("chunk_index", 0))
+            window_frames = int(state["window_num_frames"])
+            global_event_frame = int(interaction_payload.get("event_frame", -1))
+            if current_chunk * window_frames <= global_event_frame < (current_chunk + 1) * window_frames:
+                consumed = state.setdefault("consumed_interaction_event_frames", [])
+                if global_event_frame not in consumed:
+                    consumed.append(global_event_frame)
         state["chunk_index"] = int(state.get("chunk_index", 0)) + 1
         return latents

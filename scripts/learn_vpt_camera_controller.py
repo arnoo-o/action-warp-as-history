@@ -5,9 +5,19 @@ import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from warp_as_history.minecraft_camera import (
+    integrate_local_camera_deltas,
+    wrapped_degrees,
+)
 
 
 KEY_W = "key.keyboard.w"
@@ -36,10 +46,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def wrapped_degrees(delta: float) -> float:
-    return (float(delta) + 180.0) % 360.0 - 180.0
-
-
 def resolve_data_path(repo_root: Path, value: str) -> Path:
     path = Path(str(value).replace("\\", "/")).expanduser()
     if not path.is_absolute():
@@ -54,16 +60,6 @@ def robust_median(values: list[float], fallback: float) -> float:
     low, high = np.quantile(values_array, [0.05, 0.95])
     trimmed = values_array[(values_array >= low) & (values_array <= high)]
     return float(np.median(trimmed if trimmed.size else values_array))
-
-
-def rotation_x(angle: float) -> np.ndarray:
-    c, s = math.cos(angle), math.sin(angle)
-    return np.asarray([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=np.float32)
-
-
-def rotation_y(angle: float) -> np.ndarray:
-    c, s = math.cos(angle), math.sin(angle)
-    return np.asarray([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float32)
 
 
 def conditioning_frame_for_output_frame(output_frame: int, chunk_frames: int = 33) -> int:
@@ -207,8 +203,6 @@ def build_trajectory(
     include_motion: bool = True,
     include_view_rotation: bool = True,
 ) -> tuple[np.ndarray, list[dict]]:
-    poses = np.repeat(np.eye(4, dtype=np.float32)[None], int(num_frames), axis=0)
-    pose = np.eye(4, dtype=np.float32)
     speeds = controller["speed_per_frame"]
     schedule: list[dict] = [{"action": "idle", "mouse_dx": 0.0, "mouse_dy": 0.0} for _ in range(num_frames)]
 
@@ -259,7 +253,7 @@ def build_trajectory(
             )
             previous_height = float(height)
 
-    debug = []
+    pose_commands = []
     for frame in range(num_frames):
         command = schedule[frame]
         translation = np.zeros(3, dtype=np.float32)
@@ -268,19 +262,23 @@ def build_trajectory(
         translation[1] += float(command.get("jump_delta", 0.0))
         yaw_delta = float(command["mouse_dx"]) * float(controller["yaw_radians_per_mouse_dx"])
         pitch_delta = float(command["mouse_dy"]) * float(controller["pitch_radians_per_mouse_dy"])
-        delta = np.eye(4, dtype=np.float32)
-        delta[:3, :3] = rotation_y(yaw_delta) @ rotation_x(pitch_delta)
-        delta[:3, 3] = translation
-        if frame > 0:
-            pose = (pose @ delta).astype(np.float32)
-        poses[frame] = pose
+        pose_commands.append(
+            {
+                "translation": translation,
+                "yaw_delta": yaw_delta,
+                "pitch_delta": pitch_delta,
+            }
+        )
+    poses = integrate_local_camera_deltas(pose_commands)
+    debug = []
+    for frame, command in enumerate(schedule):
         debug.append(
             {
                 "frame": frame,
                 "action": command["action"],
                 "mouse_dx": command["mouse_dx"],
                 "mouse_dy": command["mouse_dy"],
-                "position": [float(value) for value in pose[:3, 3]],
+                "position": [float(value) for value in poses[frame, :3, 3]],
             }
         )
     return poses, debug
@@ -317,10 +315,10 @@ def main() -> None:
             controller,
             num_frames=int(args.num_frames),
             minimum_translation=float(args.minimum_translation),
-        event_frame=int(args.event_frame),
-        include_jump=bool(args.include_jump),
-        include_motion=bool(args.include_motion),
-        include_view_rotation=bool(args.include_view_rotation),
+            event_frame=int(args.event_frame),
+            include_jump=bool(args.include_jump),
+            include_motion=bool(args.include_motion),
+            include_view_rotation=bool(args.include_view_rotation),
         )
     np.savez(
         output_dir / "camera_poses.npz",

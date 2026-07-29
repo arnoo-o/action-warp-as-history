@@ -405,15 +405,19 @@ The training script writes `train_config.json`, `train_loss.json`,
 
 ### Minecraft VPT at 16 FPS
 
-Minecraft training uses every 16-fps RGB target frame while caching Pi3X
-geometry sparsely. VPT telemetry supplies camera translation and rotation;
-Pi3X supplies depth/geometry only. The profile also requires the Minecraft HUD
-mask, so HUD pixels do not contribute to flow matching, interaction masks,
-history tokens, or Pi3X point geometry.
+Minecraft training uses every 16-fps RGB target frame. VPT telemetry supplies
+future camera poses; Pi3X geometry receives only the first frame for the first
+chunk and only already-observed history for later chunks. Target RGB never
+enters warp geometry. The HUD mask also removes HUD pixels from flow matching,
+interaction masks, history tokens, and Pi3X point geometry.
+
+The camera profile trains only WAH camera control:
 
 ```bash
 python scripts/train_warp_as_history_lora.py \
-  --prompt_csv data/vpt_9x_100/wah_mc_training/mc_training_16fps.csv \
+  --prompt_csv data/vpt_9x_100/wah_mc_training/mc_training_samples.csv \
+  --data_root data/vpt_9x_100 \
+  --output_dir runs/minecraft_camera \
   --minecraft_training_profile \
   --online_target_fps 16 \
   --online_frame_stride 1 \
@@ -421,15 +425,43 @@ python scripts/train_warp_as_history_lora.py \
   --online_geometry_keyframe_stride 8 \
   --use_minecraft_hud_mask \
   --online_first_chunk_prob 0.5 \
-  --online_max_video_frames 256 \
+  --training_profile camera \
+  --interaction_conditioning_mode off \
+  --base_train_steps 1500
+```
+
+The interaction profile initializes from the camera checkpoint, uses exact
+step quotas (`place=0.5`, `mine=0.3`, `other=0.2`), and keeps place/mine events
+at local frames 6 through 16:
+
+```bash
+python scripts/train_warp_as_history_lora.py \
+  --prompt_csv data/vpt_9x_100/wah_mc_training/mc_training_samples.csv \
+  --data_root data/vpt_9x_100 \
+  --output_dir runs/minecraft_interaction \
+  --minecraft_training_profile \
+  --online_target_fps 16 \
+  --online_frame_stride 1 \
+  --online_use_vpt_camera_poses \
+  --online_geometry_keyframe_stride 8 \
+  --use_minecraft_hud_mask \
+  --training_profile interaction \
+  --camera_checkpoint runs/minecraft_camera/visible_lora_state.pt \
   --interaction_conditioning_mode router \
+  --place_step_ratio 0.5 \
+  --mine_step_ratio 0.3 \
+  --other_step_ratio 0.2 \
+  --interaction_event_local_min 6 \
+  --interaction_event_local_max 16 \
   --base_train_steps 1500
 ```
 
 For inference, use `--fps 16 --minecraft_16fps_multichunk` and provide more
 than 33 camera poses. The pipeline generates successive 33-frame chunks and
 concatenates them; interaction events are active only in the chunk containing
-their global `event_frame`.
+their global `event_frame`. The checkpoint recipe is checked against inference
+settings, and Router inference fails rather than using random interaction
+weights when the interaction state is missing.
 
 ## GPU memory
 

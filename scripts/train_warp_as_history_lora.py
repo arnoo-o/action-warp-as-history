@@ -68,6 +68,7 @@ import torch
 from tqdm import tqdm
 
 from warp_as_history.training import core as opt
+from warp_as_history.minecraft_recipe import minecraft_wah_recipe
 from warp_as_history.training.data import (
     LazyPreparedItems,
     build_online_warp_training_cache,
@@ -78,6 +79,7 @@ from warp_as_history.training.utils import (
     release_cuda_cache,
     save_lora,
     scalar,
+    StepCategorySampler,
     write_json,
     next_index_generator,
 )
@@ -107,6 +109,76 @@ def should_compute_bidirectional_feedback(
         return False
     stage_step = int(step) - int(base_train_steps)
     return stage_step % max(int(bidirectional_interval), 1) == 0
+
+
+def build_minecraft_step_sampler(df, args):
+    """Create quota-exact pools before expensive Pi3X/latent preparation."""
+    source_pools = {"place": [], "mine": [], "movement": [], "negative": [], "other": []}
+    for position, (_, row) in enumerate(df.iterrows()):
+        category = str(row.get("training_category", row.get("category", "movement"))).strip().lower()
+        source_pools[category if category in source_pools else "other"].append(int(position))
+    pools = {
+        "place": source_pools["place"],
+        "mine": source_pools["mine"],
+        "other": [
+            *source_pools["negative"],
+            *source_pools["movement"],
+            *source_pools["other"],
+        ],
+    }
+    profile = str(args.training_profile)
+    if profile == "camera":
+        pools = {"other": list(source_pools["movement"])}
+        ratios = {"other": 1.0}
+    else:
+        ratios = {
+            "place": float(args.place_step_ratio),
+            "mine": float(args.mine_step_ratio),
+            "other": float(args.other_step_ratio),
+        }
+    empty_requested = [name for name, ratio in ratios.items() if ratio > 0 and not pools.get(name)]
+    if empty_requested:
+        print(json.dumps({"event": "minecraft_sampler_pool_empty", "pools": empty_requested, "action": "renormalized"}), flush=True)
+    sampler = StepCategorySampler(pools, ratios, args.max_steps, args.seed)
+    return sampler, {
+        "pool_sizes": {name: len(values) for name, values in source_pools.items()},
+        "effective_pool_sizes": {name: len(values) for name, values in pools.items()},
+        **sampler.report(0),
+    }
+
+
+def distribution_counts_from_losses(losses):
+    counts = {
+        "place": 0,
+        "mine": 0,
+        "other": 0,
+        "valid_place": 0,
+        "valid_mine": 0,
+        "movement": 0,
+        "first": 0,
+        "later": 0,
+        "invalid_event_retries": 0,
+        "pose_vpt": 0,
+        "pose_pi3x": 0,
+    }
+    for record in losses:
+        sampled = str(record.get("sampled_category", ""))
+        if sampled in {"place", "mine", "other"}:
+            counts[sampled] += 1
+        category = str(record.get("training_category", ""))
+        if category == "movement":
+            counts["movement"] += 1
+        if category in {"place", "mine"} and bool(record.get("event_valid", False)):
+            counts[f"valid_{category}"] += 1
+        chunk_mode = str(record.get("chunk_mode", ""))
+        counts["first" if chunk_mode == "first" else "later"] += 1
+        pose_source = str(record.get("pose_source", ""))
+        if pose_source == "vpt_telemetry":
+            counts["pose_vpt"] += 1
+        elif pose_source == "pi3x":
+            counts["pose_pi3x"] += 1
+        counts["invalid_event_retries"] += int(record.get("invalid_event_retries", 0) or 0)
+    return counts
 
 
 def interaction_teacher_cache_key(item):
@@ -198,6 +270,7 @@ def save_training_state(
     args,
     refined_teacher_cache,
     losses,
+    distribution_counts=None,
 ):
     trainable_state = {
         name: parameter.detach().cpu()
@@ -206,7 +279,7 @@ def save_training_state(
     }
     completed_step = max(int(global_step) - 1, 0)
     payload = {
-        "training_state_version": 1,
+        "training_state_version": 2,
         "trainable_state": trainable_state,
         "optimizer": optimizer.state_dict(),
         "global_step": int(global_step),
@@ -220,6 +293,8 @@ def save_training_state(
         "base_completed_steps": min(int(global_step), int(args.base_train_steps)),
         "bidirectional_completed_steps": max(int(global_step) - int(args.base_train_steps), 0),
         "enable_bidirectional_training": bool(args.enable_bidirectional_training),
+        "training_profile": str(args.training_profile),
+        "distribution_counts": dict(distribution_counts or {}),
         "refined_teacher_cache": {
             key: value.detach().cpu() for key, value in refined_teacher_cache.items()
         },
@@ -336,7 +411,12 @@ def parse_args():
     parser.add_argument("--data_root", default="data/training")
     parser.add_argument("--prompt_csv", default="data/training/training_data.csv")
     parser.add_argument("--output_dir", default="runs/warp_as_history_lora")
-    parser.add_argument("--limit", type=int, default=4)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional manifest row limit for debugging. By default all rows are eligible for step-level sampling.",
+    )
     parser.add_argument("--max_steps", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--base_train_steps", type=int, default=1500)
     parser.add_argument("--bidirectional_train_steps", type=int, default=1500)
@@ -349,7 +429,19 @@ def parse_args():
     parser.add_argument("--bidirectional_feedback_weight", type=float, default=0.5)
     parser.add_argument("--bidirectional_teacher_floor", type=float, default=0.5)
     parser.add_argument("--resume_from_checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--camera_checkpoint",
+        type=Path,
+        default=None,
+        help="Initialize camera/WAH LoRA weights for interaction-profile training.",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--wah_lora_lr", type=float, default=None)
+    parser.add_argument("--interaction_lr", type=float, default=None)
+    parser.add_argument("--training_profile", choices=["camera", "interaction", "joint"], default="joint")
+    parser.add_argument("--place_step_ratio", type=float, default=0.5)
+    parser.add_argument("--mine_step_ratio", type=float, default=0.3)
+    parser.add_argument("--other_step_ratio", type=float, default=0.2)
     parser.add_argument("--lr_schedule", choices=["constant", "cosine", "linear"], default="constant")
     parser.add_argument("--lr_schedule_final_ratio", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=20)
@@ -383,7 +475,7 @@ def parse_args():
     parser.add_argument("--visible_token_drop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--visible_token_mode", choices=["drop", "none"], default="drop")
     parser.add_argument("--visible_token_threshold", type=float, default=0.1)
-    parser.add_argument("--direction_augmentation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--direction_augmentation", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--direction_reverse_probability", type=float, default=0.5)
     parser.add_argument("--online_video_column", default="")
     parser.add_argument("--online_prompt_column", default="")
@@ -413,6 +505,7 @@ def parse_args():
     parser.add_argument("--interaction_router_spatial_loss_scale", type=float, default=1.0)
     parser.add_argument("--interaction_router_negative_loss_scale", type=float, default=0.25)
     parser.add_argument("--interaction_router_sparsity_loss_scale", type=float, default=0.01)
+    parser.add_argument("--interaction_debug_every", type=int, default=100)
     parser.add_argument("--use_minecraft_hud_mask", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--online_frame_stride", type=int, default=1)
     parser.add_argument(
@@ -445,6 +538,8 @@ def parse_args():
     parser.add_argument("--online_warp_memory_cache_size", type=int, default=2)
     parser.add_argument("--online_warp_disk_cache_dir", default="auto")
     parser.add_argument("--online_first_chunk_prob", type=float, default=0.5)
+    parser.add_argument("--interaction_event_local_min", type=int, default=6)
+    parser.add_argument("--interaction_event_local_max", type=int, default=16)
     parser.add_argument("--online_max_history_frames", type=int, default=19)
     parser.add_argument("--online_future_keyframe_prob", type=float, default=0.0)
     parser.add_argument("--online_future_keyframes_min", type=int, default=0)
@@ -524,6 +619,8 @@ def build_exact_args(args):
     exact.online_primary_fire_background_loss_scale = float(args.primary_fire_background_loss_scale)
     exact.use_primary_fire_focus_loss = bool(args.use_primary_fire_focus_loss)
     exact.interaction_conditioning_mode = str(args.interaction_conditioning_mode)
+    if str(args.training_profile) == "camera":
+        exact.interaction_conditioning_mode = "off"
     exact.use_primary_fire_event_condition = bool(
         args.use_primary_fire_event_condition and args.interaction_conditioning_mode == "binary"
     )
@@ -551,6 +648,7 @@ def build_exact_args(args):
     exact.online_target_fps = float(args.online_target_fps)
     exact.online_use_vpt_camera_poses = bool(args.online_use_vpt_camera_poses)
     exact.online_vpt_translation_scale = float(args.online_vpt_translation_scale)
+    exact.camera_multiply_translation_by_depth = True
     exact.online_geometry_keyframe_stride = max(1, int(args.online_geometry_keyframe_stride))
     exact.minecraft_training_profile = bool(args.minecraft_training_profile)
     exact.online_primary_fire_window_probability = float(args.online_primary_fire_window_probability)
@@ -558,6 +656,10 @@ def build_exact_args(args):
     exact.online_warp_memory_cache_size = int(args.online_warp_memory_cache_size)
     exact.online_warp_disk_cache_dir = str(args.online_warp_disk_cache_dir)
     exact.online_first_chunk_prob = float(args.online_first_chunk_prob)
+    exact.interaction_event_local_min = int(args.interaction_event_local_min)
+    exact.interaction_event_local_max = int(args.interaction_event_local_max)
+    exact.training_profile = str(args.training_profile)
+    exact.pose_convention = "opencv_c2w_relative"
     exact.online_max_history_frames = int(args.online_max_history_frames)
     exact.online_future_keyframe_prob = float(args.online_future_keyframe_prob)
     exact.online_future_keyframes_min = int(args.online_future_keyframes_min)
@@ -607,6 +709,12 @@ def build_exact_args(args):
 
 def main():
     args = parse_args()
+    if str(args.training_profile) == "camera":
+        args.interaction_conditioning_mode = "off"
+    if str(args.training_profile) == "interaction" and args.camera_checkpoint is None:
+        raise ValueError("--training_profile interaction requires --camera_checkpoint.")
+    if args.camera_checkpoint is not None and args.resume_from_checkpoint is not None:
+        raise ValueError("--camera_checkpoint initializes a new stage and cannot be combined with --resume_from_checkpoint.")
     if args.max_steps is not None:
         args.base_train_steps = int(args.max_steps)
     if int(args.base_train_steps) < 0 or int(args.bidirectional_train_steps) < 0:
@@ -636,11 +744,14 @@ def main():
     opt.seed_global_rng(args.seed)
     device = torch.device("cuda")
 
-    df = pd.read_csv(args.prompt_csv).head(args.limit)
+    df = pd.read_csv(args.prompt_csv)
+    if args.limit is not None and int(args.limit) > 0:
+        df = df.head(int(args.limit))
     df, training_meta = normalize_online_training_dataframe(df, exact_args)
     if df.empty:
         raise ValueError(f"No training rows loaded from {args.prompt_csv}")
     exact_args.online_warp_cache = build_online_warp_training_cache(df, exact_args, device)
+    step_sampler, sampler_meta = build_minecraft_step_sampler(df, args)
     skipped_rows = []
     print(
         json.dumps(
@@ -654,6 +765,20 @@ def main():
     )
 
     pipe = opt.load_pipeline(exact_args, device)
+    pipe.transformer._wah_recipe = minecraft_wah_recipe(
+        target_fps=args.online_target_fps,
+        num_frames=args.num_frames,
+        warp_history_downsample_mode=args.warp_history_downsample_mode,
+        camera_warp_render_mode=args.online_render_mode,
+        camera_control_translation_scale=args.online_vpt_translation_scale,
+        camera_multiply_translation_by_depth=True,
+        camera_mesh_samples_per_axis=args.online_mesh_samples_per_axis,
+        camera_keyframe_max_previous=args.online_max_history_frames,
+        visible_token_threshold=args.visible_token_threshold,
+        amplify_first_chunk=False,
+        history_sizes=args.history_sizes,
+        pose_convention="opencv_c2w_relative",
+    )
     mean, std = opt.latent_stats(pipe, device)
 
     config = {
@@ -666,9 +791,11 @@ def main():
         "rows": df.to_dict(orient="records"),
         "skipped_rows": skipped_rows,
         "training_data": training_meta,
+        "step_sampler": sampler_meta,
         "prompt_cache_dir": str(args.prompt_cache_dir) if args.prompt_cache_dir else "",
         "tensorboard_log_dir": str(tb_log_dir) if tb_log_dir else "",
         "loss": "flow_matching_train_exact",
+        "wah_recipe": dict(pipe.transformer._wah_recipe),
     }
     write_json(out_dir / "train_config.json", config)
     if tb_writer is not None:
@@ -698,6 +825,24 @@ def main():
 
     opt.seed_global_rng(args.seed)
     adapter_name, lora_params, lora_stats = opt.setup_visible_lora(pipe.transformer, exact_args, "shared")
+    if args.camera_checkpoint is not None:
+        camera_load = opt.load_visible_lora_state(
+            pipe.transformer,
+            args.camera_checkpoint,
+            adapter_name,
+            load_interaction=False,
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "camera_checkpoint_loaded",
+                    "checkpoint": str(args.camera_checkpoint),
+                    **camera_load,
+                },
+                default=str,
+            ),
+            flush=True,
+        )
     opt.assert_lora_only_trainable(
         pipe.transformer,
         lora_params,
@@ -706,8 +851,28 @@ def main():
     )
     print(json.dumps(lora_stats), flush=True)
 
-    trainable_params = list(lora_params)
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
+    named_params = {id(param): name for name, param in pipe.transformer.named_parameters()}
+    default_wah_lr = float(args.lr) * (0.1 if str(args.training_profile) == "interaction" else 1.0)
+    wah_lora_lr = float(args.wah_lora_lr if args.wah_lora_lr is not None else default_wah_lr)
+    interaction_lr = float(args.interaction_lr if args.interaction_lr is not None else args.lr)
+    profile = str(args.training_profile)
+    wah_params = []
+    interaction_params = []
+    for param in lora_params:
+        name = named_params.get(id(param), "")
+        is_interaction = name.startswith("interaction_conditioning.")
+        param.requires_grad_(True)
+        if param.requires_grad:
+            (interaction_params if is_interaction else wah_params).append(param)
+    if profile == "interaction" and not interaction_params:
+        raise ValueError("interaction profile requires Router/Adapter trainable parameters.")
+    trainable_params = [*wah_params, *interaction_params]
+    groups = []
+    if wah_params:
+        groups.append({"params": wah_params, "lr": wah_lora_lr, "base_lr": wah_lora_lr, "name": "wah_lora"})
+    if interaction_params:
+        groups.append({"params": interaction_params, "lr": interaction_lr, "base_lr": interaction_lr, "name": "interaction"})
+    optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
 
     losses = []
     refined_teacher_cache = {}
@@ -752,12 +917,37 @@ def main():
     if start_step > int(args.max_steps):
         raise ValueError(f"Checkpoint step {start_step} exceeds configured total steps {args.max_steps}.")
     start_time = time.perf_counter()
-    index_iter = next_index_generator(len(items), args.max_steps, args.shuffle, args.seed)
-    for _ in range(start_step):
-        next(index_iter)
+    distribution_counts = distribution_counts_from_losses(losses)
     for step in tqdm(range(start_step, args.max_steps), desc="train shared lora"):
-        item_idx = next(index_iter)
-        item = items.get(item_idx)
+        sampled_class, item_idx = step_sampler.sample(step)
+        item = None
+        step_invalid_event_retries = 0
+        for retry in range(8):
+            try:
+                item = items.get(item_idx, requested_category=None if sampled_class == "other" else sampled_class)
+                break
+            except (RuntimeError, ValueError) as exc:
+                if sampled_class not in {"place", "mine"} or retry == 7:
+                    raise
+                distribution_counts["invalid_event_retries"] += 1
+                step_invalid_event_retries += 1
+                item_idx = step_sampler.sample_category(sampled_class, step + retry + 1)
+                print(json.dumps({"event": "invalid_interaction_retry", "step": step, "category": sampled_class, "reason": str(exc)}), flush=True)
+        if item is None:
+            raise RuntimeError("Failed to prepare a sampled training item.")
+        category = str(item.get("training_category", item.get("training", {}).get("training_category", "other")))
+        distribution_counts[sampled_class] += 1
+        if category == "movement":
+            distribution_counts["movement"] += 1
+        if category in {"place", "mine"} and float((item.get("interaction_payload") or {}).get("event_valid", 0.0)) == 1.0:
+            distribution_counts[f"valid_{category}"] += 1
+        chunk_mode = str(item.get("training", {}).get("chunk_mode", ""))
+        distribution_counts["first" if chunk_mode == "first" else "later"] += 1
+        pose_source = str(item.get("training", {}).get("pose_source", ""))
+        if pose_source == "vpt_telemetry":
+            distribution_counts["pose_vpt"] += 1
+        elif pose_source == "pi3x":
+            distribution_counts["pose_pi3x"] += 1
         current_lr = current_train_lr(step, args.max_steps, args, exact_args)
         training_stage = training_stage_for_step(
             step,
@@ -785,7 +975,9 @@ def main():
         else:
             router_teacher_map = initial_teacher_map
 
-        opt.set_optimizer_lr(optimizer, current_lr)
+        lr_scale = current_lr / max(float(args.lr), 1.0e-12)
+        for group in optimizer.param_groups:
+            group["lr"] = float(group["base_lr"]) * lr_scale
         optimizer.zero_grad(set_to_none=True)
         loss, stats, interaction_feedback = opt.flow_matching_loss(
             pipe,
@@ -816,13 +1008,18 @@ def main():
             if cached_refined_teacher is not None and training_stage == "bidirectional"
             else None
         )
-        if step % max(int(args.log_every), 1) == 0:
+        if (
+            item.get("interaction_debug_inputs") is not None
+            and int(args.interaction_debug_every) > 0
+            and (step == 0 or (step + 1) % int(args.interaction_debug_every) == 0)
+        ):
             opt.save_interaction_debug(
-                Path(args.output_dir) / "interaction_debug",
+                Path(args.output_dir) / "interaction_debug" / f"step_{step + 1:06d}",
                 initial_teacher_map,
                 getattr(pipe.transformer, "_last_interaction_debug", None),
                 improvement_map=interaction_feedback.get("improvement_map"),
                 refined_teacher_map=active_refined_teacher,
+                input_debug=item.get("interaction_debug_inputs"),
             )
         loss.backward()
         grad_norm = None
@@ -849,6 +1046,15 @@ def main():
             "max_grad_norm": float(args.max_grad_norm),
             "grad_norm": scalar(grad_norm) if grad_norm is not None else None,
             "elapsed_s": time.perf_counter() - start_time,
+            "sampled_category": sampled_class,
+            "training_category": category,
+            "event_local_frame": item.get("training", {}).get("event_local_frame"),
+            "event_valid": float((item.get("interaction_payload") or {}).get("event_valid", 0.0)),
+            "chunk_mode": chunk_mode,
+            "pose_source": pose_source,
+            "invalid_event_retries": step_invalid_event_retries,
+            "wah_lora_lr": next((group["lr"] for group in optimizer.param_groups if group["name"] == "wah_lora"), 0.0),
+            "interaction_lr": next((group["lr"] for group in optimizer.param_groups if group["name"] == "interaction"), 0.0),
         }
         for key, value in stats.items():
             record[key] = scalar(value)
@@ -858,6 +1064,24 @@ def main():
         do_log = args.log_every > 0 and ((step + 1) % args.log_every == 0 or step == 0)
         do_save = args.save_every > 0 and (step + 1) % args.save_every == 0
         if do_log:
+            if (step + 1) % 100 == 0:
+                print(
+                    json.dumps(
+                        {
+                            "event": "minecraft_sampling_progress",
+                            "step": step + 1,
+                            **step_sampler.report(step + 1),
+                            "valid_positive_rate": {
+                                "place": distribution_counts["valid_place"]
+                                / max(distribution_counts["place"], 1),
+                                "mine": distribution_counts["valid_mine"]
+                                / max(distribution_counts["mine"], 1),
+                            },
+                            "counters": distribution_counts,
+                        }
+                    ),
+                    flush=True,
+                )
             print(json.dumps(record), flush=True)
             write_json(loss_path, losses)
             if tb_writer is not None:
@@ -872,6 +1096,7 @@ def main():
                 args=args,
                 refined_teacher_cache=refined_teacher_cache,
                 losses=losses,
+                distribution_counts=distribution_counts,
             )
 
         del loss, stats, item, interaction_feedback
@@ -888,8 +1113,18 @@ def main():
         args=args,
         refined_teacher_cache=refined_teacher_cache,
         losses=losses,
+        distribution_counts=distribution_counts,
     )
     write_json(loss_path, losses)
+    distribution_report = {
+        "requested": step_sampler.report(args.max_steps),
+        "counters": distribution_counts,
+        "valid_positive_rate": {
+            "place": distribution_counts["valid_place"] / max(distribution_counts["place"], 1),
+            "mine": distribution_counts["valid_mine"] / max(distribution_counts["mine"], 1),
+        },
+    }
+    write_json(out_dir / "training_distribution_report.json", distribution_report)
     if tb_writer is not None:
         tb_writer.add_text("summary/prompt_cache_status", _json_text(items.prompt_cache_status_counts), args.max_steps)
         tb_writer.flush()

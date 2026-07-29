@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from peft import LoraConfig
-from peft.utils import get_peft_model_state_dict
+from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
 from warp_as_history.training.loss_masks import valid_element_normalized_loss
 
 from diffusers import AutoencoderKLWan
@@ -1100,6 +1100,9 @@ def visible_aux_state_dict(transformer):
             "stage_warp_scales": interaction_conditioning.stage_warp_scales.detach().cpu().tolist(),
             "stage_adapter_scales": interaction_conditioning.stage_adapter_scales.detach().cpu().tolist(),
         }
+    recipe = getattr(transformer, "_wah_recipe", None)
+    if isinstance(recipe, dict):
+        state["wah_recipe"] = dict(recipe)
     return state
 
 
@@ -1313,11 +1316,19 @@ def save_interaction_debug(
     *,
     improvement_map=None,
     refined_teacher_map=None,
+    input_debug=None,
 ):
     if teacher_map is None or not debug_items:
         return
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_frame_strip(name, frames):
+        if not frames:
+            return
+        arrays = [np.asarray(frame.convert("RGB"), dtype=np.uint8) for frame in frames]
+        Image.fromarray(np.concatenate(arrays, axis=1), mode="RGB").save(output_dir / name)
+
     def save_map(name, value):
         image = value[0, 0].amax(dim=0).numpy()
         scale = max(float(image.max()), 1e-8)
@@ -1354,6 +1365,22 @@ def save_interaction_debug(
     np.save(output_dir / "residual_teacher_map.npy", teacher.numpy())
     np.save(output_dir / "predicted_gate.npy", predicted.numpy())
     np.save(output_dir / "interaction_injection_map.npy", injection.numpy())
+    if input_debug:
+        save_frame_strip("target.png", input_debug.get("target_frames"))
+        save_frame_strip("warp.png", input_debug.get("warp_frames"))
+        save_frame_strip("visibility.png", input_debug.get("visibility_frames"))
+        raw_residual = input_debug.get("raw_residual")
+        if torch.is_tensor(raw_residual):
+            raw_residual = raw_residual.detach().float().cpu()
+            save_map("raw_residual.png", raw_residual)
+            np.save(output_dir / "raw_residual.npy", raw_residual.numpy())
+        clean_teacher = input_debug.get("clean_teacher_mask")
+        if torch.is_tensor(clean_teacher):
+            clean_teacher = clean_teacher.detach().float().cpu()
+            save_map("clean_teacher_mask.png", clean_teacher)
+            np.save(output_dir / "clean_teacher_mask.npy", clean_teacher.numpy())
+        with (output_dir / "debug_frames.json").open("w", encoding="utf-8") as handle:
+            json.dump({"frame_indices": list(input_debug.get("frame_indices", []))}, handle, indent=2)
     if improvement_map is not None:
         improvement = F.interpolate(
             improvement_map.detach().float().cpu(),
@@ -1686,6 +1713,11 @@ def flow_matching_loss_train_exact(
             teacher = teacher_pyramid[stage_id].float()
             teacher = F.interpolate(teacher, size=predicted_gate.shape[2:], mode="trilinear", align_corners=False)
             teacher = teacher.clamp(0.0, 1.0)
+            teacher_support = (teacher > 0.05).to(predicted_gate)
+            teacher_area = teacher_support.mean()
+            support_elements = teacher_support.sum().clamp_min(1.0)
+            outside_support = 1.0 - teacher_support
+            outside_elements = outside_support.sum().clamp_min(1.0)
             temporal_teacher = teacher.mean(dim=(-1, -2))
             temporal_pred = predicted_gate.mean(dim=(-1, -2))
             temporal_losses.append(F.mse_loss(temporal_pred, temporal_teacher) * event_valid)
@@ -1706,6 +1738,17 @@ def flow_matching_loss_train_exact(
             previous_predicted_gate = predicted_gate
             stats[f"interaction_gate_mean_stage{stage_id}"] = predicted_gate.detach().mean()
             stats[f"interaction_teacher_mean_stage{stage_id}"] = teacher.detach().mean()
+            stats[f"teacher_mask_area_ratio_stage{stage_id}"] = teacher_area.detach()
+            stats[f"gate_inside_teacher_stage{stage_id}"] = (
+                (predicted_gate * teacher_support).sum() / support_elements
+            ).detach()
+            stats[f"gate_outside_teacher_stage{stage_id}"] = (
+                (predicted_gate * outside_support).sum() / outside_elements
+            ).detach()
+            if float(teacher_area.detach().cpu()) == 0.0:
+                stats[f"interaction_teacher_warning_stage{stage_id}"] = "empty_teacher_mask"
+            elif float(teacher_area.detach().cpu()) > 0.5:
+                stats[f"interaction_teacher_warning_stage{stage_id}"] = "teacher_mask_exceeds_50_percent"
         if temporal_losses:
             temporal_loss = torch.stack(temporal_losses).mean()
             spatial_loss = torch.stack(spatial_losses).mean()
@@ -1731,6 +1774,8 @@ def flow_matching_loss_train_exact(
             stats["interaction_sparsity_loss"] = sparsity_loss.detach()
             stats["interaction_cross_stage_consistency_loss"] = consistency_loss.detach()
             stats["interaction_aux_loss"] = interaction_aux_loss.detach()
+    if interaction_aux_loss is None:
+        stats["interaction_aux_loss"] = torch.zeros((), device=total_loss.device)
     stats["flow_mse"] = total_loss.detach()
     stats["flow_mse_mean_stage"] = torch.stack([loss.detach() for loss in stage_losses]).mean()
     return total_loss, stats, {
@@ -1896,6 +1941,37 @@ def save_visible_lora_state(transformer, out_dir, adapter_name, filename="visibl
         "extra_state": visible_aux_state_dict(transformer),
     }
     torch.save(payload, Path(out_dir) / filename)
+
+
+def load_visible_lora_state(transformer, checkpoint, adapter_name, *, load_interaction=False):
+    """Initialize a new training profile from a saved visible LoRA checkpoint."""
+    payload = torch.load(Path(checkpoint), map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unsupported visible LoRA checkpoint: {checkpoint}")
+    peft_state = payload.get("peft")
+    if not isinstance(peft_state, dict) or not peft_state:
+        raise ValueError(f"Checkpoint has no PEFT LoRA state: {checkpoint}")
+    incompatible = set_peft_model_state_dict(
+        transformer,
+        peft_state,
+        adapter_name=adapter_name,
+    )
+    missing = list(getattr(incompatible, "missing_keys", []) or [])
+    unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
+    if unexpected:
+        raise ValueError(f"Camera checkpoint has unexpected PEFT keys: {unexpected[:20]}")
+    extra_state = payload.get("extra_state", {})
+    if bool(load_interaction):
+        interaction_state = extra_state.get("interaction_conditioning")
+        if not isinstance(interaction_state, dict):
+            raise ValueError("Requested interaction restore but checkpoint has no interaction extra_state.")
+        transformer.interaction_conditioning.load_state_dict(interaction_state, strict=True)
+    return {
+        "missing_keys": missing,
+        "unexpected_keys": unexpected,
+        "wah_recipe": extra_state.get("wah_recipe"),
+        "interaction_loaded": bool(load_interaction),
+    }
 
 def schedule_multiplier(step, total_steps, schedule, final_ratio):
     if total_steps <= 1 or schedule == "constant":

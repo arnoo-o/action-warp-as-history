@@ -23,7 +23,7 @@ if TAEHV_ROOT.is_dir() and str(TAEHV_ROOT) not in sys.path:
 
 DEFAULT_MODEL = "checkpoints/helios-distilled"
 DEFAULT_WAH_LORA = "checkpoints/warp-as-history/visible_lora_state_step1000.safetensors"
-DEFAULT_CAMERA_WARP_RENDER_MODE = "splat"
+DEFAULT_CAMERA_WARP_RENDER_MODE = "target_fill"
 DEFAULT_CAMERA_PI3_PIXEL_LIMIT = 255000
 DEFAULT_CAMERA_MESH_SAMPLES_PER_AXIS = 4
 REALTIME_CAMERA_WARP_RENDER_MODE = "target_fill"
@@ -83,11 +83,10 @@ def parse_args() -> argparse.Namespace:
         help="Override Helios pyramid inference steps, for example: 1 1 1.",
     )
     parser.add_argument(
-        "--no_amplify_first_chunk",
-        action="store_false",
-        dest="amplify_first_chunk",
-        default=True,
-        help="Disable first-chunk amplification for faster inference.",
+        "--amplify_first_chunk",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Minecraft WAH recipe defaults to no first-chunk amplification.",
     )
     parser.add_argument(
         "--warp_history_downsample_mode",
@@ -128,6 +127,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override camera warp mesh samples per depth quad. Defaults to 4, or 2 in realtime fast mode.",
     )
+    parser.add_argument("--camera_control_translation_scale", type=float, default=0.1)
+    parser.add_argument(
+        "--camera_multiply_translation_by_depth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--camera_keyframe_max_previous", type=int, default=19)
+    parser.add_argument("--visible_token_threshold", type=float, default=0.1)
     parser.add_argument(
         "--warp_debug_dir",
         type=Path,
@@ -604,6 +611,13 @@ def main() -> None:
         "camera_control_warp_render_mode": camera_warp_render_mode,
         "camera_control_pi3_pixel_limit": max(int(camera_pi3_pixel_limit), 1),
         "camera_control_mesh_samples_per_axis": max(int(camera_mesh_samples_per_axis), 1),
+        "camera_control_translation_scale": float(args.camera_control_translation_scale),
+        "camera_control_translation_scale_use_first_frame_depth": bool(
+            args.camera_multiply_translation_by_depth
+        ),
+        "camera_keyframe_max_previous": max(int(args.camera_keyframe_max_previous), 0),
+        "visible_token_threshold": float(args.visible_token_threshold),
+        "target_fps": float(fps),
         "warp_debug_dir": args.warp_debug_dir,
         "warp_debug_fps": fps,
         "use_primary_fire_event_condition": bool(

@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 
 from warp_as_history.training import core as opt
+from warp_as_history.minecraft_sampling import StepCategorySampler
 
 
 def detach_tree(value):
