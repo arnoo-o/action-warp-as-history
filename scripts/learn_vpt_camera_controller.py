@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event-frame", type=int, default=100)
     parser.add_argument("--minimum-translation", type=float, default=3.0)
     parser.add_argument("--block-id", default="oak_planks")
+    parser.add_argument("--include-jump", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -199,6 +200,7 @@ def build_trajectory(
     num_frames: int,
     minimum_translation: float,
     event_frame: int,
+    include_jump: bool = True,
 ) -> tuple[np.ndarray, list[dict]]:
     poses = np.repeat(np.eye(4, dtype=np.float32)[None], int(num_frames), axis=0)
     pose = np.eye(4, dtype=np.float32)
@@ -233,21 +235,22 @@ def build_trajectory(
     for frame in range(yaw_start + 22, min(yaw_start + 28, num_frames)):
         schedule[frame]["mouse_dy"] = mouse_dy
 
-    jump_profile = np.asarray(controller["jump_profile"], dtype=np.float32)
-    jump_start = min(max(yaw_start, 72), max(num_frames - len(jump_profile) - 1, 1))
-    previous_height = 0.0
-    for offset, height in enumerate(jump_profile):
-        frame = jump_start + offset
-        if frame >= num_frames:
-            break
-        schedule[frame]["jump_delta"] = float(height - previous_height)
-        schedule[frame]["jump_height"] = float(height)
-        schedule[frame]["action"] = (
-            f"{schedule[frame]['action']}+jump"
-            if schedule[frame]["action"] != "idle"
-            else "jump"
-        )
-        previous_height = float(height)
+    if include_jump:
+        jump_profile = np.asarray(controller["jump_profile"], dtype=np.float32)
+        jump_start = min(max(yaw_start, 72), max(num_frames - len(jump_profile) - 1, 1))
+        previous_height = 0.0
+        for offset, height in enumerate(jump_profile):
+            frame = jump_start + offset
+            if frame >= num_frames:
+                break
+            schedule[frame]["jump_delta"] = float(height - previous_height)
+            schedule[frame]["jump_height"] = float(height)
+            schedule[frame]["action"] = (
+                f"{schedule[frame]['action']}+jump"
+                if schedule[frame]["action"] != "idle"
+                else "jump"
+            )
+            previous_height = float(height)
 
     debug = []
     for frame in range(num_frames):
@@ -295,6 +298,7 @@ def main() -> None:
         num_frames=int(args.num_frames),
         minimum_translation=float(args.minimum_translation),
         event_frame=int(args.event_frame),
+        include_jump=bool(args.include_jump),
     )
     np.savez(
         output_dir / "camera_poses.npz",
@@ -341,6 +345,7 @@ def main() -> None:
         "requested_output_event_frame": int(args.event_frame),
         "conditioning_event_frame": conditioning_event_frame,
         "event_time_seconds": float(args.event_frame) / float(args.fps),
+        "include_jump": bool(args.include_jump),
         "controller": controller,
     }
     print(json.dumps(summary, indent=2))
