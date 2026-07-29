@@ -2087,7 +2087,7 @@ def load_initial_wah_lora(transformer, checkpoint, adapter_name, args):
         "source": "official_wah_lora",
         "path": str(path),
         "loaded_keys": len(mapped),
-        "missing_keys": load_missing,
+        "missing_keys": lora_load_missing,
         "unexpected_keys": load_unexpected,
         "rank": int(args.lora_rank),
         "alpha": int(args.lora_alpha),

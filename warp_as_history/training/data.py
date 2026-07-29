@@ -2309,7 +2309,6 @@ def prepare_online_warp_item(
                         height=int(exact_args.height),
                         width=int(exact_args.width),
                         num_frames=int(exact_args.num_frames),
-                        prompt_embeds=cached_prompt_embeds,
                         output_type="np",
                         generator=torch.Generator(device=device).manual_seed(
                             opt.stable_seed_from_parts(int(exact_args.seed), seq, "two_chunk_rollout")
