@@ -5,6 +5,7 @@ from pathlib import Path
 
 try:
     import torch
+    import torch.utils.checkpoint
 except ModuleNotFoundError:
     torch = None
 
