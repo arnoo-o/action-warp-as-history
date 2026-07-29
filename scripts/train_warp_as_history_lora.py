@@ -810,8 +810,12 @@ def main():
     )
     mean, std = opt.latent_stats(pipe, device)
 
+    serialized_train_args = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
     config = {
-        "train_args": vars(args),
+        "train_args": serialized_train_args,
         "exact_args": {
             key: value
             for key, value in vars(exact_args).items()
@@ -828,7 +832,7 @@ def main():
     }
     write_json(out_dir / "train_config.json", config)
     if tb_writer is not None:
-        tb_writer.add_text("config/train_args", _json_text(vars(args)), 0)
+        tb_writer.add_text("config/train_args", _json_text(serialized_train_args), 0)
         tb_writer.add_text("config/exact_args", _json_text(config["exact_args"]), 0)
         tb_writer.add_text("config/training_data", _json_text(training_meta), 0)
 
