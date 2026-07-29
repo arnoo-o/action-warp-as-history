@@ -30,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-translation", type=float, default=3.0)
     parser.add_argument("--block-id", default="oak_planks")
     parser.add_argument("--include-jump", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-motion", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-view-rotation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--stationary", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
@@ -202,6 +204,8 @@ def build_trajectory(
     minimum_translation: float,
     event_frame: int,
     include_jump: bool = True,
+    include_motion: bool = True,
+    include_view_rotation: bool = True,
 ) -> tuple[np.ndarray, list[dict]]:
     poses = np.repeat(np.eye(4, dtype=np.float32)[None], int(num_frames), axis=0)
     pose = np.eye(4, dtype=np.float32)
@@ -215,26 +219,28 @@ def build_trajectory(
         ("left", 0, -1.0),
         ("right", 0, 1.0),
     )
-    for action, axis, sign in direction_specs:
-        speed = max(float(speeds[action]), float(minimum_translation) / 20.0, 1e-4)
-        duration = max(2, int(math.ceil(float(minimum_translation) / speed)))
-        for frame in range(cursor, min(cursor + duration, num_frames)):
-            schedule[frame]["action"] = action
-            schedule[frame]["translation_axis"] = axis
-            schedule[frame]["translation_delta"] = sign * speed
-        cursor += duration
+    if include_motion:
+        for action, axis, sign in direction_specs:
+            speed = max(float(speeds[action]), float(minimum_translation) / 20.0, 1e-4)
+            duration = max(2, int(math.ceil(float(minimum_translation) / speed)))
+            for frame in range(cursor, min(cursor + duration, num_frames)):
+                schedule[frame]["action"] = action
+                schedule[frame]["translation_axis"] = axis
+                schedule[frame]["translation_delta"] = sign * speed
+            cursor += duration
 
     mouse_dx = float(controller["typical_mouse_dx"])
     mouse_dy = float(controller["typical_mouse_dy"])
     yaw_start = min(max(cursor, 64), max(int(event_frame) - 28, 1))
-    for frame in range(yaw_start, min(yaw_start + 8, num_frames)):
-        schedule[frame]["mouse_dx"] = mouse_dx
-    for frame in range(yaw_start + 8, min(yaw_start + 16, num_frames)):
-        schedule[frame]["mouse_dx"] = -mouse_dx
-    for frame in range(yaw_start + 16, min(yaw_start + 22, num_frames)):
-        schedule[frame]["mouse_dy"] = -mouse_dy
-    for frame in range(yaw_start + 22, min(yaw_start + 28, num_frames)):
-        schedule[frame]["mouse_dy"] = mouse_dy
+    if include_view_rotation:
+        for frame in range(yaw_start, min(yaw_start + 8, num_frames)):
+            schedule[frame]["mouse_dx"] = mouse_dx
+        for frame in range(yaw_start + 8, min(yaw_start + 16, num_frames)):
+            schedule[frame]["mouse_dx"] = -mouse_dx
+        for frame in range(yaw_start + 16, min(yaw_start + 22, num_frames)):
+            schedule[frame]["mouse_dy"] = -mouse_dy
+        for frame in range(yaw_start + 22, min(yaw_start + 28, num_frames)):
+            schedule[frame]["mouse_dy"] = mouse_dy
 
     if include_jump:
         jump_profile = np.asarray(controller["jump_profile"], dtype=np.float32)
@@ -311,8 +317,10 @@ def main() -> None:
             controller,
             num_frames=int(args.num_frames),
             minimum_translation=float(args.minimum_translation),
-            event_frame=int(args.event_frame),
-            include_jump=bool(args.include_jump),
+        event_frame=int(args.event_frame),
+        include_jump=bool(args.include_jump),
+        include_motion=bool(args.include_motion),
+        include_view_rotation=bool(args.include_view_rotation),
         )
     np.savez(
         output_dir / "camera_poses.npz",
@@ -360,6 +368,8 @@ def main() -> None:
         "conditioning_event_frame": conditioning_event_frame,
         "event_time_seconds": float(args.event_frame) / float(args.fps),
         "include_jump": bool(args.include_jump),
+        "include_motion": bool(args.include_motion),
+        "include_view_rotation": bool(args.include_view_rotation),
         "stationary": bool(args.stationary),
         "controller": controller,
     }
