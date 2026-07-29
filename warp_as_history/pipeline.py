@@ -60,7 +60,7 @@ from .defaults import (
     WAH_PYRAMID_STEPS,
     WAH_VISIBLE_TOKEN_THRESHOLD,
 )
-from .minecraft_sampling import interaction_payload_for_chunk
+from .minecraft_sampling import interaction_event_identity, interaction_payload_for_chunk
 
 
 LORA_AUTO_VALUES = frozenset({"auto", "default"})
@@ -930,6 +930,16 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         if lora_path is None:
             self._set_wah_lora_enabled(False)
             return False
+        if str(lora_path) == "current":
+            if not self._wah_has_loaded_adapters():
+                raise ValueError("lora_path='current' requires an already initialized WAH adapter.")
+            if hasattr(self, "set_adapters"):
+                try:
+                    self.set_adapters([self._wah_adapter_name], adapter_weights=[1.0])
+                except (KeyError, NotImplementedError):
+                    self.transformer.set_adapter(self._wah_adapter_name)
+            self._set_wah_lora_enabled(True)
+            return True
 
         adapter_path = self._materialize_wah_lora_path(lora_path, self._wah_adapter_name)
         loaded_path = getattr(self, "_wah_loaded_lora_path", None)
@@ -1024,8 +1034,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
 
             mismatches = recipe_mismatches(checkpoint_recipe, runtime_recipe)
             if mismatches:
-                print(format_recipe_warning(mismatches), flush=True)
-                print(json.dumps({"event": "wah_recipe_mismatch", "checkpoint": checkpoint_recipe, "runtime": runtime_recipe, "mismatches": mismatches}), flush=True)
+                raise ValueError(
+                    format_recipe_warning(mismatches).replace("WARNING:", "ERROR:")
+                )
         history_invisible_token = extra_state.get("history_invisible_token")
         if torch.is_tensor(history_invisible_token):
             if getattr(self.transformer, "history_invisible_token", None) is None:
@@ -1608,7 +1619,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             visible_token_threshold=float(visible_token_threshold),
             amplify_first_chunk=bool(is_amplify_first_chunk),
             history_sizes=list(WAH_HISTORY_SIZES),
+            history_positioning="last_n_same_order",
             pose_convention="opencv_c2w_relative",
+            vae_temporal_scale=int(self.vae_scale_factor_temporal),
         )
         self.transformer._wah_runtime_recipe = runtime_recipe
         self.transformer._wah_require_interaction_checkpoint = bool(
@@ -1850,6 +1863,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 "interaction_payload": interaction_payload,
                 "interaction_conditioning_mode": interaction_conditioning_mode,
                 "consumed_interaction_event_frames": [],
+                "consumed_interaction_event_ids": [],
                 "wah_recipe": runtime_recipe,
             }
         )
@@ -2814,6 +2828,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                         window_frames=int(state["window_num_frames"]),
                         consumed_event_frames=state.get("consumed_interaction_event_frames", []),
                     )
+                    event_identity = interaction_event_identity(routed_interaction_payload)
+                    if event_identity in set(state.get("consumed_interaction_event_ids", [])):
+                        routed_interaction_payload = None
                     if (
                         str(state.get("interaction_conditioning_mode", "router")) == "router"
                         and routed_interaction_payload is not None
@@ -3002,5 +3019,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 consumed = state.setdefault("consumed_interaction_event_frames", [])
                 if global_event_frame not in consumed:
                     consumed.append(global_event_frame)
+                event_identity = interaction_event_identity(interaction_payload)
+                consumed_ids = state.setdefault("consumed_interaction_event_ids", [])
+                if event_identity is not None and event_identity not in consumed_ids:
+                    consumed_ids.append(event_identity)
         state["chunk_index"] = int(state.get("chunk_index", 0)) + 1
         return latents

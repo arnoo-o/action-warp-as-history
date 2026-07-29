@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import imageio.v2 as imageio
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 from warp_as_history.camera_warp import (
     CAMERA_CONTROL_DEFAULT_MESH_BREAK_MODE,
@@ -678,6 +678,7 @@ def canonical_interaction_events(payload):
             continue
         events.append(
             {
+                "event_id": event.get("event_id"),
                 "event_frame": int(frame),
                 "action_type": action_type,
                 "object_id": event.get("object_id"),
@@ -802,6 +803,12 @@ def build_residual_teacher_components(
     # become interaction targets.
     warp_change_scale = warp_change.flatten(1).mean(dim=1).view(-1, 1, 1, 1, 1).clamp_min(1e-6)
     teacher = teacher * (1.0 - (warp_change / (3.0 * warp_change_scale)).clamp(0.0, 0.9))
+    warp_gray = warp.float().mean(dim=1, keepdim=True)
+    spatial_edge = torch.zeros_like(raw_residual)
+    spatial_edge[..., 1:, :] += (warp_gray[..., 1:, :] - warp_gray[..., :-1, :]).abs()
+    spatial_edge[..., :, 1:] += (warp_gray[..., :, 1:] - warp_gray[..., :, :-1]).abs()
+    edge_scale = spatial_edge.flatten(1).mean(dim=1).view(-1, 1, 1, 1, 1).clamp_min(1e-6)
+    teacher = teacher * (1.0 - (spatial_edge / (4.0 * edge_scale)).clamp(0.0, 0.75))
     if visibility is not None:
         visible = torch.nn.functional.interpolate(
             visibility.float(), size=teacher.shape[2:], mode="nearest"
@@ -839,6 +846,14 @@ def build_residual_teacher_components(
     hand_x = int(round(hand_valid.shape[-1] * 0.65))
     hand_valid[..., hand_y:, hand_x:] = 0.0
     teacher = teacher * hand_valid
+
+    # Minecraft interactions originate near the crosshair, but the prior is
+    # intentionally weak so the residual teacher can route effects elsewhere.
+    height, width = teacher.shape[-2:]
+    yy = torch.linspace(-1.0, 1.0, height, device=teacher.device).view(1, 1, 1, height, 1)
+    xx = torch.linspace(-1.0, 1.0, width, device=teacher.device).view(1, 1, 1, 1, width)
+    crosshair_prior = torch.exp(-2.0 * (xx.square() + yy.square()))
+    teacher = teacher * (0.75 + 0.25 * crosshair_prior)
 
     # Spatial and temporal averaging suppresses isolated pixels/frames while
     # preserving persistent block changes.
@@ -1143,6 +1158,33 @@ def online_tensor_video_to_pil_frames(video):
     arr = ((arr + 1.0) * 127.5).round().to(torch.uint8)
     arr = arr.permute(1, 2, 3, 0).numpy()
     return [Image.fromarray(frame, mode="RGB") for frame in arr]
+
+
+def pipeline_output_to_pil_frames(output):
+    value = output.frames if hasattr(output, "frames") else output
+    while isinstance(value, (list, tuple)) and len(value) == 1:
+        value = value[0]
+    if torch.is_tensor(value):
+        value = value.detach().float().cpu().numpy()
+    array = np.asarray(value)
+    if array.ndim == 5:
+        array = array[0]
+    if array.ndim != 4:
+        raise ValueError(f"Unexpected rollout output shape: {array.shape}")
+    frames = []
+    for frame in array:
+        if frame.shape[0] in {1, 3, 4} and frame.shape[-1] not in {3, 4}:
+            frame = np.transpose(frame, (1, 2, 0))
+        if frame.shape[-1] == 4:
+            frame = frame[..., :3]
+        if frame.dtype != np.uint8:
+            frame = (
+                np.clip(frame, 0.0, 1.0) * 255.0
+                if float(np.max(frame)) <= 1.0
+                else np.clip(frame, 0.0, 255.0)
+            ).round().astype(np.uint8)
+        frames.append(Image.fromarray(frame, mode="RGB"))
+    return frames
 
 
 def online_mask_tensor_to_pil_frames(mask):
@@ -1579,11 +1621,26 @@ class OnlineWarpTrainingCache:
                 row.get("actions_path", ""),
                 getattr(self.exact_args, "data_root", "."),
             )
-            if not isinstance(actions_path, Path) or not actions_path.is_file():
-                raise FileNotFoundError(f"Missing VPT telemetry for {row.get('id', row_index)}: {actions_path}")
-            pose_rows = load_vpt_pose_rows(actions_path, source_indices)
+            try:
+                if not isinstance(actions_path, Path) or not actions_path.is_file():
+                    raise FileNotFoundError(
+                        f"Missing VPT telemetry for {row.get('id', row_index)}: {actions_path}"
+                    )
+                pose_rows = load_vpt_pose_rows(actions_path, source_indices)
+            except (FileNotFoundError, ValueError) as exc:
+                print(
+                    json.dumps(
+                        {
+                            "event": "vpt_pose_fallback_pi3x",
+                            "row_index": int(row_index),
+                            "seq": str(row.get("id", row_index)),
+                            "reason": str(exc),
+                        }
+                    ),
+                    flush=True,
+                )
         geometry = None
-        if not use_vpt_poses:
+        if pose_rows is None:
             cache_path = self._geometry_cache_path(ref, direction, source_fps=source_fps)
             geometry = self._load_geometry_from_disk(cache_path)
             if geometry is None:
@@ -1636,7 +1693,13 @@ class OnlineWarpTrainingCache:
         reverse_prob = float(getattr(self.exact_args, "online_direction_reverse_prob", 0.5))
         return "reverse" if rng.random() < reverse_prob else "forward"
 
-    def sample_case(self, row_index, prepare_index, requested_category=None):
+    def sample_case(
+        self,
+        row_index,
+        prepare_index,
+        requested_category=None,
+        requested_chunk_mode=None,
+    ):
         row_index = int(row_index)
         row = self.rows[row_index]
         category = canonical_training_category(requested_category or row.get("training_category", row.get("category")))
@@ -1690,11 +1753,58 @@ class OnlineWarpTrainingCache:
                         [abs(int(frame) - segment_end) for frame in prepared["source_indices"]]
                     )
                 )
+            action_type = canonical_interaction_action(row.get("action_type", category))
+            if category == "mine" and not str(row.get("action_type", "") or "").strip():
+                use_active = bool(rng.randrange(2))
+                if use_active and prepared.get("pose_rows"):
+                    completion_frame = int(event_resampled_frame)
+                    active_start = completion_frame
+                    while active_start > 0:
+                        mouse = dict(prepared["pose_rows"][active_start - 1].get("mouse", {}) or {})
+                        if 0 not in list(mouse.get("buttons", []) or []):
+                            break
+                        active_start -= 1
+                    if active_start < completion_frame:
+                        event_resampled_frame = max(
+                            active_start,
+                            completion_frame - max(1, (completion_frame - active_start) // 2),
+                        )
+                        event_end_frame = completion_frame + 1
+                        action_type = "mine_active"
+                        active_segment_frame = int(
+                            prepared["source_indices"][event_resampled_frame]
+                        )
+                        source_start = int(row.get("source_frame_start", 0) or 0)
+                        event_alignment = {
+                            **event_alignment,
+                            "source_event_frame": source_start + active_segment_frame,
+                            "segment_event_frame": active_segment_frame,
+                            "source_event_time_ms": 1000.0
+                            * active_segment_frame
+                            / max(float(row.get("fps", 0.0) or 0.0), 1.0e-6),
+                            "resampled_event_frame": int(event_resampled_frame),
+                            "resampled_event_time_ms": 1000.0
+                            * int(event_resampled_frame)
+                            / max(
+                                float(getattr(self.exact_args, "online_target_fps", 16.0)),
+                                1.0e-6,
+                            ),
+                        }
+                    else:
+                        action_type = "mine_complete"
             full_interaction_payload = {
                 "events": [
                     {
+                        "event_id": str(
+                            row.get("event_id")
+                            or (
+                                f"{event_alignment['source_event_frame']}:"
+                                f"{action_type}:"
+                                f"{row.get('object_id')}"
+                            )
+                        ),
                         "event_frame": int(event_resampled_frame),
-                        "action_type": canonical_interaction_action(row.get("action_type", category)),
+                        "action_type": action_type,
                         "object_id": row.get("object_id"),
                         "block_id": row.get("block_id", row.get("object_id")),
                         "event_end_frame": event_end_frame,
@@ -1706,6 +1816,8 @@ class OnlineWarpTrainingCache:
         elif category in {"movement", "other"}:
             # Movement is WAH camera supervision only.  It must never spend a
             # Router forward or be silently represented as a none-token event.
+            full_interaction_payload = None
+        elif category == "negative":
             full_interaction_payload = None
         geometry_stride = max(1, int(getattr(self.exact_args, "online_geometry_keyframe_stride", 1)))
         geometry_frame_indices = list(range(0, len(frames), geometry_stride))
@@ -1730,14 +1842,34 @@ class OnlineWarpTrainingCache:
                 require_later=True,
             )
             chunk_mode = f"{category}_event"
-        elif rng.random() < first_chunk_prob:
+        elif requested_chunk_mode == "camera_first":
+            target_indices = list(range(num_frames))
+            chunk_mode = "first"
+        elif requested_chunk_mode in {"camera_later", "camera_rollout"}:
+            max_chunk_index = (n - num_frames) // num_frames
+            minimum_chunk_index = 2 if requested_chunk_mode == "camera_rollout" else 1
+            if max_chunk_index < minimum_chunk_index:
+                raise ValueError(
+                    f"{requested_chunk_mode} requires at least {minimum_chunk_index + 1} chunks."
+                )
+            chunk_index = rng.randint(minimum_chunk_index, max_chunk_index)
+            target_start = chunk_index * num_frames
+            target_indices = list(range(target_start, target_start + num_frames))
+            chunk_mode = "two_chunk_rollout" if requested_chunk_mode == "camera_rollout" else "later"
+        elif (
+            str(getattr(self.exact_args, "training_profile", "joint")) == "camera"
+            and rng.random() < first_chunk_prob
+        ):
             target_indices = list(range(num_frames))
             chunk_mode = "first"
         if target_indices is None:
             target_indices = choose_online_movement_window(rng, n, num_frames, full_event_payload)
         target_start = int(target_indices[0])
         if target_start <= 0:
-            chunk_mode = "first" if chunk_mode == "movement" else f"{chunk_mode}_first"
+            if requested_chunk_mode == "camera_first":
+                chunk_mode = "first"
+            if requested_chunk_mode != "camera_first":
+                chunk_mode = "first" if chunk_mode == "movement" else f"{chunk_mode}_first"
             source_idx = int(target_start)
             history_indices = []
             geometry_keyframe_frames = [source_idx]
@@ -1747,7 +1879,12 @@ class OnlineWarpTrainingCache:
             keyframe_policy = "source_only"
             condition_frame = frames[source_idx]
         else:
-            chunk_mode = "later" if chunk_mode == "movement" else f"{chunk_mode}_later"
+            if requested_chunk_mode == "camera_later":
+                chunk_mode = "later"
+            elif requested_chunk_mode == "camera_rollout":
+                chunk_mode = "two_chunk_rollout"
+            else:
+                chunk_mode = "later" if chunk_mode == "movement" else f"{chunk_mode}_later"
             max_history = min(int(getattr(self.exact_args, "online_max_history_frames", 19)), target_start)
             history_len = rng.randint(1, max(1, max_history))
             history_indices = list(range(target_start - history_len, target_start))
@@ -1758,6 +1895,9 @@ class OnlineWarpTrainingCache:
                 for frame_index in geometry_frame_indices
                 if history_indices[0] <= frame_index < target_start
             ]
+            if requested_chunk_mode == "camera_rollout":
+                rollout_source = int(target_start) - int(num_frames)
+                geometry_keyframe_frames = [max(rollout_source, 0)]
             if not geometry_keyframe_frames:
                 geometry_keyframe_frames = [max(frame_index for frame_index in geometry_frame_indices if frame_index < target_start)]
             render_pose_indices = [geometry_keyframe_frames[-1], *target_indices]
@@ -1857,6 +1997,17 @@ class OnlineWarpTrainingCache:
             if category in {"place", "mine"}
             else None
         )
+        if category == "negative":
+            interaction_payload = {
+                "event_id": f"negative:{row.get('id', row_index)}:{target_start}",
+                "event_frame": 0,
+                "action_type": "none",
+                "object_id": None,
+                "block_id": None,
+                "event_valid": 0.0,
+                "num_frames": int(num_frames),
+                "time_mask": [0.0] * int(num_frames),
+            }
         if category in {"place", "mine"}:
             if interaction_payload is None or float(interaction_payload.get("event_valid", 0.0)) != 1.0:
                 raise RuntimeError(f"Positive {category} row lost its event window: {row.get('id', row_index)}.")
@@ -1930,6 +2081,9 @@ class OnlineWarpTrainingCache:
                 "row_index": int(row_index),
                 "seq": seq,
                 "target_indices": target_indices,
+                "target_start_frame": int(target_start),
+                "chunk_index": int(target_start // num_frames),
+                "requested_chunk_mode": requested_chunk_mode,
                 "video": prepared["video_ref"],
                 "warp_render_stats": rendered.get("warp_render_stats", {}),
                 "interaction_history_text": interaction_memory.get("merged", ""),
@@ -1972,6 +2126,7 @@ class OnlineWarpTrainingCache:
             "seq": seq,
             "camera_pose_source": pose_source,
             "camera_translation_scale": float(effective_scale),
+            "camera_raw_relative_poses": raw_poses.copy(),
             "target_frames": [frames[idx] for idx in target_indices],
             "target_indices": target_indices,
             "warp_frames": warp_frames,
@@ -1981,6 +2136,19 @@ class OnlineWarpTrainingCache:
             if world_valid_mask is None
             else [world_valid_mask.copy() for _ in range(num_frames)],
         }
+        if requested_chunk_mode == "camera_rollout":
+            previous_start = int(target_start) - int(num_frames)
+            previous_indices = list(range(previous_start, int(target_start)))
+            if previous_start < 0 or prepared.get("pose_rows") is None:
+                raise ValueError("Two-chunk rollout requires an earlier VPT-controlled chunk.")
+            result["rollout_source_frame"] = frames[previous_start]
+            result["rollout_camera_poses"] = vpt_relative_camera_poses(
+                prepared["pose_rows"],
+                previous_start,
+                previous_indices,
+                translation_scale=1.0,
+            )
+            result["rollout_previous_indices"] = previous_indices
         del rendered, warp_video, warp_mask, geometry, poses
         self.renderer._pi3x_runtime = None
         opt.clean_memory()
@@ -2064,17 +2232,47 @@ def prepare_online_warp_item(
     memory_prompt_cache,
     prepare_index=0,
     requested_category=None,
+    requested_chunk_mode=None,
 ):
     online_cache = getattr(exact_args, "online_warp_cache", None)
     if online_cache is None:
         raise ValueError("Training cache is missing.")
-    case = online_cache.sample_case(row_index, prepare_index, requested_category=requested_category)
+    case = online_cache.sample_case(
+        row_index,
+        prepare_index,
+        requested_category=requested_category,
+        requested_chunk_mode=requested_chunk_mode,
+    )
     seq = case["seq"]
     prompt_text = str(case["prompt"])
     first_frame = case["condition_frame"]
     target_frames = case["target_frames"]
     history_frames = case["warp_frames"]
     mask_frames = case["warp_mask_frames"]
+    history_corruption = "clean"
+    if (
+        str(getattr(exact_args, "training_profile", "joint")) == "camera"
+        and str(case.get("metadata", {}).get("chunk_mode")) == "later"
+    ):
+        history_corruption = ("clean", "latent_noise", "downsample", "photometric")[
+            int(prepare_index) % 4
+        ]
+        if history_corruption == "photometric":
+            factor_seed = random.Random(
+                opt.stable_seed_from_parts(int(exact_args.seed), case["seq"], "history_photometric")
+            )
+            brightness = factor_seed.uniform(0.95, 1.05)
+            contrast = factor_seed.uniform(0.95, 1.05)
+            saturation = factor_seed.uniform(0.95, 1.05)
+            history_frames = [
+                ImageEnhance.Color(
+                    ImageEnhance.Contrast(
+                        ImageEnhance.Brightness(frame).enhance(brightness)
+                    ).enhance(contrast)
+                ).enhance(saturation)
+                for frame in history_frames
+            ]
+    case["metadata"]["history_corruption"] = history_corruption
 
     had_extra_mask = hasattr(exact_args, "history_visibility_extra_mask_frames")
     old_extra_mask = getattr(exact_args, "history_visibility_extra_mask_frames", None)
@@ -2098,6 +2296,49 @@ def prepare_online_warp_item(
                 cache_dir,
                 memory_prompt_cache,
             )
+            rollout_history_frames = None
+            if str(case.get("metadata", {}).get("chunk_mode")) == "two_chunk_rollout":
+                transformer_training = bool(pipe.transformer.training)
+                pipe.transformer.eval()
+                try:
+                    rollout_output = pipe(
+                        prompt=prompt_text,
+                        image=case["rollout_source_frame"],
+                        camera_poses=case["rollout_camera_poses"],
+                        lora_path="current",
+                        height=int(exact_args.height),
+                        width=int(exact_args.width),
+                        num_frames=int(exact_args.num_frames),
+                        prompt_embeds=cached_prompt_embeds,
+                        output_type="np",
+                        generator=torch.Generator(device=device).manual_seed(
+                            opt.stable_seed_from_parts(int(exact_args.seed), seq, "two_chunk_rollout")
+                        ),
+                        pyramid_num_inference_steps_list=list(
+                            exact_args.pyramid_num_inference_steps_list
+                        ),
+                        camera_control_translation_scale=float(
+                            getattr(exact_args, "online_vpt_translation_scale", 0.1)
+                        ),
+                        camera_control_translation_scale_use_first_frame_depth=bool(
+                            getattr(exact_args, "camera_multiply_translation_by_depth", True)
+                        ),
+                        camera_control_warp_render_mode=str(exact_args.online_render_mode),
+                        camera_control_mesh_samples_per_axis=int(
+                            exact_args.online_mesh_samples_per_axis
+                        ),
+                        camera_keyframe_max_previous=int(exact_args.online_max_history_frames),
+                        visible_token_threshold=float(exact_args.history_visible_token_threshold),
+                        target_fps=float(exact_args.online_target_fps),
+                        interaction_conditioning_mode="off",
+                    )
+                    rollout_history_frames = pipeline_output_to_pil_frames(rollout_output)
+                    if len(rollout_history_frames) != int(exact_args.num_frames):
+                        raise RuntimeError(
+                            f"Two-chunk rollout generated {len(rollout_history_frames)} frames."
+                        )
+                finally:
+                    pipe.transformer.train(transformer_training)
             prompt_embeds, image_latents, fake_image_latents, video_latents = opt.prepare_condition(
                 pipe,
                 first_frame,
@@ -2109,6 +2350,30 @@ def prepare_online_warp_item(
                 history_frames=history_frames,
                 prompt_embeds_override=cached_prompt_embeds,
             )
+            if history_corruption == "latent_noise":
+                video_latents = (
+                    video_latents
+                    + torch.randn_like(video_latents) * 0.01
+                )
+            elif history_corruption == "downsample":
+                original_size = video_latents.shape[2:]
+                reduced_size = (
+                    original_size[0],
+                    max(1, original_size[1] // 2),
+                    max(1, original_size[2] // 2),
+                )
+                video_latents = torch.nn.functional.interpolate(
+                    video_latents.float(),
+                    size=reduced_size,
+                    mode="trilinear",
+                    align_corners=False,
+                )
+                video_latents = torch.nn.functional.interpolate(
+                    video_latents,
+                    size=original_size,
+                    mode="trilinear",
+                    align_corners=False,
+                ).to(image_latents)
             histories = opt.make_histories(
                 pipe,
                 image_latents,
@@ -2120,15 +2385,42 @@ def prepare_online_warp_item(
             )
             base_history_args = copy.copy(exact_args)
             base_history_args.use_warp_as_history = False
-            base_histories = opt.make_histories(
-                pipe,
-                image_latents,
-                fake_image_latents,
-                base_history_args,
-                device,
-                video_latents=video_latents,
-                seq=f"{seq}:helios_base",
-            )
+            if rollout_history_frames is None:
+                base_histories = opt.make_histories(
+                    pipe,
+                    image_latents,
+                    fake_image_latents,
+                    base_history_args,
+                    device,
+                    video_latents=video_latents,
+                    seq=f"{seq}:helios_base",
+                )
+            else:
+                (
+                    _rollout_prompt,
+                    rollout_image_latents,
+                    rollout_fake_image_latents,
+                    rollout_video_latents,
+                ) = opt.prepare_condition(
+                    pipe,
+                    case["rollout_source_frame"],
+                    prompt_text,
+                    base_history_args,
+                    device,
+                    mean,
+                    std,
+                    history_frames=rollout_history_frames,
+                    prompt_embeds_override=cached_prompt_embeds,
+                )
+                base_histories = opt.make_histories(
+                    pipe,
+                    rollout_image_latents,
+                    rollout_fake_image_latents,
+                    base_history_args,
+                    device,
+                    video_latents=rollout_video_latents.detach(),
+                    seq=f"{seq}:generated_rollout_history",
+                )
             loss_focus_mask_latents = online_mask_frames_to_latent_mask(
                 case.get("focus_mask_frames"),
                 target_latents=target_latents,
@@ -2155,8 +2447,13 @@ def prepare_online_warp_item(
             interaction_payload = case.get("interaction_payload")
             interaction_active = bool(
                 interaction_payload
-                and float(interaction_payload.get("event_valid", 0.0)) > 0.0
-                and str(case.get("training_category", "")) in {"place", "mine"}
+                and (
+                    (
+                        float(interaction_payload.get("event_valid", 0.0)) > 0.0
+                        and str(case.get("training_category", "")) in {"place", "mine"}
+                    )
+                    or str(case.get("training_category", "")) == "negative"
+                )
             )
             if str(getattr(exact_args, "interaction_conditioning_mode", "router")) == "router" and interaction_active:
                 interaction_teacher_components = build_residual_teacher_components(
@@ -2274,7 +2571,7 @@ class LazyPreparedItems:
     def _remember_status(self, status):
         self.prompt_cache_status_counts[status] = self.prompt_cache_status_counts.get(status, 0) + 1
 
-    def get(self, idx, requested_category=None):
+    def get(self, idx, requested_category=None, requested_chunk_mode=None):
         idx = int(idx)
         print(json.dumps({"event": "prepare_item_start", "index": idx, "seq": str(self.rows[idx]["id"])}), flush=True)
         self.prepare_counter += 1
@@ -2291,6 +2588,7 @@ class LazyPreparedItems:
             memory_prompt_cache=self.memory_prompt_cache,
             prepare_index=self.prepare_counter,
             requested_category=requested_category,
+            requested_chunk_mode=requested_chunk_mode,
         )
         self._remember_status(item["prompt_cache_status"])
         print(

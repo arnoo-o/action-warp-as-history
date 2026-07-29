@@ -133,3 +133,16 @@ def interaction_payload_for_chunk(payload, *, chunk_index, window_frames, consum
     routed["event_frame"] = global_event_frame - start
     routed["event_valid"] = float(payload.get("event_valid", 1.0))
     return routed
+
+
+def interaction_event_identity(payload):
+    if payload is None:
+        return None
+    explicit = str(payload.get("event_id", "") or "").strip()
+    if explicit:
+        return explicit
+    return (
+        f"{int(payload.get('event_frame', -1))}:"
+        f"{payload.get('action_type', 'none')}:"
+        f"{payload.get('block_id', payload.get('object_id'))}"
+    )

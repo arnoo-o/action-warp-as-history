@@ -68,7 +68,7 @@ import torch
 from tqdm import tqdm
 
 from warp_as_history.training import core as opt
-from warp_as_history.minecraft_recipe import minecraft_wah_recipe
+from warp_as_history.minecraft_recipe import minecraft_wah_recipe, recipe_mismatches
 from warp_as_history.training.data import (
     LazyPreparedItems,
     build_online_warp_training_cache,
@@ -117,24 +117,24 @@ def build_minecraft_step_sampler(df, args):
     for position, (_, row) in enumerate(df.iterrows()):
         category = str(row.get("training_category", row.get("category", "movement"))).strip().lower()
         source_pools[category if category in source_pools else "other"].append(int(position))
-    pools = {
-        "place": source_pools["place"],
-        "mine": source_pools["mine"],
-        "other": [
-            *source_pools["negative"],
-            *source_pools["movement"],
-            *source_pools["other"],
-        ],
-    }
     profile = str(args.training_profile)
     if profile == "camera":
-        pools = {"other": list(source_pools["movement"])}
-        ratios = {"other": 1.0}
+        pools = {
+            "camera_first": list(source_pools["movement"]),
+            "camera_later": list(source_pools["movement"]),
+            "camera_rollout": list(source_pools["movement"]),
+        }
+        ratios = {"camera_first": 0.25, "camera_later": 0.55, "camera_rollout": 0.20}
     else:
+        pools = {
+            "place": source_pools["place"],
+            "mine": source_pools["mine"],
+            "negative": source_pools["negative"],
+        }
         ratios = {
             "place": float(args.place_step_ratio),
             "mine": float(args.mine_step_ratio),
-            "other": float(args.other_step_ratio),
+            "negative": float(args.other_step_ratio),
         }
     empty_requested = [name for name, ratio in ratios.items() if ratio > 0 and not pools.get(name)]
     if empty_requested:
@@ -151,7 +151,10 @@ def distribution_counts_from_losses(losses):
     counts = {
         "place": 0,
         "mine": 0,
-        "other": 0,
+        "negative": 0,
+        "camera_first": 0,
+        "camera_later": 0,
+        "camera_rollout": 0,
         "valid_place": 0,
         "valid_mine": 0,
         "movement": 0,
@@ -163,7 +166,14 @@ def distribution_counts_from_losses(losses):
     }
     for record in losses:
         sampled = str(record.get("sampled_category", ""))
-        if sampled in {"place", "mine", "other"}:
+        if sampled in {
+            "place",
+            "mine",
+            "negative",
+            "camera_first",
+            "camera_later",
+            "camera_rollout",
+        }:
             counts[sampled] += 1
         category = str(record.get("training_category", ""))
         if category == "movement":
@@ -294,6 +304,8 @@ def save_training_state(
         "bidirectional_completed_steps": max(int(global_step) - int(args.base_train_steps), 0),
         "enable_bidirectional_training": bool(args.enable_bidirectional_training),
         "training_profile": str(args.training_profile),
+        "wah_recipe": dict(getattr(transformer, "_wah_recipe", {}) or {}),
+        "wah_initialization": dict(getattr(transformer, "_wah_initialization", {}) or {}),
         "distribution_counts": dict(distribution_counts or {}),
         "refined_teacher_cache": {
             key: value.detach().cpu() for key, value in refined_teacher_cache.items()
@@ -397,6 +409,9 @@ def load_training_state(path, *, transformer, optimizer, device):
             for key, value in dict(payload.get("refined_teacher_cache", {})).items()
         },
         "losses": list(payload.get("losses", [])),
+        "training_profile": str(payload.get("training_profile", "joint")),
+        "wah_recipe": dict(payload.get("wah_recipe", {}) or {}),
+        "wah_initialization": dict(payload.get("wah_initialization", {}) or {}),
     }
 
 
@@ -418,7 +433,7 @@ def parse_args():
         help="Optional manifest row limit for debugging. By default all rows are eligible for step-level sampling.",
     )
     parser.add_argument("--max_steps", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--base_train_steps", type=int, default=1500)
+    parser.add_argument("--base_train_steps", type=int, default=None)
     parser.add_argument("--bidirectional_train_steps", type=int, default=1500)
     parser.add_argument(
         "--enable_bidirectional_training",
@@ -434,6 +449,16 @@ def parse_args():
         type=Path,
         default=None,
         help="Initialize camera/WAH LoRA weights for interaction-profile training.",
+    )
+    parser.add_argument(
+        "--init_wah_lora_path",
+        type=Path,
+        default=Path("checkpoints/warp-as-history/visible_lora_state_step1000.safetensors"),
+    )
+    parser.add_argument(
+        "--require_init_wah_lora",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--wah_lora_lr", type=float, default=None)
@@ -709,6 +734,8 @@ def build_exact_args(args):
 
 def main():
     args = parse_args()
+    if args.base_train_steps is None:
+        args.base_train_steps = 1000 if str(args.training_profile) == "camera" else 1500
     if str(args.training_profile) == "camera":
         args.interaction_conditioning_mode = "off"
     if str(args.training_profile) == "interaction" and args.camera_checkpoint is None:
@@ -777,7 +804,9 @@ def main():
         visible_token_threshold=args.visible_token_threshold,
         amplify_first_chunk=False,
         history_sizes=args.history_sizes,
+        history_positioning=args.history_positioning,
         pose_convention="opencv_c2w_relative",
+        vae_temporal_scale=int(pipe.vae_scale_factor_temporal),
     )
     mean, std = opt.latent_stats(pipe, device)
 
@@ -825,6 +854,13 @@ def main():
 
     opt.seed_global_rng(args.seed)
     adapter_name, lora_params, lora_stats = opt.setup_visible_lora(pipe.transformer, exact_args, "shared")
+    pipe._wah_adapter_name = adapter_name
+    peft_configs = dict(getattr(pipe.transformer, "peft_config", {}) or {})
+    if len(peft_configs) != 1 or adapter_name not in peft_configs:
+        raise RuntimeError(
+            f"Training requires exactly one WAH LoRA adapter, got {sorted(peft_configs)}."
+        )
+    initialization = None
     if args.camera_checkpoint is not None:
         camera_load = opt.load_visible_lora_state(
             pipe.transformer,
@@ -843,6 +879,40 @@ def main():
             ),
             flush=True,
         )
+        checkpoint_recipe = camera_load.get("wah_recipe")
+        if isinstance(checkpoint_recipe, dict):
+            mismatches = recipe_mismatches(checkpoint_recipe, pipe.transformer._wah_recipe)
+            if mismatches:
+                raise ValueError(f"Camera checkpoint WAH recipe mismatch: {mismatches}")
+        initialization = {
+            "source": "camera_checkpoint",
+            "path": str(args.camera_checkpoint),
+            "official_parent": camera_load.get("wah_initialization"),
+        }
+        pipe.transformer._wah_initialization = dict(initialization)
+    elif args.resume_from_checkpoint is None:
+        init_path = Path(args.init_wah_lora_path)
+        if not init_path.is_absolute():
+            init_path = REPO_ROOT / init_path
+        if bool(args.require_init_wah_lora) or init_path.is_file():
+            initialization = opt.load_initial_wah_lora(
+                pipe.transformer,
+                init_path,
+                adapter_name,
+                exact_args,
+            )
+            print(
+                json.dumps(
+                    {
+                        "event": "wah_lora_initialized",
+                        **initialization,
+                    }
+                ),
+                flush=True,
+            )
+        else:
+            initialization = {"source": "random", "path": None}
+            pipe.transformer._wah_initialization = dict(initialization)
     opt.assert_lora_only_trainable(
         pipe.transformer,
         lora_params,
@@ -852,18 +922,31 @@ def main():
     print(json.dumps(lora_stats), flush=True)
 
     named_params = {id(param): name for name, param in pipe.transformer.named_parameters()}
-    default_wah_lr = float(args.lr) * (0.1 if str(args.training_profile) == "interaction" else 1.0)
+    default_wah_lr = (
+        1.0e-5
+        if str(args.training_profile) == "camera"
+        else 0.0
+        if str(args.training_profile) == "interaction"
+        else float(args.lr)
+    )
     wah_lora_lr = float(args.wah_lora_lr if args.wah_lora_lr is not None else default_wah_lr)
-    interaction_lr = float(args.interaction_lr if args.interaction_lr is not None else args.lr)
+    interaction_lr = float(args.interaction_lr if args.interaction_lr is not None else 1.0e-4)
     profile = str(args.training_profile)
     wah_params = []
     interaction_params = []
     for param in lora_params:
         name = named_params.get(id(param), "")
-        is_interaction = name.startswith("interaction_conditioning.")
-        param.requires_grad_(True)
+        is_interaction = name.startswith("interaction_conditioning.") or ".interaction_conditioning." in name
+        should_train = (not is_interaction and profile in {"camera", "joint"}) or (
+            is_interaction and profile in {"interaction", "joint"}
+        )
+        param.requires_grad_(should_train)
         if param.requires_grad:
             (interaction_params if is_interaction else wah_params).append(param)
+    if profile == "camera" and interaction_params:
+        raise RuntimeError("Camera profile must not train interaction parameters.")
+    if profile == "interaction" and wah_params:
+        raise RuntimeError("Interaction profile must freeze the WAH LoRA by default.")
     if profile == "interaction" and not interaction_params:
         raise ValueError("interaction profile requires Router/Adapter trainable parameters.")
     trainable_params = [*wah_params, *interaction_params]
@@ -885,6 +968,16 @@ def main():
             device=device,
         )
         start_step = int(resume_state["global_step"])
+        if str(resume_state.get("training_profile", args.training_profile)) != str(args.training_profile):
+            raise ValueError("Resume checkpoint training_profile does not match the current profile.")
+        resume_recipe = resume_state.get("wah_recipe")
+        if resume_recipe:
+            mismatches = recipe_mismatches(resume_recipe, pipe.transformer._wah_recipe)
+            if mismatches:
+                raise ValueError(f"Resume checkpoint WAH recipe mismatch: {mismatches}")
+        pipe.transformer._wah_initialization = dict(
+            resume_state.get("wah_initialization", {}) or {}
+        )
         resume_schedule = (
             int(resume_state.get("base_train_steps", args.base_train_steps)),
             int(resume_state.get("bidirectional_train_steps", args.bidirectional_train_steps)),
@@ -924,13 +1017,24 @@ def main():
         step_invalid_event_retries = 0
         for retry in range(8):
             try:
-                item = items.get(item_idx, requested_category=None if sampled_class == "other" else sampled_class)
+                requested_category = (
+                    "movement" if sampled_class.startswith("camera_") else sampled_class
+                )
+                requested_chunk_mode = (
+                    sampled_class if sampled_class.startswith("camera_") else None
+                )
+                item = items.get(
+                    item_idx,
+                    requested_category=requested_category,
+                    requested_chunk_mode=requested_chunk_mode,
+                )
                 break
             except (RuntimeError, ValueError) as exc:
-                if sampled_class not in {"place", "mine"} or retry == 7:
+                if sampled_class not in {"place", "mine", "camera_rollout"} or retry == 7:
                     raise
-                distribution_counts["invalid_event_retries"] += 1
-                step_invalid_event_retries += 1
+                if sampled_class in {"place", "mine"}:
+                    distribution_counts["invalid_event_retries"] += 1
+                    step_invalid_event_retries += 1
                 item_idx = step_sampler.sample_category(sampled_class, step + retry + 1)
                 print(json.dumps({"event": "invalid_interaction_retry", "step": step, "category": sampled_class, "reason": str(exc)}), flush=True)
         if item is None:
@@ -1049,8 +1153,16 @@ def main():
             "sampled_category": sampled_class,
             "training_category": category,
             "event_local_frame": item.get("training", {}).get("event_local_frame"),
+            "source_fps": item.get("training", {}).get("source_fps"),
+            "target_fps": item.get("training", {}).get("target_fps"),
+            "source_event_frame": item.get("training", {}).get("source_event_frame"),
+            "source_event_time_ms": item.get("training", {}).get("source_event_time_ms"),
+            "resampled_event_frame": item.get("training", {}).get("resampled_event_frame"),
+            "target_start_frame": item.get("training", {}).get("target_start_frame"),
             "event_valid": float((item.get("interaction_payload") or {}).get("event_valid", 0.0)),
             "chunk_mode": chunk_mode,
+            "chunk_index": item.get("training", {}).get("chunk_index"),
+            "history_corruption": item.get("training", {}).get("history_corruption", "clean"),
             "pose_source": pose_source,
             "invalid_event_retries": step_invalid_event_retries,
             "wah_lora_lr": next((group["lr"] for group in optimizer.param_groups if group["name"] == "wah_lora"), 0.0),
@@ -1117,6 +1229,7 @@ def main():
     )
     write_json(loss_path, losses)
     distribution_report = {
+        "training_profile": str(args.training_profile),
         "requested": step_sampler.report(args.max_steps),
         "counters": distribution_counts,
         "valid_positive_rate": {
@@ -1124,6 +1237,38 @@ def main():
             "mine": distribution_counts["valid_mine"] / max(distribution_counts["mine"], 1),
         },
     }
+    chunk_index_histogram = {}
+    history_corruption_counts = {}
+    event_local_frame_histogram = {}
+    for record in losses:
+        chunk_index = record.get("chunk_index")
+        if chunk_index is not None:
+            key = str(int(chunk_index))
+            chunk_index_histogram[key] = chunk_index_histogram.get(key, 0) + 1
+        corruption = str(record.get("history_corruption", "clean"))
+        history_corruption_counts[corruption] = history_corruption_counts.get(corruption, 0) + 1
+        event_local = record.get("event_local_frame")
+        if event_local is not None:
+            key = str(int(event_local))
+            event_local_frame_histogram[key] = event_local_frame_histogram.get(key, 0) + 1
+    distribution_report.update(
+        {
+            "first_chunk_steps": distribution_counts["camera_first"],
+            "later_chunk_steps": distribution_counts["camera_later"],
+            "two_chunk_rollout_steps": distribution_counts["camera_rollout"],
+            "chunk_index_histogram": chunk_index_histogram,
+            "history_corruption_counts": history_corruption_counts,
+            "pose_source_vpt_steps": distribution_counts["pose_vpt"],
+            "pose_source_pi3x_steps": distribution_counts["pose_pi3x"],
+            "sampled_place_steps": distribution_counts["place"],
+            "valid_place_steps": distribution_counts["valid_place"],
+            "sampled_mine_steps": distribution_counts["mine"],
+            "valid_mine_steps": distribution_counts["valid_mine"],
+            "sampled_negative_steps": distribution_counts["negative"],
+            "invalid_event_retries": distribution_counts["invalid_event_retries"],
+            "event_local_frame_histogram": event_local_frame_histogram,
+        }
+    )
     write_json(out_dir / "training_distribution_report.json", distribution_report)
     if tb_writer is not None:
         tb_writer.add_text("summary/prompt_cache_status", _json_text(items.prompt_cache_status_counts), args.max_steps)

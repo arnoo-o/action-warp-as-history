@@ -18,6 +18,8 @@ import torch.nn.functional as F
 from PIL import Image
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
+from safetensors import safe_open
+from safetensors.torch import load_file as load_safetensors_file
 from warp_as_history.training.loss_masks import valid_element_normalized_loss
 
 from diffusers import AutoencoderKLWan
@@ -32,6 +34,7 @@ from helios.modules.helios_kernels import (
     replace_rmsnorm_with_fp32,
     replace_rope_with_flash_rope,
 )
+from warp_as_history.pipeline import WarpAsHistoryPipeline
 
 NEGATIVE_PROMPT = (
     "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, "
@@ -164,7 +167,7 @@ def load_pipeline(args, device):
 
     vae = AutoencoderKLWan.from_pretrained(args.base_model_path, subfolder="vae", torch_dtype=torch.float32)
     scheduler = HeliosScheduler.from_pretrained(args.base_model_path, subfolder="scheduler")
-    pipe = HeliosPipeline.from_pretrained(
+    pipe = WarpAsHistoryPipeline.from_pretrained(
         args.base_model_path,
         transformer=transformer,
         vae=vae,
@@ -1103,6 +1106,9 @@ def visible_aux_state_dict(transformer):
     recipe = getattr(transformer, "_wah_recipe", None)
     if isinstance(recipe, dict):
         state["wah_recipe"] = dict(recipe)
+    initialization = getattr(transformer, "_wah_initialization", None)
+    if isinstance(initialization, dict):
+        state["wah_initialization"] = dict(initialization)
     return state
 
 
@@ -1951,6 +1957,24 @@ def load_visible_lora_state(transformer, checkpoint, adapter_name, *, load_inter
     peft_state = payload.get("peft")
     if not isinstance(peft_state, dict) or not peft_state:
         raise ValueError(f"Checkpoint has no PEFT LoRA state: {checkpoint}")
+    expected = get_peft_model_state_dict(transformer, adapter_name=adapter_name)
+    missing_state = sorted(set(expected) - set(peft_state))
+    unexpected_state = sorted(set(peft_state) - set(expected))
+    shape_mismatches = [
+        {
+            "key": key,
+            "checkpoint": tuple(peft_state[key].shape),
+            "model": tuple(expected[key].shape),
+        }
+        for key in sorted(set(expected) & set(peft_state))
+        if tuple(peft_state[key].shape) != tuple(expected[key].shape)
+    ]
+    if missing_state or unexpected_state or shape_mismatches:
+        raise ValueError(
+            "Camera checkpoint PEFT state is incompatible with the configured WAH LoRA: "
+            f"missing={missing_state[:8]}, unexpected={unexpected_state[:8]}, "
+            f"shape_mismatches={shape_mismatches[:4]}"
+        )
     incompatible = set_peft_model_state_dict(
         transformer,
         peft_state,
@@ -1970,8 +1994,107 @@ def load_visible_lora_state(transformer, checkpoint, adapter_name, *, load_inter
         "missing_keys": missing,
         "unexpected_keys": unexpected,
         "wah_recipe": extra_state.get("wah_recipe"),
+        "wah_initialization": extra_state.get("wah_initialization"),
         "interaction_loaded": bool(load_interaction),
     }
+
+
+def load_initial_wah_lora(transformer, checkpoint, adapter_name, args):
+    """Load an official WAH safetensors file into the one existing adapter."""
+    path = Path(checkpoint).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Required initial WAH LoRA is missing: {path}")
+    if path.suffix.lower() != ".safetensors":
+        raise ValueError("--init_wah_lora_path must point to the official .safetensors LoRA.")
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        metadata = dict(handle.metadata() or {})
+    loaded = load_safetensors_file(path, device="cpu")
+    expected = get_peft_model_state_dict(transformer, adapter_name=adapter_name)
+
+    def canonical_key(key):
+        value = str(key)
+        for prefix in ("transformer.", "base_model.model.", "module."):
+            if value.startswith(prefix):
+                value = value[len(prefix) :]
+        value = value.replace(f".{adapter_name}.", ".")
+        value = value.replace(".lora_A.default.", ".lora_A.")
+        value = value.replace(".lora_B.default.", ".lora_B.")
+        return value
+
+    loaded_by_canonical = {}
+    for key, value in loaded.items():
+        canonical = canonical_key(key)
+        if canonical in loaded_by_canonical:
+            raise ValueError(f"Duplicate official LoRA key after normalization: {canonical}")
+        loaded_by_canonical[canonical] = (key, value)
+    mapped = {}
+    missing = []
+    shape_mismatches = []
+    used_loaded = set()
+    for expected_key, expected_value in expected.items():
+        canonical = canonical_key(expected_key)
+        candidate = loaded_by_canonical.get(canonical)
+        if candidate is None:
+            missing.append(expected_key)
+            continue
+        source_key, source_value = candidate
+        if tuple(source_value.shape) != tuple(expected_value.shape):
+            shape_mismatches.append(
+                {
+                    "key": expected_key,
+                    "checkpoint": tuple(source_value.shape),
+                    "model": tuple(expected_value.shape),
+                }
+            )
+            continue
+        mapped[expected_key] = source_value
+        used_loaded.add(source_key)
+    unexpected = sorted(set(loaded) - used_loaded)
+    if missing or unexpected or shape_mismatches:
+        raise ValueError(
+            "Official WAH LoRA is incompatible with the configured adapter: "
+            f"missing={missing[:8]}, unexpected={unexpected[:8]}, shape_mismatches={shape_mismatches[:4]}"
+        )
+    inferred_ranks = {
+        int(value.shape[0])
+        for key, value in loaded.items()
+        if ".lora_A." in key or key.endswith(".lora_A.weight")
+    }
+    if inferred_ranks != {int(args.lora_rank)}:
+        raise ValueError(
+            f"Official WAH LoRA rank {sorted(inferred_ranks)} does not match --lora_rank {args.lora_rank}."
+        )
+    metadata_alpha = metadata.get("lora_alpha") or metadata.get("alpha")
+    if metadata_alpha is not None and int(float(metadata_alpha)) != int(args.lora_alpha):
+        raise ValueError(
+            f"Official WAH LoRA alpha {metadata_alpha} does not match --lora_alpha {args.lora_alpha}."
+        )
+    if metadata_alpha is None and int(args.lora_alpha) != int(args.lora_rank):
+        raise ValueError(
+            "Official checkpoint has no alpha metadata; require --lora_alpha == --lora_rank "
+            "to preserve the official unit scaling."
+        )
+    incompatible = set_peft_model_state_dict(transformer, mapped, adapter_name=adapter_name)
+    load_missing = list(getattr(incompatible, "missing_keys", []) or [])
+    load_unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
+    lora_load_missing = [key for key in load_missing if "lora_" in key]
+    if lora_load_missing or load_unexpected:
+        raise ValueError(
+            "PEFT rejected part of the official WAH LoRA: "
+            f"missing={lora_load_missing[:8]}, unexpected={load_unexpected[:8]}"
+        )
+    result = {
+        "source": "official_wah_lora",
+        "path": str(path),
+        "loaded_keys": len(mapped),
+        "missing_keys": load_missing,
+        "unexpected_keys": load_unexpected,
+        "rank": int(args.lora_rank),
+        "alpha": int(args.lora_alpha),
+        "target_modules": lora_target_modules(args),
+    }
+    transformer._wah_initialization = dict(result)
+    return result
 
 def schedule_multiplier(step, total_steps, schedule, final_ratio):
     if total_steps <= 1 or schedule == "constant":

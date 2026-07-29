@@ -15,7 +15,9 @@ DEFAULT_MINECRAFT_WAH_RECIPE = {
     "visible_token_threshold": 0.1,
     "amplify_first_chunk": False,
     "history_sizes": [16, 2, 1],
+    "history_positioning": "last_n_same_order",
     "pose_convention": "opencv_c2w_relative",
+    "vae_temporal_scale": 4,
 }
 
 
@@ -31,6 +33,8 @@ def minecraft_wah_recipe(**overrides):
     recipe["camera_multiply_translation_by_depth"] = bool(recipe["camera_multiply_translation_by_depth"])
     recipe["amplify_first_chunk"] = bool(recipe["amplify_first_chunk"])
     recipe["history_sizes"] = [int(value) for value in recipe["history_sizes"]]
+    recipe["history_positioning"] = str(recipe["history_positioning"])
+    recipe["vae_temporal_scale"] = int(recipe["vae_temporal_scale"])
     return recipe
 
 

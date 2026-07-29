@@ -74,7 +74,8 @@ class BidirectionalTrainingScheduleSmokeTest(unittest.TestCase):
     def test_requested_cli_defaults_are_stable(self):
         source = TRAIN_SCRIPT.read_text(encoding="utf-8")
         for declaration in (
-            'parser.add_argument("--base_train_steps", type=int, default=1500)',
+            'parser.add_argument("--base_train_steps", type=int, default=None)',
+            'args.base_train_steps = 1000 if str(args.training_profile) == "camera" else 1500',
             'parser.add_argument("--bidirectional_train_steps", type=int, default=1500)',
             'parser.add_argument("--bidirectional_interval", type=int, default=8)',
             'parser.add_argument("--bidirectional_feedback_weight", type=float, default=0.5)',
