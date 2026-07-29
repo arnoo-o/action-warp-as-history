@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-translation", type=float, default=3.0)
     parser.add_argument("--block-id", default="oak_planks")
     parser.add_argument("--include-jump", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--stationary", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
 
@@ -293,13 +294,26 @@ def main() -> None:
         }
     )
     controller = learn_controller(action_paths, float(args.fps))
-    poses, debug = build_trajectory(
-        controller,
-        num_frames=int(args.num_frames),
-        minimum_translation=float(args.minimum_translation),
-        event_frame=int(args.event_frame),
-        include_jump=bool(args.include_jump),
-    )
+    if bool(args.stationary):
+        poses = np.repeat(np.eye(4, dtype=np.float32)[None], int(args.num_frames), axis=0)
+        debug = [
+            {
+                "frame": frame,
+                "action": "idle",
+                "mouse_dx": 0.0,
+                "mouse_dy": 0.0,
+                "position": [0.0, 0.0, 0.0],
+            }
+            for frame in range(int(args.num_frames))
+        ]
+    else:
+        poses, debug = build_trajectory(
+            controller,
+            num_frames=int(args.num_frames),
+            minimum_translation=float(args.minimum_translation),
+            event_frame=int(args.event_frame),
+            include_jump=bool(args.include_jump),
+        )
     np.savez(
         output_dir / "camera_poses.npz",
         camera_poses=poses,
@@ -346,6 +360,7 @@ def main() -> None:
         "conditioning_event_frame": conditioning_event_frame,
         "event_time_seconds": float(args.event_frame) / float(args.fps),
         "include_jump": bool(args.include_jump),
+        "stationary": bool(args.stationary),
         "controller": controller,
     }
     print(json.dumps(summary, indent=2))
