@@ -825,7 +825,7 @@ def build_residual_teacher_components(
     visibility,
     world_valid_mask=None,
     interaction_payload=None,
-    teacher_support_threshold=0.05,
+    teacher_support_threshold=0.25,
     teacher_min_area_by_action=None,
     teacher_max_area=0.25,
     min_valid_pixels=8,

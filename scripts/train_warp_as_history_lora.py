@@ -566,7 +566,7 @@ def parse_args():
     parser.add_argument("--max_attempt_steps", type=int, default=15000)
     parser.add_argument("--interaction_router_loss_scale", type=float, default=0.05)
     parser.add_argument("--interaction_focus_scale", type=float, default=1.0)
-    parser.add_argument("--interaction_teacher_support_threshold", type=float, default=0.05)
+    parser.add_argument("--interaction_teacher_support_threshold", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=384)
     parser.add_argument("--width", type=int, default=640)

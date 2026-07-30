@@ -41,7 +41,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" PYTHONUNBUFFERED=1 "${PYTHON}" scripts/train_warp_
   --max_attempt_steps 15000 \
   --interaction_router_loss_scale 0.05 \
   --interaction_focus_scale 1.0 \
-  --interaction_teacher_support_threshold 0.05 \
+  --interaction_teacher_support_threshold 0.25 \
   --interaction_event_local_min 6 \
   --interaction_event_local_max 16 \
   --height 384 \

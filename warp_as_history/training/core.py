@@ -1786,7 +1786,7 @@ def flow_matching_loss_train_exact(
         teacher_tokens = F.interpolate(
             router_teacher_map.float(), size=raw_gate.shape[2:], mode="trilinear", align_corners=False
         ).clamp(0.0, 1.0)
-        support_threshold = float(getattr(args, "interaction_teacher_support_threshold", 0.05))
+        support_threshold = float(getattr(args, "interaction_teacher_support_threshold", 0.25))
         positive_tokens = (teacher_tokens > support_threshold).to(raw_gate) * valid_tokens
         negative_tokens = valid_tokens * (1.0 - (positive_tokens > 0).to(valid_tokens))
         if float(event_valid) > 0.0:
