@@ -1406,6 +1406,7 @@ class HeliosTransformer3DModel(
         semantic_dim=256,
         stage_warp_scales=(1.0, 0.5, 0.25),
         stage_adapter_scales=(1.0, 0.5, 0.25),
+        active_stages=(0,),
     ):
         if getattr(self, "interaction_conditioning", None) is None:
             self.interaction_conditioning = InteractionConditioningStack(
@@ -1414,6 +1415,7 @@ class HeliosTransformer3DModel(
                 rank=int(rank),
                 stage_warp_scales=stage_warp_scales,
                 stage_adapter_scales=stage_adapter_scales,
+                active_stages=active_stages,
             )
 
     def apply_interaction_conditioning(
@@ -1422,6 +1424,7 @@ class HeliosTransformer3DModel(
         raw_warp_latents,
         payload,
         visibility,
+        world_valid,
         temporal,
         height,
         width,
@@ -1441,6 +1444,7 @@ class HeliosTransformer3DModel(
             warp_tokens,
             payload,
             visibility,
+            world_valid,
             temporal,
             height,
             width,
@@ -1641,6 +1645,7 @@ class HeliosTransformer3DModel(
                         cur_warp,
                         interaction_conditioning["payload"],
                         cur_visibility,
+                        interaction_conditioning.get("world_valid"),
                         T,
                         H,
                         W,
@@ -1715,6 +1720,7 @@ class HeliosTransformer3DModel(
                     interaction_conditioning["warp_latents"],
                     interaction_conditioning["payload"],
                     interaction_conditioning.get("visibility"),
+                    interaction_conditioning.get("world_valid"),
                     T,
                     H,
                     W,

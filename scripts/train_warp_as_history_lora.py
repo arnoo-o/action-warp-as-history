@@ -8,6 +8,7 @@ import os
 import random
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 ENABLE_OPTIONAL_ATTENTION = str(os.environ.get("WAH_ENABLE_OPTIONAL_ATTENTION", "")).strip().lower() in {
@@ -85,6 +86,72 @@ from warp_as_history.training.utils import (
 )
 
 DEFAULT_HELIOS_MODEL = "checkpoints/helios-distilled"
+NEUTRAL_MINECRAFT_PROMPT = "Minecraft first-person gameplay."
+
+
+class InteractionJointSampler:
+    """Deterministic action-by-history quota plan for three 500-step curricula."""
+
+    ACTION_RATIOS = {
+        "place": 0.50,
+        "mine_active": 0.15,
+        "mine_complete": 0.15,
+        "negative": 0.20,
+    }
+    HISTORY_PHASES = (
+        {"first": 0.40, "later": 0.60},
+        {"first": 0.30, "later": 0.70},
+        {"first": 0.25, "later": 0.50, "generated": 0.25},
+    )
+
+    def __init__(self, source_pools, total_steps, seed):
+        if int(total_steps) != 1500:
+            raise ValueError("The validated interaction curriculum requires exactly 1500 effective steps.")
+        self.samplers = []
+        self.source_pools = {key: list(value) for key, value in source_pools.items()}
+        self.seed = int(seed)
+        self.offsets = (0, 500, 1000)
+        for phase_index, history_ratios in enumerate(self.HISTORY_PHASES):
+            pools = {}
+            ratios = {}
+            for action, action_ratio in self.ACTION_RATIOS.items():
+                if not source_pools.get(action):
+                    raise ValueError(f"Required interaction pool is empty: {action}.")
+                for history, history_ratio in history_ratios.items():
+                    key = f"{action}|{history}"
+                    pools[key] = list(source_pools[action])
+                    ratios[key] = float(action_ratio) * float(history_ratio)
+            self.samplers.append(
+                StepCategorySampler(pools, ratios, 500, int(seed) + phase_index * 10007)
+            )
+
+    def sample(self, effective_step):
+        effective_step = int(effective_step)
+        phase = min(effective_step // 500, 2)
+        local = effective_step - self.offsets[phase]
+        return self.samplers[phase].sample(local)
+
+    def sample_category(self, category, occurrence):
+        action = str(category).split("|", 1)[0]
+        pool = self.source_pools[action]
+        return pool[int(occurrence) % len(pool)]
+
+    def report(self, completed_steps):
+        completed_steps = min(max(int(completed_steps), 0), 1500)
+        reports = []
+        remaining = completed_steps
+        for sampler in self.samplers:
+            count = min(remaining, 500)
+            reports.append(sampler.report(count))
+            remaining -= count
+        actual = Counter()
+        for report in reports:
+            actual.update(report["actual_steps"])
+        return {
+            "target_effective_steps": 1500,
+            "completed_effective_steps": completed_steps,
+            "joint_actual_steps": dict(actual),
+        }
 
 
 def training_total_steps(base_train_steps, bidirectional_train_steps, enable_bidirectional_training):
@@ -113,9 +180,20 @@ def should_compute_bidirectional_feedback(
 
 def build_minecraft_step_sampler(df, args):
     """Create quota-exact pools before expensive Pi3X/latent preparation."""
-    source_pools = {"place": [], "mine": [], "movement": [], "negative": [], "other": []}
+    source_pools = {
+        "place": [],
+        "mine": [],
+        "mine_active": [],
+        "mine_complete": [],
+        "movement": [],
+        "negative": [],
+        "other": [],
+    }
     for position, (_, row) in enumerate(df.iterrows()):
         category = str(row.get("training_category", row.get("category", "movement"))).strip().lower()
+        action_type = str(row.get("action_type", "") or "").strip().lower()
+        if category == "mine" and action_type in {"mine_active", "mine_complete"}:
+            source_pools[action_type].append(int(position))
         source_pools[category if category in source_pools else "other"].append(int(position))
     profile = str(args.training_profile)
     if profile == "camera":
@@ -125,6 +203,12 @@ def build_minecraft_step_sampler(df, args):
             "camera_rollout": list(source_pools["movement"]),
         }
         ratios = {"camera_first": 0.25, "camera_later": 0.55, "camera_rollout": 0.20}
+    elif profile == "interaction":
+        sampler = InteractionJointSampler(source_pools, args.max_steps, args.seed)
+        return sampler, {
+            "pool_sizes": {name: len(values) for name, values in source_pools.items()},
+            **sampler.report(0),
+        }
     else:
         pools = {
             "place": source_pools["place"],
@@ -151,6 +235,8 @@ def distribution_counts_from_losses(losses):
     counts = {
         "place": 0,
         "mine": 0,
+        "mine_active": 0,
+        "mine_complete": 0,
         "negative": 0,
         "camera_first": 0,
         "camera_later": 0,
@@ -281,6 +367,8 @@ def save_training_state(
     refined_teacher_cache,
     losses,
     distribution_counts=None,
+    attempt_step=0,
+    skipped_invalid_step=0,
 ):
     trainable_state = {
         name: parameter.detach().cpu()
@@ -289,7 +377,7 @@ def save_training_state(
     }
     completed_step = max(int(global_step) - 1, 0)
     payload = {
-        "training_state_version": 2,
+        "training_state_version": 3,
         "trainable_state": trainable_state,
         "optimizer": optimizer.state_dict(),
         "global_step": int(global_step),
@@ -307,6 +395,8 @@ def save_training_state(
         "wah_recipe": dict(getattr(transformer, "_wah_recipe", {}) or {}),
         "wah_initialization": dict(getattr(transformer, "_wah_initialization", {}) or {}),
         "distribution_counts": dict(distribution_counts or {}),
+        "attempt_step": int(attempt_step),
+        "skipped_invalid_step": int(skipped_invalid_step),
         "refined_teacher_cache": {
             key: value.detach().cpu() for key, value in refined_teacher_cache.items()
         },
@@ -412,6 +502,8 @@ def load_training_state(path, *, transformer, optimizer, device):
         "training_profile": str(payload.get("training_profile", "joint")),
         "wah_recipe": dict(payload.get("wah_recipe", {}) or {}),
         "wah_initialization": dict(payload.get("wah_initialization", {}) or {}),
+        "attempt_step": int(payload.get("attempt_step", 0)),
+        "skipped_invalid_step": int(payload.get("skipped_invalid_step", 0)),
     }
 
 
@@ -471,6 +563,10 @@ def parse_args():
     parser.add_argument("--lr_schedule_final_ratio", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=20)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--max_attempt_steps", type=int, default=15000)
+    parser.add_argument("--interaction_router_loss_scale", type=float, default=0.05)
+    parser.add_argument("--interaction_focus_scale", type=float, default=1.0)
+    parser.add_argument("--interaction_teacher_support_threshold", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=384)
     parser.add_argument("--width", type=int, default=640)
@@ -586,6 +682,7 @@ def parse_args():
     parser.add_argument("--lora_target_modules", default="attn1.to_q,attn1.to_k,attn1.to_v,attn1.to_out.0")
     parser.add_argument("--lora_adapter_name", default="warp_as_history")
     parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--save_steps", type=int, nargs="*", default=[300, 500, 750, 1000, 1500])
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tensorboard_log_dir", default="")
@@ -660,6 +757,10 @@ def build_exact_args(args):
     exact.interaction_router_spatial_loss_scale = float(args.interaction_router_spatial_loss_scale)
     exact.interaction_router_negative_loss_scale = float(args.interaction_router_negative_loss_scale)
     exact.interaction_router_sparsity_loss_scale = float(args.interaction_router_sparsity_loss_scale)
+    exact.interaction_router_loss_scale = float(args.interaction_router_loss_scale)
+    exact.interaction_focus_scale = float(args.interaction_focus_scale)
+    exact.interaction_teacher_support_threshold = float(args.interaction_teacher_support_threshold)
+    exact.interaction_active_stages = [0]
     exact.base_train_steps = int(args.base_train_steps)
     exact.bidirectional_train_steps = int(args.bidirectional_train_steps)
     exact.enable_bidirectional_training = bool(args.enable_bidirectional_training)
@@ -777,6 +878,10 @@ def main():
     df, training_meta = normalize_online_training_dataframe(df, exact_args)
     if df.empty:
         raise ValueError(f"No training rows loaded from {args.prompt_csv}")
+    if str(args.training_profile) == "interaction":
+        prompts = {str(value).strip() for value in df["prompt"].tolist()}
+        if prompts != {NEUTRAL_MINECRAFT_PROMPT}:
+            raise ValueError(f"Interaction training requires the exact neutral prompt, got {sorted(prompts)}.")
     exact_args.online_warp_cache = build_online_warp_training_cache(df, exact_args, device)
     step_sampler, sampler_meta = build_minecraft_step_sampler(df, args)
     skipped_rows = []
@@ -938,6 +1043,8 @@ def main():
     profile = str(args.training_profile)
     wah_params = []
     interaction_params = []
+    interaction_router_params = []
+    interaction_other_params = []
     for param in lora_params:
         name = named_params.get(id(param), "")
         is_interaction = name.startswith("interaction_conditioning.") or ".interaction_conditioning." in name
@@ -946,7 +1053,14 @@ def main():
         )
         param.requires_grad_(should_train)
         if param.requires_grad:
-            (interaction_params if is_interaction else wah_params).append(param)
+            if is_interaction:
+                interaction_params.append(param)
+                if ".router." in name:
+                    interaction_router_params.append(param)
+                else:
+                    interaction_other_params.append(param)
+            else:
+                wah_params.append(param)
     if profile == "camera" and interaction_params:
         raise RuntimeError("Camera profile must not train interaction parameters.")
     if profile == "interaction" and wah_params:
@@ -957,8 +1071,24 @@ def main():
     groups = []
     if wah_params:
         groups.append({"params": wah_params, "lr": wah_lora_lr, "base_lr": wah_lora_lr, "name": "wah_lora"})
-    if interaction_params:
-        groups.append({"params": interaction_params, "lr": interaction_lr, "base_lr": interaction_lr, "name": "interaction"})
+    if interaction_other_params:
+        groups.append(
+            {
+                "params": interaction_other_params,
+                "lr": interaction_lr,
+                "base_lr": interaction_lr,
+                "name": "interaction",
+            }
+        )
+    if interaction_router_params:
+        groups.append(
+            {
+                "params": interaction_router_params,
+                "lr": 5.0e-5,
+                "base_lr": 5.0e-5,
+                "name": "interaction_router",
+            }
+        )
     optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
 
     losses = []
@@ -1015,36 +1145,110 @@ def main():
         raise ValueError(f"Checkpoint step {start_step} exceeds configured total steps {args.max_steps}.")
     start_time = time.perf_counter()
     distribution_counts = distribution_counts_from_losses(losses)
-    for step in tqdm(range(start_step, args.max_steps), desc="train shared lora"):
+    effective_optimizer_step = int(start_step)
+    attempt_step = int(resume_state.get("attempt_step", 0)) if args.resume_from_checkpoint is not None else 0
+    skipped_invalid_step = (
+        int(resume_state.get("skipped_invalid_step", 0)) if args.resume_from_checkpoint is not None else 0
+    )
+    progress = tqdm(total=args.max_steps, initial=start_step, desc="train shared lora")
+    while effective_optimizer_step < int(args.max_steps):
+        if attempt_step >= int(args.max_attempt_steps):
+            raise RuntimeError(
+                f"Reached max_attempt_steps={args.max_attempt_steps} after "
+                f"{effective_optimizer_step} effective optimizer steps; "
+                f"skipped_invalid_step={skipped_invalid_step}."
+            )
+        step = int(effective_optimizer_step)
+        attempt_step += 1
         sampled_class, item_idx = step_sampler.sample(step)
+        if "|" in sampled_class:
+            sampled_action, sampled_history = sampled_class.split("|", 1)
+            item_idx = step_sampler.sample_category(sampled_class, step + attempt_step - 1)
+        else:
+            sampled_action, sampled_history = sampled_class, None
         item = None
         step_invalid_event_retries = 0
         for retry in range(8):
             try:
                 requested_category = (
-                    "movement" if sampled_class.startswith("camera_") else sampled_class
+                    "movement"
+                    if sampled_class.startswith("camera_")
+                    else "mine"
+                    if sampled_action in {"mine_active", "mine_complete"}
+                    else sampled_action
                 )
                 requested_chunk_mode = (
-                    sampled_class if sampled_class.startswith("camera_") else None
+                    sampled_class
+                    if sampled_class.startswith("camera_")
+                    else f"interaction_{sampled_history}"
+                    if sampled_history is not None
+                    else None
                 )
                 item = items.get(
                     item_idx,
                     requested_category=requested_category,
                     requested_chunk_mode=requested_chunk_mode,
                 )
+                if (
+                    sampled_action in {"place", "mine_active", "mine_complete"}
+                    and not bool(item.get("interaction_teacher_valid", False))
+                    and retry < 4
+                ):
+                    distribution_counts["invalid_event_retries"] += 1
+                    step_invalid_event_retries += 1
+                    print(
+                        json.dumps(
+                            {
+                                "event": "teacher_invalid_retry",
+                                "effective_optimizer_step": step,
+                                "category": sampled_class,
+                                "seq": item.get("seq"),
+                                "reasons": item.get("interaction_teacher_invalid_reasons"),
+                            }
+                        ),
+                        flush=True,
+                    )
+                    item_idx = step_sampler.sample_category(sampled_class, step + attempt_step + retry)
+                    continue
                 break
             except (RuntimeError, ValueError) as exc:
-                if sampled_class not in {"place", "mine", "camera_rollout"} or retry == 7:
+                if (
+                    sampled_action not in {"place", "mine_active", "mine_complete"}
+                    and sampled_class != "camera_rollout"
+                ) or retry == 7:
                     raise
-                if sampled_class in {"place", "mine"}:
+                if sampled_action in {"place", "mine_active", "mine_complete"}:
                     distribution_counts["invalid_event_retries"] += 1
                     step_invalid_event_retries += 1
                 item_idx = step_sampler.sample_category(sampled_class, step + retry + 1)
                 print(json.dumps({"event": "invalid_interaction_retry", "step": step, "category": sampled_class, "reason": str(exc)}), flush=True)
         if item is None:
             raise RuntimeError("Failed to prepare a sampled training item.")
+        is_positive_interaction = sampled_action in {"place", "mine_active", "mine_complete"}
+        if is_positive_interaction and not bool(item.get("interaction_teacher_valid", False)):
+            skipped_invalid_step += 1
+            distribution_counts["invalid_event_retries"] += 1
+            print(
+                json.dumps(
+                    {
+                        "event": "teacher_invalid_skip",
+                        "attempt_step": attempt_step,
+                        "effective_optimizer_step": effective_optimizer_step,
+                        "sampled_class": sampled_class,
+                        "seq": item.get("seq"),
+                        "teacher_area_ratio": item.get("interaction_teacher_area_ratio"),
+                        "teacher_visibility_ratio": item.get("interaction_teacher_visibility_ratio"),
+                        "reasons": item.get("interaction_teacher_invalid_reasons"),
+                    }
+                ),
+                flush=True,
+            )
+            del item
+            release_cuda_cache()
+            continue
         category = str(item.get("training_category", item.get("training", {}).get("training_category", "other")))
-        distribution_counts[sampled_class] += 1
+        if sampled_action in distribution_counts:
+            distribution_counts[sampled_action] += 1
         if category == "movement":
             distribution_counts["movement"] += 1
         if category in {"place", "mine"} and float((item.get("interaction_payload") or {}).get("event_valid", 0.0)) == 1.0:
@@ -1137,7 +1341,10 @@ def main():
         pipe.transformer.set_adapter(adapter_name)
 
         record = {
-            "step": int(step),
+            "step": int(step + 1),
+            "effective_optimizer_step": int(step + 1),
+            "attempt_step": int(attempt_step),
+            "skipped_invalid_step": int(skipped_invalid_step),
             "training_stage": training_stage,
             "base_completed_steps": min(int(step + 1), int(args.base_train_steps)),
             "bidirectional_completed_steps": max(int(step + 1) - int(args.base_train_steps), 0),
@@ -1154,7 +1361,9 @@ def main():
             "max_grad_norm": float(args.max_grad_norm),
             "grad_norm": scalar(grad_norm) if grad_norm is not None else None,
             "elapsed_s": time.perf_counter() - start_time,
-            "sampled_category": sampled_class,
+            "sampled_category": sampled_action,
+            "sampled_joint_class": sampled_class,
+            "sampled_history_type": sampled_history,
             "training_category": category,
             "event_local_frame": item.get("training", {}).get("event_local_frame"),
             "source_fps": item.get("training", {}).get("source_fps"),
@@ -1164,6 +1373,11 @@ def main():
             "resampled_event_frame": item.get("training", {}).get("resampled_event_frame"),
             "target_start_frame": item.get("training", {}).get("target_start_frame"),
             "event_valid": float((item.get("interaction_payload") or {}).get("event_valid", 0.0)),
+            "action_type": str((item.get("interaction_payload") or {}).get("action_type", "none")),
+            "block_id": (item.get("interaction_payload") or {}).get("block_id"),
+            "teacher_valid": bool(item.get("interaction_teacher_valid", False)),
+            "teacher_area_ratio": item.get("interaction_teacher_area_ratio"),
+            "teacher_visibility_ratio": item.get("interaction_teacher_visibility_ratio"),
             "chunk_mode": chunk_mode,
             "chunk_index": item.get("training", {}).get("chunk_index"),
             "history_corruption": item.get("training", {}).get("history_corruption", "clean"),
@@ -1178,7 +1392,9 @@ def main():
         tensorboard_log_record(tb_writer, record, step)
 
         do_log = args.log_every > 0 and ((step + 1) % args.log_every == 0 or step == 0)
-        do_save = args.save_every > 0 and (step + 1) % args.save_every == 0
+        do_save = (step + 1) in set(int(value) for value in args.save_steps) or (
+            args.save_every > 0 and (step + 1) % args.save_every == 0
+        )
         if do_log:
             if (step + 1) % 100 == 0:
                 print(
@@ -1213,13 +1429,18 @@ def main():
                 refined_teacher_cache=refined_teacher_cache,
                 losses=losses,
                 distribution_counts=distribution_counts,
+                attempt_step=attempt_step,
+                skipped_invalid_step=skipped_invalid_step,
             )
 
         del loss, stats, item, interaction_feedback
         if grad_norm is not None:
             del grad_norm
         release_cuda_cache()
+        effective_optimizer_step += 1
+        progress.update(1)
 
+    progress.close()
     save_lora(pipe, out_dir, adapter_name, "visible_lora_state.pt")
     save_training_state(
         out_dir / "training_state.pt",
@@ -1230,6 +1451,8 @@ def main():
         refined_teacher_cache=refined_teacher_cache,
         losses=losses,
         distribution_counts=distribution_counts,
+        attempt_step=attempt_step,
+        skipped_invalid_step=skipped_invalid_step,
     )
     write_json(loss_path, losses)
     distribution_report = {

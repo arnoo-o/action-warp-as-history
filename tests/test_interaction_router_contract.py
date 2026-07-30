@@ -75,6 +75,8 @@ class InteractionRouterTorchTest(unittest.TestCase):
             "event_frames": TORCH.tensor([event_frame]),
             "total_frames": TORCH.tensor([5.0]),
             "event_valid": TORCH.tensor([event_valid]),
+            "frame_action_mask": TORCH.tensor([[0.0, 1.0, 1.0, 1.0, 1.0]]),
+            "frame_progress_curve": TORCH.zeros(1, 5),
         }
 
     def test_block_ids_change_semantic_condition(self):
@@ -84,7 +86,6 @@ class InteractionRouterTorchTest(unittest.TestCase):
             self.payload(11)["block_ids"],
             self.payload(11)["event_frames"],
             self.payload(11)["total_frames"],
-            self.payload(11)["event_valid"],
         )
         second_payload = self.payload(12)
         second = encoder(
@@ -92,7 +93,6 @@ class InteractionRouterTorchTest(unittest.TestCase):
             second_payload["block_ids"],
             second_payload["event_frames"],
             second_payload["total_frames"],
-            second_payload["event_valid"],
         )
         self.assertFalse(TORCH.allclose(first, second))
 
@@ -104,6 +104,7 @@ class InteractionRouterTorchTest(unittest.TestCase):
             self.target.to(dtype=TORCH.bfloat16),
             self.warp.to(dtype=TORCH.bfloat16),
             self.payload(),
+            self.visibility,
             self.visibility,
             temporal=2,
             height=2,
@@ -118,6 +119,7 @@ class InteractionRouterTorchTest(unittest.TestCase):
             self.warp.to(dtype=TORCH.bfloat16),
             self.payload(),
             self.visibility,
+            self.visibility,
             temporal=2,
             height=2,
             width=2,
@@ -126,21 +128,34 @@ class InteractionRouterTorchTest(unittest.TestCase):
         self.assertEqual(debug["predicted_gate"].dtype, TORCH.float32)
 
     def test_event_frame_changes_router_temporal_output(self):
-        _, first = self.stack(self.target, self.warp, self.payload(event_frame=0.0), self.visibility, 2, 2, 2)
-        _, second = self.stack(self.target, self.warp, self.payload(event_frame=4.0), self.visibility, 2, 2, 2)
+        _, first = self.stack(
+            self.target, self.warp, self.payload(event_frame=0.0), self.visibility, self.visibility, 2, 2, 2
+        )
+        _, second = self.stack(
+            self.target, self.warp, self.payload(event_frame=4.0), self.visibility, self.visibility, 2, 2, 2
+        )
         self.assertFalse(TORCH.allclose(first["predicted_gate"], second["predicted_gate"]))
 
     def test_no_event_gate_is_zero(self):
         _, debug = self.stack(
-            self.target, self.warp, self.payload(event_valid=0.0), self.visibility, 2, 2, 2
+            self.target,
+            self.warp,
+            self.payload(event_valid=0.0),
+            self.visibility,
+            self.visibility,
+            2,
+            2,
+            2,
         )
         self.assertEqual(float(debug["predicted_gate"].abs().max()), 0.0)
+        self.assertGreater(float(debug["raw_gate"].abs().max()), 0.0)
 
     def test_adapter_switch_preserves_router_and_disables_only_injection(self):
         enabled_output, enabled_debug = self.stack(
             self.target,
             self.warp,
             self.payload(),
+            self.visibility,
             self.visibility,
             2,
             2,
@@ -151,6 +166,7 @@ class InteractionRouterTorchTest(unittest.TestCase):
             self.target,
             self.warp,
             self.payload(),
+            self.visibility,
             self.visibility,
             2,
             2,

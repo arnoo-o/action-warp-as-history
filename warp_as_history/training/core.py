@@ -1102,6 +1102,7 @@ def visible_aux_state_dict(transformer):
             "semantic_dim": int(interaction_conditioning.semantic_encoder.semantic_dim),
             "stage_warp_scales": interaction_conditioning.stage_warp_scales.detach().cpu().tolist(),
             "stage_adapter_scales": interaction_conditioning.stage_adapter_scales.detach().cpu().tolist(),
+            "active_stages": list(interaction_conditioning.active_stages),
         }
     recipe = getattr(transformer, "_wah_recipe", None)
     if isinstance(recipe, dict):
@@ -1125,6 +1126,7 @@ def ensure_interaction_conditioning(
     semantic_dim=256,
     stage_warp_scales=(1.0, 0.5, 0.25),
     stage_adapter_scales=(1.0, 0.5, 0.25),
+    active_stages=(0,),
 ):
     if getattr(transformer, "interaction_conditioning", None) is None:
         transformer.enable_interaction_conditioning(
@@ -1132,6 +1134,7 @@ def ensure_interaction_conditioning(
             semantic_dim=semantic_dim,
             stage_warp_scales=stage_warp_scales,
             stage_adapter_scales=stage_adapter_scales,
+            active_stages=active_stages,
         )
     transformer.interaction_conditioning.to(device=transformer.device, dtype=transformer.dtype)
     return transformer.interaction_conditioning
@@ -1345,6 +1348,9 @@ def save_interaction_debug(
     debug_items = list(debug_items)
     for index, debug in enumerate(debug_items):
         stage_id = int(debug.get("stage_id", index))
+        raw_gate = debug["raw_gate"].detach().float().cpu()
+        final_gate = debug["final_gate"].detach().float().cpu()
+        raw_delta = debug["raw_delta_map"].detach().float().cpu()
         predicted = debug["predicted_gate"].detach().float().cpu()
         injection = debug["interaction_injection_map"].detach().float().cpu()
         teacher = F.interpolate(
@@ -1354,11 +1360,26 @@ def save_interaction_debug(
             align_corners=False,
         )
         save_map(f"residual_teacher_map_stage{stage_id}.png", teacher)
+        save_map(f"raw_gate_stage{stage_id}.png", raw_gate)
+        save_map(f"final_gate_stage{stage_id}.png", final_gate)
+        save_map(f"raw_delta_stage{stage_id}.png", raw_delta)
         save_map(f"predicted_gate_stage{stage_id}.png", predicted)
         save_map(f"interaction_injection_map_stage{stage_id}.png", injection)
         np.save(output_dir / f"residual_teacher_map_stage{stage_id}.npy", teacher.numpy())
+        np.save(output_dir / f"raw_gate_stage{stage_id}.npy", raw_gate.numpy())
+        np.save(output_dir / f"final_gate_stage{stage_id}.npy", final_gate.numpy())
+        np.save(output_dir / f"raw_delta_stage{stage_id}.npy", raw_delta.numpy())
         np.save(output_dir / f"predicted_gate_stage{stage_id}.npy", predicted.numpy())
         np.save(output_dir / f"interaction_injection_map_stage{stage_id}.npy", injection.numpy())
+        curves = {
+            "raw_gate": raw_gate.mean(dim=(0, 1, 3, 4)).tolist(),
+            "final_gate": final_gate.mean(dim=(0, 1, 3, 4)).tolist(),
+            "raw_delta_rms": raw_delta.square().mean(dim=(0, 1, 3, 4)).sqrt().tolist(),
+            "final_injection_rms": injection.square().mean(dim=(0, 1, 3, 4)).sqrt().tolist(),
+            "teacher": teacher.mean(dim=(0, 1, 3, 4)).tolist(),
+        }
+        with (output_dir / f"temporal_curves_stage{stage_id}.json").open("w", encoding="utf-8") as handle:
+            json.dump(curves, handle, indent=2)
     debug = debug_items[-1]
     predicted = debug["predicted_gate"].detach().float().cpu()
     injection = debug["interaction_injection_map"].detach().float().cpu()
@@ -1475,6 +1496,7 @@ def pyramid_stage_model_forward(
                     "payload": stage_interaction["payload"],
                     "warp_latents": stage_interaction["warp_latents"][index],
                     "visibility": stage_interaction["visibility"][index],
+                    "world_valid": stage_interaction.get("world_valid"),
                     "stage_id": stage_id,
                     "previous_gate": previous_gate,
                 }
@@ -1509,6 +1531,54 @@ def pyramid_stage_model_forward(
     return predictions, debug_items
 
 
+def _interaction_latent_valid_region(interaction_conditioning, target_shape, device):
+    """Align controllable RGB-frame/world signals to a flow-error latent grid."""
+    if interaction_conditioning is None:
+        return None
+    temporal, height, width = (int(value) for value in target_shape)
+    payload = interaction_conditioning["payload"]
+    frame_mask = payload.get("frame_action_mask")
+    if frame_mask is None:
+        return None
+    frame_mask = torch.as_tensor(frame_mask, device=device, dtype=torch.float32)
+    if frame_mask.ndim == 1:
+        frame_mask = frame_mask.unsqueeze(0)
+    frame_count = int(frame_mask.shape[1])
+    pooled = []
+    for latent_index in range(temporal):
+        start = int(math.floor(latent_index * frame_count / temporal))
+        end = max(int(math.ceil((latent_index + 1) * frame_count / temporal)), start + 1)
+        pooled.append(frame_mask[:, start:end].amax(dim=1))
+    action = torch.stack(pooled, dim=1).view(frame_mask.shape[0], 1, temporal, 1, 1)
+    visibility = interaction_conditioning.get("visibility")
+    if visibility is None:
+        visibility = torch.ones(
+            frame_mask.shape[0], 1, temporal, height, width, device=device, dtype=torch.float32
+        )
+    else:
+        visibility = F.adaptive_avg_pool3d(
+            visibility.to(device=device, dtype=torch.float32), (temporal, height, width)
+        ).clamp(0.0, 1.0)
+    world = interaction_conditioning.get("world_valid")
+    if world is None:
+        world = torch.ones_like(visibility)
+    else:
+        world = (
+            F.adaptive_avg_pool3d(
+                world.to(device=device, dtype=torch.float32), (temporal, height, width)
+            )
+            >= 0.999
+        ).to(visibility)
+    return action * visibility * world
+
+
+def _masked_per_sample_mean(values, mask):
+    expanded = mask.expand_as(values)
+    numerator = (values * expanded).flatten(1).sum(dim=1)
+    denominator = expanded.flatten(1).sum(dim=1)
+    return numerator / denominator.clamp_min(1.0), denominator
+
+
 def flow_matching_loss_train_exact(
     pipe,
     prompt_embeds,
@@ -1529,6 +1599,7 @@ def flow_matching_loss_train_exact(
 ):
     stage_items = flow_matching_train_exact_items(pipe, target_latents, args, device)
     stage_losses = []
+    stage_flow_errors = []
     stage_ids = [int(item["stage_id"]) for item in stage_items]
     stats = {
         "flow_matching_mode": "train_exact",
@@ -1574,6 +1645,7 @@ def flow_matching_loss_train_exact(
             "payload": interaction_conditioning["payload"],
             "warp_latents": [warp_pyramid[sid] for sid in stage_ids],
             "visibility": [visibility_pyramid[sid] for sid in stage_ids],
+            "world_valid": interaction_conditioning.get("world_valid"),
         }
     stage_target_channel_fusion = (
         [
@@ -1670,6 +1742,7 @@ def flow_matching_loss_train_exact(
             elif bool(getattr(args, "use_primary_fire_focus_loss", False)):
                 stats[f"focus_mask_warning_stage{stage_id}"] = "empty_mask_fallback"
         loss_map = weighting.float() * (cur_model_pred.float() - target.float()) ** 2
+        stage_flow_errors.append((cur_model_pred.float() - target.float()) ** 2)
         if world_mask_now is not None:
             loss_map = loss_map * world_mask_now
         stage_loss = world_valid_normalized_loss(loss_map, world_mask_now)
@@ -1697,89 +1770,78 @@ def flow_matching_loss_train_exact(
         stats[f"timestep_stage{stage_id}"] = item["timesteps"].detach().float().mean()
         stats[f"timestep_index_stage{stage_id}"] = item["indices"].float().mean()
 
-    # Stagewise forward is required so PEFT can be active only on the coarse stage.
-    # The optimization objective remains the mean of the three Helios pyramid losses.
-    total_loss = torch.stack(stage_losses).mean()
+    stage0_index = stage_ids.index(0) if 0 in stage_ids else 0
+    total_loss = stage_losses[stage0_index]
+    stats["stage0_weighted_flow"] = total_loss.detach()
     interaction_aux_loss = None
     router_teacher_map = refined_teacher_map if refined_teacher_map is not None else interaction_teacher_map
     if router_teacher_map is not None and stage_interaction is not None:
         debug_items = enabled_interaction_debug
-        teacher_pyramid = training_exact_pyramid_latents(
-            router_teacher_map, len(args.pyramid_num_inference_steps_list)
-        )
         event_valid = stage_interaction["payload"]["event_valid"].float().mean()
-        temporal_losses = []
-        spatial_losses = []
-        negative_losses = []
-        sparse_losses = []
-        consistency_losses = []
-        previous_predicted_gate = None
-        for debug, stage_id in zip(debug_items, stage_ids):
-            predicted_gate = debug["predicted_gate"].float()
-            teacher = teacher_pyramid[stage_id].float()
-            teacher = F.interpolate(teacher, size=predicted_gate.shape[2:], mode="trilinear", align_corners=False)
-            teacher = teacher.clamp(0.0, 1.0)
-            teacher_support = (teacher > 0.05).to(predicted_gate)
-            teacher_area = teacher_support.mean()
-            support_elements = teacher_support.sum().clamp_min(1.0)
-            outside_support = 1.0 - teacher_support
-            outside_elements = outside_support.sum().clamp_min(1.0)
-            temporal_teacher = teacher.mean(dim=(-1, -2))
-            temporal_pred = predicted_gate.mean(dim=(-1, -2))
-            temporal_losses.append(F.mse_loss(temporal_pred, temporal_teacher) * event_valid)
-            spatial_losses.append(F.binary_cross_entropy(predicted_gate.clamp(1e-5, 1.0 - 1e-5), teacher) * event_valid)
-            negative_losses.append(predicted_gate.mean() * (1.0 - event_valid))
-            sparse_losses.append(predicted_gate.mean())
-            if previous_predicted_gate is not None:
-                previous_resized = F.interpolate(
-                    previous_predicted_gate,
-                    size=predicted_gate.shape[2:],
-                    mode="trilinear",
-                    align_corners=False,
-                )
-                consistency_losses.append(F.smooth_l1_loss(predicted_gate, previous_resized) * event_valid)
-                stats[f"interaction_cross_stage_consistency_stage{stage_id}"] = (
-                    consistency_losses[-1].detach()
-                )
-            previous_predicted_gate = predicted_gate
-            stats[f"interaction_gate_mean_stage{stage_id}"] = predicted_gate.detach().mean()
-            stats[f"interaction_teacher_mean_stage{stage_id}"] = teacher.detach().mean()
-            stats[f"teacher_mask_area_ratio_stage{stage_id}"] = teacher_area.detach()
-            stats[f"gate_inside_teacher_stage{stage_id}"] = (
-                (predicted_gate * teacher_support).sum() / support_elements
-            ).detach()
-            stats[f"gate_outside_teacher_stage{stage_id}"] = (
-                (predicted_gate * outside_support).sum() / outside_elements
-            ).detach()
-            if float(teacher_area.detach().cpu()) == 0.0:
-                stats[f"interaction_teacher_warning_stage{stage_id}"] = "empty_teacher_mask"
-            elif float(teacher_area.detach().cpu()) > 0.5:
-                stats[f"interaction_teacher_warning_stage{stage_id}"] = "teacher_mask_exceeds_50_percent"
-        if temporal_losses:
-            temporal_loss = torch.stack(temporal_losses).mean()
-            spatial_loss = torch.stack(spatial_losses).mean()
-            negative_loss = torch.stack(negative_losses).mean()
-            sparsity_loss = torch.stack(sparse_losses).mean()
-            consistency_loss = (
-                torch.stack(consistency_losses).mean()
-                if consistency_losses
-                else torch.zeros((), device=temporal_loss.device, dtype=temporal_loss.dtype)
+        debug = debug_items[stage0_index]
+        raw_gate = debug["raw_gate"].float().clamp(1.0e-5, 1.0 - 1.0e-5)
+        final_gate = debug["final_gate"].float()
+        valid_tokens = debug["valid_injection_region"].float()
+        world_tokens = debug["world_valid_region"].float()
+        teacher_tokens = F.interpolate(
+            router_teacher_map.float(), size=raw_gate.shape[2:], mode="trilinear", align_corners=False
+        ).clamp(0.0, 1.0)
+        support_threshold = float(getattr(args, "interaction_teacher_support_threshold", 0.05))
+        positive_tokens = (teacher_tokens > support_threshold).to(raw_gate) * valid_tokens
+        negative_tokens = valid_tokens * (1.0 - (positive_tokens > 0).to(valid_tokens))
+        if float(event_valid) > 0.0:
+            positive_bce = (
+                -(raw_gate.log()) * positive_tokens
+            ).sum() / positive_tokens.sum().clamp_min(1.0)
+            negative_bce = (
+                -(1.0 - raw_gate).log() * negative_tokens
+            ).sum() / negative_tokens.sum().clamp_min(1.0)
+            balanced_bce = 0.5 * (positive_bce + negative_bce)
+            dice_numerator = 2.0 * (raw_gate * teacher_tokens * valid_tokens).sum()
+            dice_denominator = (raw_gate * valid_tokens).sum() + (teacher_tokens * valid_tokens).sum()
+            dice_loss = 1.0 - (dice_numerator + 1.0e-6) / (dice_denominator + 1.0e-6)
+            interaction_aux_loss = balanced_bce + 0.5 * dice_loss
+
+            stage0_error = stage_flow_errors[stage0_index]
+            latent_teacher = F.interpolate(
+                router_teacher_map.float(), size=stage0_error.shape[2:], mode="trilinear", align_corners=False
+            ).clamp(0.0, 1.0)
+            latent_valid = _interaction_latent_valid_region(
+                interaction_conditioning, stage0_error.shape[2:], stage0_error.device
             )
-            interaction_aux_loss = (
-                float(getattr(args, "interaction_router_temporal_loss_scale", 1.0)) * temporal_loss
-                + float(getattr(args, "interaction_router_spatial_loss_scale", 1.0)) * spatial_loss
-                + float(getattr(args, "interaction_router_negative_loss_scale", 0.25)) * negative_loss
-                + float(getattr(args, "interaction_router_sparsity_loss_scale", 0.01)) * sparsity_loss
-                + float(getattr(args, "interaction_cross_stage_consistency_loss_scale", 0.1))
-                * consistency_loss
-            )
-            total_loss = total_loss + interaction_aux_loss
-            stats["interaction_temporal_alignment_loss"] = temporal_loss.detach()
-            stats["interaction_spatial_mask_loss"] = spatial_loss.detach()
-            stats["interaction_negative_loss"] = negative_loss.detach()
-            stats["interaction_sparsity_loss"] = sparsity_loss.detach()
-            stats["interaction_cross_stage_consistency_loss"] = consistency_loss.detach()
-            stats["interaction_aux_loss"] = interaction_aux_loss.detach()
+            latent_support = (latent_teacher > support_threshold).to(latent_teacher)
+            focus_weight = latent_teacher * latent_support * latent_valid
+            background_weight = latent_valid * (1.0 - latent_support)
+            focus_loss_per_sample, focus_den = _masked_per_sample_mean(stage0_error, focus_weight)
+            background_loss_per_sample, background_den = _masked_per_sample_mean(stage0_error, background_weight)
+            focus_scale = float(getattr(args, "interaction_focus_scale", 1.0))
+            flow_parts = background_loss_per_sample
+            flow_parts = flow_parts + focus_scale * focus_loss_per_sample
+            total_loss = flow_parts.mean()
+            stats["stage0_focus_flow"] = focus_loss_per_sample.mean().detach()
+            stats["stage0_background_flow"] = background_loss_per_sample.mean().detach()
+            stats["stage0_focus_elements"] = focus_den.mean().detach()
+            stats["stage0_background_elements"] = background_den.mean().detach()
+            stats["stage0_weighted_flow"] = total_loss.detach()
+        else:
+            negative_den = world_tokens.sum().clamp_min(1.0)
+            interaction_aux_loss = (raw_gate * world_tokens).sum() / negative_den
+            total_loss = torch.zeros_like(interaction_aux_loss)
+            stats["stage0_weighted_flow"] = total_loss.detach()
+            stats["interaction_negative_raw_gate_loss"] = interaction_aux_loss.detach()
+        router_scale = float(getattr(args, "interaction_router_loss_scale", 0.05))
+        total_loss = total_loss + router_scale * interaction_aux_loss
+        stats["interaction_router_loss"] = interaction_aux_loss.detach()
+        stats["interaction_aux_loss"] = (router_scale * interaction_aux_loss).detach()
+        stats["router_weighted_ratio"] = (
+            router_scale * interaction_aux_loss.detach() / stats["stage0_weighted_flow"].clamp_min(1.0e-8)
+        )
+        stats["raw_gate_mean_stage0"] = raw_gate.detach().mean()
+        stats["final_gate_mean_stage0"] = final_gate.detach().mean()
+        stats["raw_delta_rms_stage0"] = debug["raw_delta_map"].detach().float().mean()
+        stats["final_injection_rms_stage0"] = debug["interaction_injection_map"].detach().float().mean()
+        stats["stage0_interaction_scale"] = torch.ones((), device=total_loss.device)
+        stats["teacher_mask_area_ratio_stage0"] = positive_tokens.detach().sum() / valid_tokens.detach().sum().clamp_min(1.0)
     if interaction_aux_loss is None:
         stats["interaction_aux_loss"] = torch.zeros((), device=total_loss.device)
     stats["flow_mse"] = total_loss.detach()
@@ -1870,8 +1932,11 @@ def setup_visible_lora(transformer, args, seq):
             semantic_dim=int(getattr(args, "interaction_semantic_dim", 256)),
             stage_warp_scales=getattr(args, "interaction_stage_warp_scales", (1.0, 0.5, 0.25)),
             stage_adapter_scales=getattr(args, "interaction_stage_adapter_scales", (1.0, 0.5, 0.25)),
+            active_stages=getattr(args, "interaction_active_stages", (0,)),
         )
         interaction_stack.requires_grad_(optimize_lora_now)
+        interaction_stack.stage_warp_scales.requires_grad_(False)
+        interaction_stack.stage_adapter_scales.requires_grad_(False)
         for param in interaction_stack.parameters():
             if optimize_lora_now:
                 param.data = param.data.float()

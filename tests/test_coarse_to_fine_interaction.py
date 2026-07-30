@@ -36,14 +36,11 @@ class CoarseToFineStaticContractTest(unittest.TestCase):
         self.assertIn('use_wah_lora = bool(state["lora_active"]) and i_s == 0', pipeline)
         self.assertIn("if i_s == 0:", pipeline)
 
-    def test_previous_gate_is_passed_in_order_and_reset_per_chunk(self):
+    def test_stage_zero_only_interaction_is_shared(self):
         core = CORE_PATH.read_text(encoding="utf-8")
-        self.assertIn('"previous_gate": previous_gate', core)
-        self.assertIn('previous_gate = debug["predicted_gate"]', core)
+        self.assertIn('active_stages=getattr(args, "interaction_active_stages", (0,))', core)
         pipeline = PIPELINE_PATH.read_text(encoding="utf-8")
-        self.assertIn("previous_stage_interaction_gate = None", pipeline)
-        self.assertIn('"previous_gate": stage_previous_interaction_gate', pipeline)
-        self.assertIn("previous_stage_interaction_gate = last_stage_interaction_gate", pipeline)
+        self.assertIn("active_stages=(0,)", pipeline)
 
     def test_training_and_inference_share_coarse_to_fine_stack(self):
         for path in (TRAINING_TRANSFORMER, INFERENCE_TRANSFORMER):
@@ -57,10 +54,9 @@ class CoarseToFineStaticContractTest(unittest.TestCase):
         self.assertIn('{"router", "binary", "off"}', pipeline)
         self.assertIn('interaction_conditioning_mode == "router"', pipeline)
 
-    def test_cross_stage_consistency_is_configurable(self):
+    def test_cross_stage_consistency_is_not_optimized(self):
         source = CORE_PATH.read_text(encoding="utf-8")
-        self.assertIn("interaction_cross_stage_consistency_loss_scale", source)
-        self.assertIn("F.smooth_l1_loss(predicted_gate, previous_resized)", source)
+        self.assertNotIn("F.smooth_l1_loss(predicted_gate, previous_resized)", source)
 
 
 @unittest.skipIf(TORCH is None, "PyTorch is not installed in the local test environment")
@@ -89,6 +85,7 @@ class CoarseToFineTorchTest(unittest.TestCase):
             warp,
             self.payload,
             TORCH.ones(1, 1, temporal, height, width),
+            TORCH.ones(1, 1, temporal, height, width),
             temporal,
             height,
             width,
@@ -97,7 +94,7 @@ class CoarseToFineTorchTest(unittest.TestCase):
         )
         return target, output, debug
 
-    def test_three_stages_route_coarse_to_fine_and_inject(self):
+    def test_only_stage_zero_routes_and_injects(self):
         _target0, _output0, debug0 = self.run_stage(0, 3, 2, 2)
         _target1, _output1, debug1 = self.run_stage(
             1, 3, 4, 4, previous_gate=debug0["predicted_gate"]
@@ -109,12 +106,15 @@ class CoarseToFineTorchTest(unittest.TestCase):
             self.assertEqual(debug["stage_id"], stage_id)
             self.assertIn(f"predicted_gate_stage{stage_id}", debug)
             self.assertIn(f"interaction_injection_map_stage{stage_id}", debug)
-        self.assertIsNotNone(debug1["previous_gate"])
-        self.assertIsNotNone(debug2["previous_gate"])
+        self.assertTrue(bool(debug0["interaction_active"]))
+        self.assertFalse(bool(debug1["interaction_active"]))
+        self.assertFalse(bool(debug2["interaction_active"]))
+        self.assertEqual(float(debug1["interaction_injection_map"].abs().max()), 0.0)
+        self.assertEqual(float(debug2["interaction_injection_map"].abs().max()), 0.0)
 
-    def test_default_stage_scales_are_trainable(self):
+    def test_adapter_stage_scale_is_fixed(self):
         self.assertTrue(self.stack.stage_warp_scales.requires_grad)
-        self.assertTrue(self.stack.stage_adapter_scales.requires_grad)
+        self.assertFalse(self.stack.stage_adapter_scales.requires_grad)
         self.assertTrue(
             TORCH.allclose(
                 self.stack.stage_warp_scales.detach(),
@@ -128,9 +128,10 @@ class CoarseToFineTorchTest(unittest.TestCase):
             )
         )
 
-    def test_refinement_stage_cannot_start_without_previous_gate(self):
-        with self.assertRaisesRegex(ValueError, "requires the previous stage"):
-            self.run_stage(1, 3, 4, 4)
+    def test_inactive_refinement_stage_does_not_require_previous_gate(self):
+        _target, output, debug = self.run_stage(1, 3, 4, 4)
+        self.assertFalse(bool(debug["interaction_active"]))
+        self.assertEqual(float(debug["interaction_injection_map"].abs().max()), 0.0)
 
     def test_legacy_state_dict_uses_default_new_parameters(self):
         legacy_state = {

@@ -4,6 +4,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import math
 import random
 import copy
 from collections import OrderedDict
@@ -217,7 +218,10 @@ def normalize_online_training_dataframe(df, exact_args):
         base["online_row_index"] = int(row_index)
         base["video_path"] = str(base[video_column])
         base["prompt_raw"] = raw_prompt
-        base["prompt"] = add_online_prompt_trigger(raw_prompt, prompt_trigger)
+        if str(getattr(exact_args, "training_profile", "joint")) == "interaction":
+            base["prompt"] = "Minecraft first-person gameplay."
+        else:
+            base["prompt"] = add_online_prompt_trigger(raw_prompt, prompt_trigger)
         base["training_category"] = canonical_training_category(
             base.get("category", base.get("action_type", "movement"))
         )
@@ -687,6 +691,11 @@ def canonical_interaction_events(payload):
                     "event_end_frame",
                     event.get("end_frame", event.get("mine_end_frame")),
                 ),
+                "action_start_frame": event.get("action_start_frame", frame),
+                "action_end_frame": event.get(
+                    "action_end_frame",
+                    event.get("event_end_frame", event.get("end_frame", event.get("mine_end_frame"))),
+                ),
             }
         )
     if not events:
@@ -732,7 +741,7 @@ def crop_interaction_payload(interaction_payload, target_indices):
         }
     event = events[0]
     local_event = int(index_to_local[int(event["event_frame"])])
-    end_source = event.get("event_end_frame")
+    end_source = event.get("action_end_frame", event.get("event_end_frame"))
     if event["action_type"] == "mine_active" and end_source is not None:
         end_local = next(
             (
@@ -748,6 +757,14 @@ def crop_interaction_payload(interaction_payload, target_indices):
     time_mask = [0.0] * len(target_indices)
     for local in range(local_event, min(end_local, len(time_mask))):
         time_mask[local] = 1.0
+    progress_curve = [0.0] * len(target_indices)
+    if event["action_type"] == "mine_active":
+        active_count = max(end_local - local_event, 1)
+        for local in range(local_event, min(end_local, len(progress_curve))):
+            progress_curve[local] = min((local - local_event) / float(active_count), 1.0 - 1.0e-6)
+    elif event["action_type"] == "mine_complete":
+        for local in range(local_event, len(progress_curve)):
+            progress_curve[local] = 1.0
     return {
         **event,
         "event_frame_source": int(event["event_frame"]),
@@ -755,6 +772,10 @@ def crop_interaction_payload(interaction_payload, target_indices):
         "event_valid": 1.0,
         "num_frames": len(target_indices),
         "time_mask": time_mask,
+        "frame_action_mask": time_mask,
+        "frame_progress_curve": progress_curve,
+        "action_start_frame": local_event,
+        "action_end_frame": min(end_local - 1, len(target_indices) - 1),
     }
 
 
@@ -770,6 +791,16 @@ def interaction_payload_tensors(payload, device):
         "event_frames": torch.tensor([float(payload.get("event_frame", 0))], device=device),
         "total_frames": torch.tensor([float(payload.get("num_frames", 1))], device=device),
         "event_valid": torch.tensor([float(payload.get("event_valid", 0.0))], device=device),
+        "frame_action_mask": torch.tensor(
+            [list(payload.get("frame_action_mask", payload.get("time_mask", [])))],
+            device=device,
+            dtype=torch.float32,
+        ),
+        "frame_progress_curve": torch.tensor(
+            [list(payload.get("frame_progress_curve", [0.0] * int(payload.get("num_frames", 1))))],
+            device=device,
+            dtype=torch.float32,
+        ),
     }
 
 
@@ -779,97 +810,129 @@ def build_residual_teacher_components(
     visibility,
     world_valid_mask=None,
     interaction_payload=None,
+    teacher_support_threshold=0.05,
+    teacher_min_area_by_action=None,
+    teacher_max_area=0.25,
+    min_valid_pixels=8,
+    min_visibility_ratio=0.05,
+    z_cap=3.0,
 ):
-    """Create a causal, persistent interaction teacher and its debug components."""
+    """Build a detached latent-grid residual teacher and per-sample validity audit."""
     warp = warp_latents.to(device=target_latents.device, dtype=target_latents.dtype)
     if warp.shape[2:] != target_latents.shape[2:]:
         warp = torch.nn.functional.interpolate(
             warp.float(), size=target_latents.shape[2:], mode="trilinear", align_corners=False
         ).to(target_latents)
     raw_residual = (target_latents.float() - warp.float()).abs().mean(dim=1, keepdim=True)
-    target_change = torch.zeros_like(raw_residual)
-    warp_change = torch.zeros_like(raw_residual)
-    if raw_residual.shape[2] > 1:
-        target_change[:, :, 1:] = (target_latents[:, :, 1:].float() - target_latents[:, :, :-1].float()).abs().mean(
-            dim=1, keepdim=True
-        )
-        warp_change[:, :, 1:] = (warp[:, :, 1:].float() - warp[:, :, :-1].float()).abs().mean(dim=1, keepdim=True)
-    change = target_change + warp_change
-    residual_scale = raw_residual.flatten(1).mean(dim=1).view(-1, 1, 1, 1, 1).clamp_min(1e-6)
-    change_scale = change.flatten(1).mean(dim=1).view(-1, 1, 1, 1, 1).clamp_min(1e-6)
-    teacher = (raw_residual / (3.0 * residual_scale)).clamp(0.0, 1.0)
-    teacher = teacher * (0.25 + 0.75 * (change / (3.0 * change_scale)).clamp(0.0, 1.0))
-    # Camera-motion edges are already represented by the warp and should not
-    # become interaction targets.
-    warp_change_scale = warp_change.flatten(1).mean(dim=1).view(-1, 1, 1, 1, 1).clamp_min(1e-6)
-    teacher = teacher * (1.0 - (warp_change / (3.0 * warp_change_scale)).clamp(0.0, 0.9))
-    warp_gray = warp.float().mean(dim=1, keepdim=True)
-    spatial_edge = torch.zeros_like(raw_residual)
-    spatial_edge[..., 1:, :] += (warp_gray[..., 1:, :] - warp_gray[..., :-1, :]).abs()
-    spatial_edge[..., :, 1:] += (warp_gray[..., :, 1:] - warp_gray[..., :, :-1]).abs()
-    edge_scale = spatial_edge.flatten(1).mean(dim=1).view(-1, 1, 1, 1, 1).clamp_min(1e-6)
-    teacher = teacher * (1.0 - (spatial_edge / (4.0 * edge_scale)).clamp(0.0, 0.75))
     if visibility is not None:
         visible = torch.nn.functional.interpolate(
-            visibility.float(), size=teacher.shape[2:], mode="nearest"
+            visibility.float(), size=raw_residual.shape[2:], mode="nearest"
         )
-        teacher = teacher * (visible >= 0.6).to(teacher)
+        visible = visible.clamp(0.0, 1.0)
+    else:
+        visible = torch.ones_like(raw_residual)
     if world_valid_mask is not None:
-        teacher = teacher * torch.nn.functional.interpolate(
-            world_valid_mask.float(), size=teacher.shape[2:], mode="nearest"
+        world_valid = torch.nn.functional.interpolate(
+            world_valid_mask.float(), size=raw_residual.shape[2:], mode="nearest"
         )
+        world_valid = (world_valid > 0.5).to(raw_residual)
+    else:
+        world_valid = torch.ones_like(raw_residual)
     if interaction_payload and float(interaction_payload.get("event_valid", 0.0)) > 0.0:
         source_frames = max(int(interaction_payload.get("num_frames", target_latents.shape[2])), 1)
-        frame_mask = list(interaction_payload.get("time_mask", []))
+        frame_mask = list(
+            interaction_payload.get("frame_action_mask", interaction_payload.get("time_mask", []))
+        )
         if len(frame_mask) != source_frames:
             event_frame = int(interaction_payload.get("event_frame", 0))
             frame_mask = [0.0] * max(event_frame, 0) + [1.0] * max(source_frames - event_frame, 0)
             frame_mask = frame_mask[:source_frames]
-        frame_mask_tensor = torch.as_tensor(
-            frame_mask,
-            device=teacher.device,
-            dtype=torch.float32,
-        ).view(1, 1, source_frames, 1, 1)
-        temporal_mask = torch.nn.functional.interpolate(
-            frame_mask_tensor,
-            size=(teacher.shape[2], 1, 1),
-            mode="nearest",
-        )
-        teacher = teacher * temporal_mask
+        temporal_values = []
+        latent_frames = int(raw_residual.shape[2])
+        for latent_index in range(latent_frames):
+            start = int(math.floor(latent_index * source_frames / latent_frames))
+            end = max(int(math.ceil((latent_index + 1) * source_frames / latent_frames)), start + 1)
+            temporal_values.append(max(float(value) for value in frame_mask[start:end]))
+        temporal_mask = torch.as_tensor(
+            temporal_values, device=raw_residual.device, dtype=torch.float32
+        ).view(1, 1, latent_frames, 1, 1)
     else:
-        temporal_mask = torch.zeros_like(teacher[:, :, :, :1, :1])
+        temporal_mask = torch.zeros_like(raw_residual[:, :, :, :1, :1])
 
-    # The held item/arm is dynamic target content, but is not the world-space
-    # placement/mining result supervised by the Router.
-    hand_valid = torch.ones_like(teacher[:, :, :1])
+    hand_valid = torch.ones_like(raw_residual[:, :, :1])
     hand_y = int(round(hand_valid.shape[-2] * 0.58))
     hand_x = int(round(hand_valid.shape[-1] * 0.65))
     hand_valid[..., hand_y:, hand_x:] = 0.0
-    teacher = teacher * hand_valid
+    base_valid = visible * world_valid * hand_valid
+    teacher_score = torch.zeros_like(raw_residual)
+    epsilon = 1.0e-6
+    for batch_index in range(raw_residual.shape[0]):
+        for time_index in range(raw_residual.shape[2]):
+            valid_now = base_valid[batch_index, 0, time_index] > 0.0
+            values = raw_residual[batch_index, 0, time_index][valid_now]
+            if values.numel() < int(min_valid_pixels):
+                continue
+            median = values.median()
+            mad = (values - median).abs().median()
+            scale = 1.4826 * mad
+            if float(scale) <= epsilon:
+                q50 = torch.quantile(values, 0.50)
+                q90 = torch.quantile(values, 0.90)
+                scale = q90 - q50
+            if float(scale) <= epsilon:
+                continue
+            positive = (raw_residual[batch_index, 0, time_index] - median).clamp_min(0.0)
+            teacher_score[batch_index, 0, time_index] = (
+                positive / (scale + epsilon) / max(float(z_cap), epsilon)
+            ).clamp(0.0, 1.0)
 
-    # Minecraft interactions originate near the crosshair, but the prior is
-    # intentionally weak so the residual teacher can route effects elsewhere.
-    height, width = teacher.shape[-2:]
-    yy = torch.linspace(-1.0, 1.0, height, device=teacher.device).view(1, 1, 1, height, 1)
-    xx = torch.linspace(-1.0, 1.0, width, device=teacher.device).view(1, 1, 1, 1, width)
-    crosshair_prior = torch.exp(-2.0 * (xx.square() + yy.square()))
-    teacher = teacher * (0.75 + 0.25 * crosshair_prior)
-
-    # Spatial and temporal averaging suppresses isolated pixels/frames while
-    # preserving persistent block changes.
-    teacher = torch.nn.functional.avg_pool3d(
-        teacher,
-        kernel_size=(3, 3, 3),
-        stride=1,
-        padding=(1, 1, 1),
+    valid_action_region = temporal_mask * base_valid
+    teacher = (teacher_score * valid_action_region).detach()
+    support = ((teacher_score > float(teacher_support_threshold)) & (valid_action_region > 0)).to(teacher)
+    support_weighted = support * valid_action_region
+    valid_denominator = valid_action_region.flatten(1).sum(dim=1)
+    area_ratio = support_weighted.flatten(1).sum(dim=1) / valid_denominator.clamp_min(1.0)
+    visibility_ratio = (visible * temporal_mask).flatten(1).sum(dim=1) / (
+        temporal_mask.expand_as(visible).flatten(1).sum(dim=1).clamp_min(1.0)
     )
-    teacher = teacher * temporal_mask
-    teacher = teacher.clamp(0.0, 1.0)
+    action_type = str((interaction_payload or {}).get("action_type", "none"))
+    minimums = {
+        "place": 0.001,
+        "mine_complete": 0.001,
+        "mine_active": 0.0001,
+    }
+    minimums.update(dict(teacher_min_area_by_action or {}))
+    min_area = float(minimums.get(action_type, 0.001))
+    teacher_valid = (
+        (valid_denominator >= float(min_valid_pixels))
+        & (visibility_ratio >= float(min_visibility_ratio))
+        & (area_ratio >= min_area)
+        & (area_ratio <= float(teacher_max_area))
+    )
+    invalid_reason = []
+    for index in range(raw_residual.shape[0]):
+        reasons = []
+        if float(valid_denominator[index]) < float(min_valid_pixels):
+            reasons.append("insufficient_valid_pixels")
+        if float(visibility_ratio[index]) < float(min_visibility_ratio):
+            reasons.append("low_visibility")
+        if float(area_ratio[index]) < min_area:
+            reasons.append("teacher_too_small")
+        if float(area_ratio[index]) > float(teacher_max_area):
+            reasons.append("teacher_too_large")
+        invalid_reason.append(reasons)
     return {
         "raw_residual": raw_residual.detach(),
         "visibility": None if visibility is None else visibility.detach(),
         "temporal_mask": temporal_mask.detach(),
-        "clean_teacher_mask": teacher,
+        "valid_action_region": valid_action_region.detach(),
+        "teacher_score": teacher_score.detach(),
+        "teacher_support": support.detach(),
+        "teacher_area_ratio": area_ratio.detach(),
+        "teacher_visibility_ratio": visibility_ratio.detach(),
+        "teacher_valid": teacher_valid.detach(),
+        "teacher_invalid_reasons": invalid_reason,
+        "clean_teacher_mask": teacher.detach(),
     }
 
 
@@ -1755,43 +1818,16 @@ class OnlineWarpTrainingCache:
                 )
             action_type = canonical_interaction_action(row.get("action_type", category))
             if category == "mine" and not str(row.get("action_type", "") or "").strip():
-                use_active = bool(rng.randrange(2))
-                if use_active and prepared.get("pose_rows"):
-                    completion_frame = int(event_resampled_frame)
-                    active_start = completion_frame
-                    while active_start > 0:
-                        mouse = dict(prepared["pose_rows"][active_start - 1].get("mouse", {}) or {})
-                        if 0 not in list(mouse.get("buttons", []) or []):
-                            break
-                        active_start -= 1
-                    if active_start < completion_frame:
-                        event_resampled_frame = max(
-                            active_start,
-                            completion_frame - max(1, (completion_frame - active_start) // 2),
-                        )
-                        event_end_frame = completion_frame + 1
-                        action_type = "mine_active"
-                        active_segment_frame = int(
-                            prepared["source_indices"][event_resampled_frame]
-                        )
-                        source_start = int(row.get("source_frame_start", 0) or 0)
-                        event_alignment = {
-                            **event_alignment,
-                            "source_event_frame": source_start + active_segment_frame,
-                            "segment_event_frame": active_segment_frame,
-                            "source_event_time_ms": 1000.0
-                            * active_segment_frame
-                            / max(float(row.get("fps", 0.0) or 0.0), 1.0e-6),
-                            "resampled_event_frame": int(event_resampled_frame),
-                            "resampled_event_time_ms": 1000.0
-                            * int(event_resampled_frame)
-                            / max(
-                                float(getattr(self.exact_args, "online_target_fps", 16.0)),
-                                1.0e-6,
-                            ),
-                        }
-                    else:
-                        action_type = "mine_complete"
+                action_type = "mine_complete"
+            raw_action_end = row.get("action_end_frame", row.get("event_end_frame", row.get("mine_end_frame")))
+            if raw_action_end is not None and str(raw_action_end).strip():
+                source_start = int(row.get("source_frame_start", 0) or 0)
+                segment_end = int(raw_action_end)
+                if segment_end >= source_start:
+                    segment_end -= source_start
+                event_end_frame = int(
+                    np.argmin([abs(int(frame) - segment_end) for frame in prepared["source_indices"]])
+                ) + (1 if action_type == "mine_active" else 0)
             full_interaction_payload = {
                 "events": [
                     {
@@ -1808,6 +1844,8 @@ class OnlineWarpTrainingCache:
                         "object_id": row.get("object_id"),
                         "block_id": row.get("block_id", row.get("object_id")),
                         "event_end_frame": event_end_frame,
+                        "action_start_frame": int(event_resampled_frame),
+                        "action_end_frame": None if event_end_frame is None else int(event_end_frame),
                         "source_event_frame": event_alignment["source_event_frame"],
                         "source_event_time_ms": event_alignment["source_event_time_ms"],
                     }
@@ -1831,7 +1869,19 @@ class OnlineWarpTrainingCache:
         event_local_frame = None
         chunk_mode = category
         first_chunk_prob = float(getattr(self.exact_args, "online_first_chunk_prob", 0.0) or 0.0)
-        if category in {"place", "mine"}:
+        if category == "negative" and str(row.get("negative_window_start_frame", "")).strip():
+            target_start = int(row["negative_window_start_frame"])
+            target_indices = list(range(target_start, target_start + num_frames))
+            if target_indices[-1] >= n:
+                raise ValueError(f"Negative window exceeds resampled video: {row.get('id', row_index)}.")
+            chunk_mode = (
+                "first"
+                if requested_chunk_mode == "interaction_first"
+                else "generated"
+                if requested_chunk_mode == "interaction_generated"
+                else "later"
+            )
+        elif category in {"place", "mine"}:
             target_indices, event_local_frame = build_interaction_event_window(
                 int(event_resampled_frame),
                 num_source_frames=n,
@@ -1839,9 +1889,15 @@ class OnlineWarpTrainingCache:
                 rng=rng,
                 local_min=int(getattr(self.exact_args, "interaction_event_local_min", 6)),
                 local_max=int(getattr(self.exact_args, "interaction_event_local_max", 16)),
-                require_later=True,
+                require_later=requested_chunk_mode != "interaction_first",
             )
-            chunk_mode = f"{category}_event"
+            chunk_mode = (
+                "first"
+                if requested_chunk_mode == "interaction_first"
+                else "generated"
+                if requested_chunk_mode == "interaction_generated"
+                else "later"
+            )
         elif requested_chunk_mode == "camera_first":
             target_indices = list(range(num_frames))
             chunk_mode = "first"
@@ -1865,10 +1921,10 @@ class OnlineWarpTrainingCache:
         if target_indices is None:
             target_indices = choose_online_movement_window(rng, n, num_frames, full_event_payload)
         target_start = int(target_indices[0])
-        if target_start <= 0:
+        if target_start <= 0 or requested_chunk_mode == "interaction_first":
             if requested_chunk_mode == "camera_first":
                 chunk_mode = "first"
-            if requested_chunk_mode != "camera_first":
+            if requested_chunk_mode not in {"camera_first", "interaction_first"}:
                 chunk_mode = "first" if chunk_mode == "movement" else f"{chunk_mode}_first"
             source_idx = int(target_start)
             history_indices = []
@@ -1883,6 +1939,8 @@ class OnlineWarpTrainingCache:
                 chunk_mode = "later"
             elif requested_chunk_mode == "camera_rollout":
                 chunk_mode = "two_chunk_rollout"
+            elif requested_chunk_mode == "interaction_generated":
+                chunk_mode = "generated"
             else:
                 chunk_mode = "later" if chunk_mode == "movement" else f"{chunk_mode}_later"
             max_history = min(int(getattr(self.exact_args, "online_max_history_frames", 19)), target_start)
@@ -1895,8 +1953,10 @@ class OnlineWarpTrainingCache:
                 for frame_index in geometry_frame_indices
                 if history_indices[0] <= frame_index < target_start
             ]
-            if requested_chunk_mode == "camera_rollout":
-                rollout_source = int(target_start) - int(num_frames)
+            if requested_chunk_mode in {"camera_rollout", "interaction_generated"}:
+                rollout_source = int(target_start) - (int(num_frames) - 1)
+                if rollout_source < 0:
+                    raise ValueError("Generated history requires a complete preceding chunk.")
                 geometry_keyframe_frames = [max(rollout_source, 0)]
             if not geometry_keyframe_frames:
                 geometry_keyframe_frames = [max(frame_index for frame_index in geometry_frame_indices if frame_index < target_start)]
@@ -2136,9 +2196,9 @@ class OnlineWarpTrainingCache:
             if world_valid_mask is None
             else [world_valid_mask.copy() for _ in range(num_frames)],
         }
-        if requested_chunk_mode == "camera_rollout":
-            previous_start = int(target_start) - int(num_frames)
-            previous_indices = list(range(previous_start, int(target_start)))
+        if requested_chunk_mode in {"camera_rollout", "interaction_generated"}:
+            previous_start = int(target_start) - (int(num_frames) - 1)
+            previous_indices = list(range(previous_start, int(target_start) + 1))
             if previous_start < 0 or prepared.get("pose_rows") is None:
                 raise ValueError("Two-chunk rollout requires an earlier VPT-controlled chunk.")
             result["rollout_source_frame"] = frames[previous_start]
@@ -2297,7 +2357,7 @@ def prepare_online_warp_item(
                 memory_prompt_cache,
             )
             rollout_history_frames = None
-            if str(case.get("metadata", {}).get("chunk_mode")) == "two_chunk_rollout":
+            if str(case.get("metadata", {}).get("chunk_mode")) in {"two_chunk_rollout", "generated"}:
                 transformer_training = bool(pipe.transformer.training)
                 pipe.transformer.eval()
                 try:
@@ -2467,6 +2527,9 @@ def prepare_online_warp_item(
                     "payload": interaction_payload_tensors(interaction_payload, device),
                     "warp_latents": video_latents.detach(),
                     "visibility": visibility_latents.detach(),
+                    "world_valid": None
+                    if world_valid_mask_latents is None
+                    else world_valid_mask_latents.detach(),
                 }
             if bool(getattr(exact_args, "use_primary_fire_event_condition", False)):
                 event_payload = case.get("primary_fire_event_payload") or {
@@ -2521,6 +2584,19 @@ def prepare_online_warp_item(
         "initial_teacher_map": None
         if interaction_teacher_map is None
         else interaction_teacher_map.detach(),
+        "interaction_teacher_valid": bool(
+            interaction_teacher_components is not None
+            and bool(interaction_teacher_components["teacher_valid"].all().item())
+        ),
+        "interaction_teacher_area_ratio": None
+        if interaction_teacher_components is None
+        else float(interaction_teacher_components["teacher_area_ratio"].mean().item()),
+        "interaction_teacher_visibility_ratio": None
+        if interaction_teacher_components is None
+        else float(interaction_teacher_components["teacher_visibility_ratio"].mean().item()),
+        "interaction_teacher_invalid_reasons": []
+        if interaction_teacher_components is None
+        else list(interaction_teacher_components["teacher_invalid_reasons"]),
         "interaction_debug_inputs": None,
     }
     if interaction_active:

@@ -60,7 +60,7 @@ class InteractionSemanticEncoder(nn.Module):
             nn.LayerNorm(self.semantic_dim),
         )
 
-    def forward(self, action_ids, block_ids, event_frames, total_frames, event_valid):
+    def forward(self, action_ids, block_ids, event_frames, total_frames):
         denominator = (total_frames.float() - 1.0).clamp_min(1.0)
         event_position = event_frames.float() / denominator
         module_dtype = self.action_embedding.weight.dtype
@@ -77,7 +77,7 @@ class InteractionSemanticEncoder(nn.Module):
                 dim=-1,
             )
         )
-        return token * event_valid.to(token).unsqueeze(-1)
+        return token
 
 
 class InteractionRouter(nn.Module):
@@ -88,7 +88,7 @@ class InteractionRouter(nn.Module):
         self.warp_projection = nn.Linear(hidden_dim, rank, bias=False)
         self.semantic_projection = nn.Linear(min(semantic_dim, hidden_dim), rank, bias=False)
         self.temporal_projection = nn.Sequential(
-            nn.Linear(5, rank),
+            nn.Linear(7, rank),
             nn.SiLU(),
             nn.Linear(rank, rank),
         )
@@ -100,9 +100,10 @@ class InteractionRouter(nn.Module):
         warp_tokens,
         target_tokens,
         visibility,
+        action_mask,
+        progress,
         frame_positions,
         event_positions,
-        event_valid,
         previous_gate=None,
         previous_support=None,
         is_refinement=False,
@@ -115,6 +116,8 @@ class InteractionRouter(nn.Module):
                 torch.sin(math.pi * relative),
                 torch.cos(math.pi * relative),
                 visibility.squeeze(-1).float(),
+                action_mask.squeeze(-1).float(),
+                progress.squeeze(-1).float(),
             ],
             dim=-1,
         ).to(dtype=self.temporal_projection[0].weight.dtype)
@@ -139,7 +142,7 @@ class InteractionRouter(nn.Module):
             gate = (previous_gate + delta).clamp(0.0, 1.0)
         else:
             gate = torch.sigmoid(logits)
-        return gate * visibility.to(gate) * event_valid.to(gate).view(-1, 1, 1)
+        return gate
 
 
 class InteractionAdapter(nn.Module):
@@ -149,20 +152,23 @@ class InteractionAdapter(nn.Module):
         self.target_down = nn.Linear(hidden_dim, rank, bias=False)
         self.warp_down = nn.Linear(hidden_dim, rank, bias=False)
         self.semantic_down = nn.Linear(min(semantic_dim, hidden_dim), rank, bias=False)
+        self.progress_down = nn.Linear(1, rank, bias=False)
         self.up = nn.Linear(rank, hidden_dim, bias=False)
         self.scale = float(scale)
+        nn.init.zeros_(self.progress_down.weight)
         nn.init.zeros_(self.up.weight)
 
-    def forward(self, target_tokens, warp_tokens, interaction_token, gate, stage_scale=1.0):
+    def forward(self, target_tokens, warp_tokens, interaction_token, progress, gate, stage_scale=1.0):
         projection_dtype = self.target_down.weight.dtype
         low_rank = (
             self.target_down(target_tokens.to(dtype=projection_dtype))
             + self.warp_down(warp_tokens.to(dtype=projection_dtype))
             + self.semantic_down(interaction_token.to(dtype=projection_dtype)).unsqueeze(1)
+            + self.progress_down(progress.to(dtype=projection_dtype))
         )
         delta = self.up(F.silu(low_rank)).to(target_tokens)
         injection = self.scale * stage_scale.to(target_tokens) * gate.to(target_tokens) * delta
-        return target_tokens + injection, injection
+        return target_tokens + injection, delta, injection
 
 
 class InteractionConditioningStack(nn.Module):
@@ -173,6 +179,7 @@ class InteractionConditioningStack(nn.Module):
         rank: int = 64,
         stage_warp_scales=DEFAULT_STAGE_WARP_SCALES,
         stage_adapter_scales=DEFAULT_STAGE_ADAPTER_SCALES,
+        active_stages=(0,),
     ):
         super().__init__()
         self.semantic_encoder = InteractionSemanticEncoder(hidden_dim, semantic_dim=semantic_dim)
@@ -184,6 +191,10 @@ class InteractionConditioningStack(nn.Module):
         self.stage_adapter_scales = nn.Parameter(
             self._stage_scale_tensor(stage_adapter_scales, "stage_adapter_scales")
         )
+        self.active_stages = tuple(sorted({int(stage) for stage in active_stages}))
+        if not self.active_stages or any(stage < 0 or stage >= INTERACTION_PYRAMID_STAGES for stage in self.active_stages):
+            raise ValueError(f"active_stages must be a non-empty subset of [0, 1, 2], got {self.active_stages}.")
+        self.stage_adapter_scales.requires_grad_(False)
 
     @staticmethod
     def _stage_scale_tensor(values, name):
@@ -202,12 +213,63 @@ class InteractionConditioningStack(nn.Module):
             raise ValueError(f"interaction payload {name} must have batch size {batch_size}, got {value.numel()}.")
         return value
 
+    @staticmethod
+    def _payload_frame_signal(payload, name, batch_size, device, default=0.0):
+        value = payload.get(name)
+        if value is None:
+            total = torch.as_tensor(payload.get("total_frames", [1]), device=device).flatten()
+            frame_count = max(int(total.max().item()), 1)
+            return torch.full((batch_size, frame_count), float(default), device=device, dtype=torch.float32)
+        value = torch.as_tensor(value, device=device, dtype=torch.float32)
+        if value.ndim == 1:
+            value = value.unsqueeze(0)
+        if value.shape[0] == 1 and batch_size > 1:
+            value = value.expand(batch_size, -1)
+        if value.ndim != 2 or value.shape[0] != batch_size:
+            raise ValueError(f"interaction payload {name} must have shape [B,F], got {tuple(value.shape)}.")
+        return value
+
+    @staticmethod
+    def _pool_frame_signals(frame_action_mask, frame_progress_curve, temporal):
+        """Coverage-pool RGB-frame controls onto the actual patch-token time axis."""
+        frame_count = int(frame_action_mask.shape[1])
+        temporal = int(temporal)
+        pooled_mask = []
+        pooled_progress = []
+        for latent_index in range(temporal):
+            start = int(math.floor(latent_index * frame_count / temporal))
+            end = int(math.ceil((latent_index + 1) * frame_count / temporal))
+            end = max(end, start + 1)
+            mask_slice = frame_action_mask[:, start:end]
+            progress_slice = frame_progress_curve[:, start:end]
+            coverage = mask_slice.amax(dim=1)
+            denominator = mask_slice.sum(dim=1).clamp_min(1.0)
+            progress = (progress_slice * mask_slice).sum(dim=1) / denominator
+            pooled_mask.append(coverage)
+            pooled_progress.append(progress * (coverage > 0).to(progress))
+        return torch.stack(pooled_mask, dim=1), torch.stack(pooled_progress, dim=1)
+
+    @staticmethod
+    def _align_spatial_mask(mask, batch_size, temporal, height, width, device, *, conservative):
+        if mask is None:
+            return torch.ones(batch_size, 1, temporal, height, width, device=device, dtype=torch.float32)
+        mask = torch.as_tensor(mask, device=device, dtype=torch.float32)
+        if mask.ndim == 4:
+            mask = mask.unsqueeze(1)
+        if mask.shape[0] == 1 and batch_size > 1:
+            mask = mask.expand(batch_size, -1, -1, -1, -1)
+        if mask.ndim != 5 or mask.shape[0] != batch_size:
+            raise ValueError(f"interaction spatial mask must have shape [B,1,T,H,W], got {tuple(mask.shape)}.")
+        aligned = F.adaptive_avg_pool3d(mask, output_size=(temporal, height, width))
+        return (aligned >= 0.999).to(aligned) if conservative else aligned.clamp(0.0, 1.0)
+
     def forward(
         self,
         target_tokens,
         warp_tokens,
         payload,
         visibility,
+        world_valid,
         temporal,
         height,
         width,
@@ -227,16 +289,43 @@ class InteractionConditioningStack(nn.Module):
         stage_id = int(stage_id)
         if stage_id < 0 or stage_id >= INTERACTION_PYRAMID_STAGES:
             raise ValueError(f"interaction stage_id must be in [0, {INTERACTION_PYRAMID_STAGES - 1}].")
-        semantic = self.semantic_encoder(action_ids, block_ids, event_frames, total_frames, event_valid)
+        if stage_id not in self.active_stages:
+            zero_gate = torch.zeros(batch_size, 1, temporal, height, width, device=device, dtype=target_tokens.dtype)
+            return target_tokens, {
+                "stage_id": stage_id,
+                "interaction_active": False,
+                "raw_gate": zero_gate,
+                "final_gate": zero_gate,
+                "valid_injection_region": zero_gate,
+                "world_valid_region": zero_gate,
+                "predicted_gate": zero_gate,
+                f"predicted_gate_stage{stage_id}": zero_gate,
+                "raw_delta_map": zero_gate,
+                "interaction_injection_map": zero_gate,
+                f"interaction_injection_map_stage{stage_id}": zero_gate,
+                "previous_gate": None,
+                "stage_warp_scale": self.stage_warp_scales[stage_id].detach(),
+                "stage_adapter_scale": torch.ones((), device=device, dtype=torch.float32),
+            }
+        semantic = self.semantic_encoder(action_ids, block_ids, event_frames, total_frames)
         stage_ids = torch.full((batch_size,), stage_id, device=device, dtype=torch.long)
-        semantic = semantic + self.stage_embedding(stage_ids) * event_valid.to(semantic).unsqueeze(-1)
+        semantic = semantic + self.stage_embedding(stage_ids)
 
-        if visibility is None:
-            visibility = torch.ones(batch_size, 1, temporal, height, width, device=device, dtype=torch.float32)
-        else:
-            visibility = visibility.to(device=device, dtype=torch.float32)
-            visibility = F.interpolate(visibility, size=(temporal, height, width), mode="nearest")
+        visibility = self._align_spatial_mask(
+            visibility, batch_size, temporal, height, width, device, conservative=False
+        )
+        world_valid = self._align_spatial_mask(
+            world_valid, batch_size, temporal, height, width, device, conservative=True
+        )
         visibility_tokens = visibility.flatten(2).transpose(1, 2)
+        world_valid_tokens = world_valid.flatten(2).transpose(1, 2)
+        frame_action_mask = self._payload_frame_signal(payload, "frame_action_mask", batch_size, device)
+        frame_progress_curve = self._payload_frame_signal(payload, "frame_progress_curve", batch_size, device)
+        temporal_action, temporal_progress = self._pool_frame_signals(
+            frame_action_mask, frame_progress_curve, temporal
+        )
+        action_tokens = temporal_action.repeat_interleave(height * width, dim=1).unsqueeze(-1)
+        progress_tokens = temporal_progress.repeat_interleave(height * width, dim=1).unsqueeze(-1)
         warp_tokens = warp_tokens * self.stage_warp_scales[stage_id].to(warp_tokens)
         frame_axis = torch.linspace(0.0, 1.0, temporal, device=device, dtype=torch.float32)
         frame_positions = frame_axis.repeat_interleave(height * width).unsqueeze(0).expand(batch_size, -1)
@@ -259,42 +348,73 @@ class InteractionConditioningStack(nn.Module):
                 stride=1,
                 padding=(0, 1, 1),
             ).flatten(2).transpose(1, 2)
-        gate = self.router(
+        raw_gate = self.router(
             semantic,
             warp_tokens,
             target_tokens,
             visibility_tokens,
+            action_tokens,
+            progress_tokens,
             frame_positions,
             event_positions,
-            event_valid,
             previous_gate=previous_gate_tokens,
             previous_support=previous_support_tokens,
             is_refinement=stage_id > 0,
         )
+        final_gate = (
+            raw_gate
+            * visibility_tokens.to(raw_gate)
+            * world_valid_tokens.to(raw_gate)
+            * action_tokens.to(raw_gate)
+            * event_valid.to(raw_gate).view(-1, 1, 1)
+        )
+        valid_injection_tokens = (
+            visibility_tokens.to(raw_gate)
+            * world_valid_tokens.to(raw_gate)
+            * action_tokens.to(raw_gate)
+        )
         if bool(interaction_adapter_enabled):
-            output, injection = self.adapter(
+            output, raw_delta, injection = self.adapter(
                 target_tokens,
                 warp_tokens,
                 semantic,
-                gate,
-                stage_scale=self.stage_adapter_scales[stage_id],
+                progress_tokens,
+                final_gate,
+                stage_scale=torch.ones((), device=device, dtype=torch.float32),
             )
         else:
             output = target_tokens
+            raw_delta = torch.zeros_like(target_tokens)
             injection = torch.zeros_like(target_tokens)
-        predicted_gate = gate.transpose(1, 2).reshape(batch_size, 1, temporal, height, width)
+        raw_gate_map = raw_gate.transpose(1, 2).reshape(batch_size, 1, temporal, height, width)
+        final_gate_map = final_gate.transpose(1, 2).reshape(batch_size, 1, temporal, height, width)
+        valid_injection_map = valid_injection_tokens.transpose(1, 2).reshape(
+            batch_size, 1, temporal, height, width
+        )
+        world_valid_map = world_valid_tokens.transpose(1, 2).reshape(
+            batch_size, 1, temporal, height, width
+        )
+        raw_delta_map = raw_delta.float().square().mean(dim=-1, keepdim=True).sqrt().transpose(1, 2).reshape(
+            batch_size, 1, temporal, height, width
+        )
         injection_map = injection.float().square().mean(dim=-1, keepdim=True).sqrt().transpose(1, 2).reshape(
             batch_size, 1, temporal, height, width
         )
         debug = {
             "stage_id": stage_id,
+            "interaction_active": True,
             "interaction_token": semantic,
-            "predicted_gate": predicted_gate,
-            f"predicted_gate_stage{stage_id}": predicted_gate,
+            "raw_gate": raw_gate_map,
+            "final_gate": final_gate_map,
+            "valid_injection_region": valid_injection_map,
+            "world_valid_region": world_valid_map,
+            "predicted_gate": final_gate_map,
+            f"predicted_gate_stage{stage_id}": final_gate_map,
+            "raw_delta_map": raw_delta_map,
             "interaction_injection_map": injection_map,
             f"interaction_injection_map_stage{stage_id}": injection_map,
             "previous_gate": previous_gate,
             "stage_warp_scale": self.stage_warp_scales[stage_id],
-            "stage_adapter_scale": self.stage_adapter_scales[stage_id],
+            "stage_adapter_scale": torch.ones((), device=device, dtype=torch.float32),
         }
         return output, debug

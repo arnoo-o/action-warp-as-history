@@ -120,7 +120,8 @@ class MinecraftStepSamplingAndAlignmentTest(unittest.TestCase):
         source = DATA_SOURCE.read_text(encoding="utf-8")
         self.assertIn("def _estimate_conditioning_geometry", source)
         self.assertIn('"target_rgb_used": False', source)
-        first_branch = source[source.index("if target_start <= 0:") : source.index("else:", source.index("if target_start <= 0:"))]
+        marker = 'if target_start <= 0 or requested_chunk_mode == "interaction_first":'
+        first_branch = source[source.index(marker) : source.index("else:", source.index(marker))]
         self.assertIn("geometry_keyframe_frames = [source_idx]", first_branch)
         self.assertIn("history_indices[0] <= frame_index < target_start", source)
 

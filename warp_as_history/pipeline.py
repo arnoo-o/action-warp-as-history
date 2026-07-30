@@ -1063,6 +1063,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 semantic_dim=int(interaction_config.get("semantic_dim", 256)),
                 stage_warp_scales=interaction_config.get("stage_warp_scales", (1.0, 0.5, 0.25)),
                 stage_adapter_scales=interaction_config.get("stage_adapter_scales", (1.0, 0.5, 0.25)),
+                active_stages=interaction_config.get("active_stages", (0,)),
             )
             incompatible = self.transformer.interaction_conditioning.load_state_dict(
                 interaction_state, strict=False
@@ -1638,6 +1639,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             self.transformer.enable_interaction_conditioning(
                 stage_warp_scales=interaction_stage_warp_scales,
                 stage_adapter_scales=interaction_stage_adapter_scales,
+                active_stages=(0,),
             )
         if lora_prompt_embeds is not None and lora_prompt_embeds.shape[0] != 1:
             raise ValueError("WarpAsHistoryPipeline currently supports lora_prompt_embeds batch size 1.")
@@ -2849,6 +2851,43 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                         event_frame = float(routed_interaction_payload["event_frame"])
                         event_valid = float(routed_interaction_payload.get("event_valid", 1.0))
                         if event_valid > 0.0:
+                            frame_count = int(state["window_num_frames"])
+                            action_type = str(routed_interaction_payload.get("action_type", "none"))
+                            action_start = int(
+                                routed_interaction_payload.get("action_start_frame", event_frame)
+                            )
+                            action_end = int(
+                                routed_interaction_payload.get(
+                                    "action_end_frame",
+                                    frame_count - 1,
+                                )
+                            )
+                            frame_action_mask = list(
+                                routed_interaction_payload.get("frame_action_mask", [])
+                            )
+                            if len(frame_action_mask) != frame_count:
+                                frame_action_mask = [0.0] * frame_count
+                                for frame_index in range(
+                                    max(action_start, 0), min(action_end + 1, frame_count)
+                                ):
+                                    frame_action_mask[frame_index] = 1.0
+                            frame_progress_curve = list(
+                                routed_interaction_payload.get("frame_progress_curve", [])
+                            )
+                            if len(frame_progress_curve) != frame_count:
+                                frame_progress_curve = [0.0] * frame_count
+                                if action_type == "mine_active":
+                                    duration = max(action_end - action_start + 1, 1)
+                                    for frame_index in range(
+                                        max(action_start, 0), min(action_end + 1, frame_count)
+                                    ):
+                                        frame_progress_curve[frame_index] = min(
+                                            (frame_index - action_start) / float(duration),
+                                            1.0 - 1.0e-6,
+                                        )
+                                elif action_type == "mine_complete":
+                                    for frame_index in range(max(action_start, 0), frame_count):
+                                        frame_progress_curve[frame_index] = 1.0
                             payload_tensors = {
                                 "action_ids": torch.tensor(
                                     [interaction_action_id(routed_interaction_payload.get("action_type"))], device=device
@@ -2866,11 +2905,18 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                                 "event_frames": torch.tensor([event_frame], device=device),
                                 "total_frames": torch.tensor([float(state["window_num_frames"])], device=device),
                                 "event_valid": torch.tensor([event_valid], device=device),
+                                "frame_action_mask": torch.tensor(
+                                    [frame_action_mask], device=device, dtype=torch.float32
+                                ),
+                                "frame_progress_curve": torch.tensor(
+                                    [frame_progress_curve], device=device, dtype=torch.float32
+                                ),
                             }
                             current_interaction_conditioning = {
                                 "payload": payload_tensors,
                                 "warp_latents": warp_for_router,
                                 "visibility": visibility_for_router,
+                                "world_valid": state.get("interaction_world_valid_latents"),
                                 "stage_id": int(i_s),
                                 "previous_gate": stage_previous_interaction_gate,
                             }
