@@ -63,6 +63,21 @@ MC_HUD_RECTS = (
 )
 
 
+def data_value_present(value):
+    if value is None:
+        return False
+    if isinstance(value, (float, np.floating)) and math.isnan(float(value)):
+        return False
+    return bool(str(value).strip())
+
+
+def first_present_data_value(*values, default=None):
+    for value in values:
+        if data_value_present(value):
+            return value
+    return default
+
+
 def minecraft_world_valid_mask(*, height=360, width=640):
     """Build the Minecraft world mask using the exact video fit and nearest sampling."""
     source_width, source_height = MC_HUD_SOURCE_SIZE
@@ -1805,8 +1820,10 @@ class OnlineWarpTrainingCache:
             )
             event_resampled_frame = int(event_alignment["resampled_event_frame"])
             event_end_frame = None
-            raw_event_end = row.get("event_end_frame", row.get("mine_end_frame"))
-            if raw_event_end is not None and str(raw_event_end).strip():
+            raw_event_end = first_present_data_value(
+                row.get("event_end_frame"), row.get("mine_end_frame")
+            )
+            if data_value_present(raw_event_end):
                 segment_end = int(raw_event_end)
                 source_start = int(row.get("source_frame_start", 0) or 0)
                 if segment_end >= source_start:
@@ -1817,10 +1834,14 @@ class OnlineWarpTrainingCache:
                     )
                 )
             action_type = canonical_interaction_action(row.get("action_type", category))
-            if category == "mine" and not str(row.get("action_type", "") or "").strip():
+            if category == "mine" and not data_value_present(row.get("action_type")):
                 action_type = "mine_complete"
-            raw_action_end = row.get("action_end_frame", row.get("event_end_frame", row.get("mine_end_frame")))
-            if raw_action_end is not None and str(raw_action_end).strip():
+            raw_action_end = first_present_data_value(
+                row.get("action_end_frame"),
+                row.get("event_end_frame"),
+                row.get("mine_end_frame"),
+            )
+            if data_value_present(raw_action_end):
                 source_start = int(row.get("source_frame_start", 0) or 0)
                 segment_end = int(raw_action_end)
                 if segment_end >= source_start:
@@ -1841,8 +1862,10 @@ class OnlineWarpTrainingCache:
                         ),
                         "event_frame": int(event_resampled_frame),
                         "action_type": action_type,
-                        "object_id": row.get("object_id"),
-                        "block_id": row.get("block_id", row.get("object_id")),
+                        "object_id": first_present_data_value(row.get("object_id"), default="none"),
+                        "block_id": first_present_data_value(
+                            row.get("block_id"), row.get("object_id"), default="none"
+                        ),
                         "event_end_frame": event_end_frame,
                         "action_start_frame": int(event_resampled_frame),
                         "action_end_frame": None if event_end_frame is None else int(event_end_frame),
