@@ -105,6 +105,21 @@ def base_output_row(row):
     return result
 
 
+def make_repo_relative_data_paths(rows, data_root):
+    repo_root = data_root.parents[2]
+    for row in rows:
+        for key in ("video_path", "actions_path", "mc_event_path"):
+            value = str(row.get(key, "") or "").strip()
+            if not value:
+                continue
+            path = Path(value)
+            try:
+                row[key] = path.resolve().relative_to(repo_root).as_posix()
+            except (OSError, ValueError):
+                if path.is_absolute():
+                    raise ValueError(f"{key} must be inside the repository for portable training: {path}")
+
+
 def main():
     args = parse_args()
     root = args.data_root.resolve()
@@ -233,6 +248,7 @@ def main():
             if candidates >= int(args.max_negative_per_segment):
                 break
 
+    make_repo_relative_data_paths(output, root)
     columns = sorted({key for row in output for key in row})
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", encoding="utf-8", newline="") as handle:
