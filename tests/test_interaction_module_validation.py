@@ -177,6 +177,32 @@ class InteractionValidationTorchTest(unittest.TestCase):
         )
         self.assertGreater(grad, 0.0)
 
+    def test_adapter_overfit_positive_actions_all_have_adapter_gradient(self):
+        INTERACTION.configure_interaction_trainability(self.stack, "adapter_overfit")
+        override = TORCH.ones(1, 1, 2, 2, 2)
+        for action_id in (1, 2, 3):
+            self.stack.zero_grad(set_to_none=True)
+            payload = self.payload()
+            payload["action_ids"] = TORCH.tensor([action_id])
+            output, _ = self.stack(
+                self.target,
+                self.warp,
+                payload,
+                self.spatial,
+                self.spatial,
+                2,
+                2,
+                2,
+                gate_override=override,
+            )
+            output.sum().backward()
+            adapter_grad = sum(
+                float(parameter.grad.abs().sum())
+                for parameter in self.stack.adapter.parameters()
+                if parameter.grad is not None
+            )
+            self.assertGreater(adapter_grad, 0.0, f"action_id={action_id}")
+
     def test_inactive_stages_and_stage0_teacher_support(self):
         _, inactive = self.stack(
             self.target, self.warp, self.payload(), self.spatial, self.spatial, 2, 2, 2, stage_id=1

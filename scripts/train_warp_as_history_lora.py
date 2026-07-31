@@ -77,7 +77,10 @@ from warp_as_history.minecraft_recipe import minecraft_wah_recipe, recipe_mismat
 from warp_as_history.training.data import (
     LazyPreparedItems,
     build_online_warp_training_cache,
+    fixed_cache_rows_ready,
     normalize_online_training_dataframe,
+    resolve_optional_data_path,
+    rgb_frame_to_latent_indices,
 )
 from warp_as_history.training.fixed_teacher import (
     ACTION_HISTORY_KEYS,
@@ -86,7 +89,11 @@ from warp_as_history.training.fixed_teacher import (
     build_action_history_pools,
     candidate_config_hash,
     encode_index_sequence,
+    file_sha256,
+    interaction_action_ratios,
+    interaction_payload_hash,
     manifest_sha256,
+    model_artifact_fingerprint,
     restore_training_counters,
     stable_json_hash,
     validate_resume_contract,
@@ -126,7 +133,7 @@ class InteractionJointSampler:
         {"steps": 100, "history": {"first": 0.25, "later": 0.75}},
     )
 
-    def __init__(self, source_pools, total_steps, seed, *, phases):
+    def __init__(self, source_pools, total_steps, seed, *, phases, action_ratios=None):
         total_steps = int(total_steps)
         phase_plan = [dict(item) for item in phases]
         planned_steps = sum(int(item["steps"]) for item in phase_plan)
@@ -135,6 +142,7 @@ class InteractionJointSampler:
         self.samplers = []
         self.source_pools = {key: list(source_pools.get(key, [])) for key in ACTION_HISTORY_KEYS}
         self.seed = int(seed)
+        self.action_ratios = dict(action_ratios or self.ACTION_RATIOS)
         self.phase_plan = phase_plan
         self.total_steps = total_steps
         self.offsets = []
@@ -145,12 +153,12 @@ class InteractionJointSampler:
             history_ratios = dict(phase["history"])
             pools = {}
             ratios = {}
-            for action, action_ratio in self.ACTION_RATIOS.items():
+            for action, action_ratio in self.action_ratios.items():
                 for history, history_ratio in history_ratios.items():
                     key = f"{action}|{history}"
                     pools[key] = list(self.source_pools[key])
                     ratios[key] = float(action_ratio) * float(history_ratio)
-            validate_required_pools(self.source_pools, [phase], self.ACTION_RATIOS)
+            validate_required_pools(self.source_pools, [phase], self.action_ratios)
             self.samplers.append(
                 StepCategorySampler(pools, ratios, int(phase["steps"]), int(seed) + phase_index * 10007)
             )
@@ -232,6 +240,31 @@ def training_total_steps(base_train_steps, bidirectional_train_steps, enable_bid
     return base + bidirectional
 
 
+def training_resume_contract(args, *, camera_fingerprint=None):
+    transformer_path = args.transformer_path or args.base_model_path
+    return {
+        "teacher_pool_manifest_hash": str(getattr(args, "teacher_pool_manifest_hash", "")),
+        "approved_teacher_row_ids": list(getattr(args, "approved_teacher_row_ids", []) or []),
+        "action_history_pool_sizes": dict(getattr(args, "action_history_pool_sizes", {}) or {}),
+        "phase_plan": list(getattr(args, "resolved_interaction_phase_plan", []) or []),
+        "sampler_seed": int(args.seed),
+        "base_model_fingerprint": model_artifact_fingerprint(args.base_model_path),
+        "transformer_fingerprint": model_artifact_fingerprint(transformer_path),
+        "camera_checkpoint_fingerprint": (
+            camera_fingerprint
+            if camera_fingerprint is not None
+            else model_artifact_fingerprint(args.camera_checkpoint)
+        ),
+        "interaction_lr": float(args.interaction_lr if args.interaction_lr is not None else 1.0e-4),
+        "router_lr": float(args.router_lr),
+        "teacher_support_threshold": float(args.interaction_teacher_support_threshold),
+        "flow_matching_train_exact_timestep_sampling": str(
+            args.flow_matching_train_exact_timestep_sampling
+        ),
+        "candidate_config_hash": str(getattr(args, "fixed_teacher_config_hash", "")),
+    }
+
+
 def training_stage_for_step(step, base_train_steps, enable_bidirectional_training):
     if bool(enable_bidirectional_training) and int(step) >= int(base_train_steps):
         return "bidirectional"
@@ -283,17 +316,25 @@ def build_minecraft_step_sampler(df, args):
             phase_steps=args.interaction_phase_steps,
             first_ratios=args.interaction_first_history_ratios,
         )
+        action_ratios = interaction_action_ratios(mode)
+        require_selected = mode in {"router_overfit", "adapter_overfit"}
         source_pools = build_action_history_pools(
             df.to_dict(orient="records"),
             require_approved=True,
-            per_pool_limit=4 if mode in {"router_overfit", "adapter_overfit"} else None,
+            require_overfit_selected=require_selected,
         )
-        validate_required_pools(source_pools, phase_plan, InteractionJointSampler.ACTION_RATIOS)
+        if require_selected and not any(source_pools.values()):
+            raise ValueError(
+                f"{mode} requires manually approved rows with overfit_selected=true; "
+                "select 16-32 clean samples in teacher_pool_review_manifest.csv."
+            )
+        validate_required_pools(source_pools, phase_plan, action_ratios)
         print(
             json.dumps(
                 {
                     "event": "approved_action_history_pools",
                     "interaction_training_mode": mode,
+                    "action_ratios": action_ratios,
                     "pool_sizes": {key: len(source_pools[key]) for key in ACTION_HISTORY_KEYS},
                 }
             ),
@@ -304,6 +345,7 @@ def build_minecraft_step_sampler(df, args):
             args.max_steps,
             args.seed,
             phases=phase_plan,
+            action_ratios=action_ratios,
         )
         return sampler, {
             "pool_sizes": {name: len(values) for name, values in source_pools.items()},
@@ -519,10 +561,32 @@ def _cpu_tree(value):
     return value
 
 
+def _row_text(row, *keys, default=""):
+    for key in keys:
+        value = row.get(key, None)
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return str(default)
+
+
+def _source_video_digest(row, exact_args, digest_cache):
+    source_path = resolve_optional_data_path(row.get("video_path", ""), exact_args.data_root)
+    if source_path is None or not source_path.is_file():
+        raise FileNotFoundError(f"Cannot fingerprint candidate source video: {source_path}")
+    cache_key = str(source_path.resolve())
+    if cache_key not in digest_cache:
+        digest_cache[cache_key] = file_sha256(source_path)
+    return digest_cache[cache_key]
+
+
 def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows = []
+    source_digest_cache = {}
     maximum = len(df) if int(limit) <= 0 else min(len(df), int(limit))
     for row_index in range(maximum):
         row = df.iloc[row_index]
@@ -563,8 +627,25 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 world_valid=conditioning.get("world_valid"),
             )
             training = dict(item["training"])
+            interaction_payload = item.get("interaction_payload") or {}
+            payload_hash = interaction_payload_hash(interaction_payload)
+            source_digest = _source_video_digest(row, exact_args, source_digest_cache)
+            normalized_action = "none" if action_type in {"", "none", "negative"} else action_type
+            object_id = _row_text(row, "object_id", "block_id")
+            block_id = _row_text(row, "block_id", "object_id")
+            training_category = _row_text(
+                item,
+                "training_category",
+                default=_row_text(row, "training_category", "category", default=category),
+            ).lower()
             identity = {
                 "event_id": str(row.get("event_id", "")),
+                "action_type": normalized_action,
+                "block_id": block_id,
+                "object_id": object_id,
+                "training_category": training_category,
+                "interaction_payload_hash": payload_hash,
+                "source_video_digest": source_digest,
                 "history_type": history_type,
                 "target_indices": [int(value) for value in training.get("target_indices", [])],
                 "history_indices": [int(value) for value in training.get("history_indices", [])],
@@ -587,6 +668,11 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
             warp_rgb = np.stack(
                 [np.asarray(frame.convert("RGB"), dtype=np.uint8) for frame in item.get("history_frames", [])]
             )
+            rgb_to_latent = rgb_frame_to_latent_indices(
+                len(target_rgb),
+                int(target.shape[2]),
+                int(getattr(exact_args, "vae_temporal_scale", 4)),
+            )
             np.savez_compressed(
                 candidate_path,
                 target_latents=target[0].cpu().numpy().astype(np.float16),
@@ -596,21 +682,20 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 world_valid=aligned["world_valid"][0].cpu().numpy().astype(np.float16),
                 target_rgb=target_rgb,
                 warp_rgb=warp_rgb,
-                interaction_payload_json=np.asarray(
-                    json.dumps(item.get("interaction_payload") or {}, ensure_ascii=False)
-                ),
+                interaction_payload_json=np.asarray(json.dumps(interaction_payload, ensure_ascii=False)),
+                rgb_frame_to_latent_index=np.asarray(rgb_to_latent, dtype=np.int16),
                 candidate_identity_json=np.asarray(json.dumps(identity, ensure_ascii=False, sort_keys=True)),
             )
             torch.save(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "candidate_identity": identity,
                     "target_latents": _cpu_tree(item["target_latents"]),
                     "prompt_embeds": _cpu_tree(item["prompt_embeds"]),
                     "histories": _cpu_tree(item["histories"]),
                     "base_histories": _cpu_tree(item.get("base_histories")),
                     "interaction_conditioning": _cpu_tree(item["interaction_conditioning"]),
-                    "interaction_payload": item.get("interaction_payload"),
+                    "interaction_payload": interaction_payload,
                     "world_valid_mask_latents": _cpu_tree(item.get("world_valid_mask_latents")),
                     "training": training,
                     "seq": str(item["seq"]),
@@ -618,6 +703,8 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 },
                 training_cache_path,
             )
+            candidate_npz_sha256 = file_sha256(candidate_path)
+            training_cache_sha256 = file_sha256(training_cache_path)
             manifest_rows.append(
                 {
                     **row.to_dict(),
@@ -635,6 +722,15 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                     "source_segment_id": identity["source_segment_id"],
                     "candidate_cache_key": candidate_name,
                     "candidate_config_hash": identity["candidate_config_hash"],
+                    "action_type": normalized_action,
+                    "block_id": block_id,
+                    "object_id": object_id,
+                    "training_category": training_category,
+                    "interaction_payload_hash": payload_hash,
+                    "source_video_digest": source_digest,
+                    "candidate_npz_sha256": candidate_npz_sha256,
+                    "training_cache_sha256": training_cache_sha256,
+                    "rgb_frame_to_latent_index": encode_index_sequence(rgb_to_latent),
                     "target_reference": str(row.get("video_path", "")),
                     "warp_reference": str(item.get("seq", "")),
                     "candidate_error": "",
@@ -721,6 +817,7 @@ def save_training_state(
         "approved_teacher_row_ids": list(getattr(args, "approved_teacher_row_ids", []) or []),
         "teacher_pool_manifest_hash": str(getattr(args, "teacher_pool_manifest_hash", "")),
         "action_history_pool_sizes": dict(getattr(args, "action_history_pool_sizes", {}) or {}),
+        "resume_contract": dict(getattr(args, "training_resume_contract", {}) or {}),
         "effective_optimizer_step": int(global_step),
         "config": vars(args).copy(),
         "launch_argv": list(sys.argv),
@@ -863,6 +960,7 @@ def load_training_state(path, *, transformer, optimizer, device, adapter_name=No
         "approved_teacher_row_ids": list(payload.get("approved_teacher_row_ids", []) or []),
         "teacher_pool_manifest_hash": str(payload.get("teacher_pool_manifest_hash", "")),
         "action_history_pool_sizes": dict(payload.get("action_history_pool_sizes", {}) or {}),
+        "resume_contract": dict(payload.get("resume_contract", {}) or {}),
         "effective_optimizer_step": int(payload.get("effective_optimizer_step", payload.get("global_step", 0))),
     }
 
@@ -915,6 +1013,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--wah_lora_lr", type=float, default=None)
     parser.add_argument("--interaction_lr", type=float, default=None)
+    parser.add_argument("--router_lr", type=float, default=5.0e-5)
     parser.add_argument("--training_profile", choices=["camera", "interaction", "joint"], default="joint")
     parser.add_argument(
         "--interaction_training_mode",
@@ -1241,8 +1340,6 @@ def main():
         and args.resume_from_checkpoint is None
     ):
         raise ValueError("--training_profile interaction requires --camera_checkpoint.")
-    if args.camera_checkpoint is not None and args.resume_from_checkpoint is not None:
-        raise ValueError("--camera_checkpoint initializes a new stage and cannot be combined with --resume_from_checkpoint.")
     if args.max_steps is not None:
         args.base_train_steps = int(args.max_steps)
     if int(args.base_train_steps) < 0 or int(args.bidirectional_train_steps) < 0:
@@ -1293,6 +1390,21 @@ def main():
             df = df.loc[approved].reset_index(drop=True)
             if df.empty:
                 raise ValueError("The audited teacher pool contains no review_status=approved rows.")
+            if str(args.interaction_training_mode) in {"router_overfit", "adapter_overfit"}:
+                if "overfit_selected" not in df.columns:
+                    raise ValueError(
+                        f"{args.interaction_training_mode} requires an overfit_selected column; "
+                        "manually mark 16-32 approved samples with overfit_selected=true."
+                    )
+                selected = df["overfit_selected"].fillna("").astype(str).str.lower().isin(
+                    ["1", "true", "yes"]
+                )
+                df = df.loc[selected].reset_index(drop=True)
+                if df.empty:
+                    raise ValueError(
+                        f"{args.interaction_training_mode} requires manually approved rows with "
+                        "overfit_selected=true; select 16-32 clean samples before training."
+                    )
             positive_rows = df["action_type"].fillna("").astype(str).str.lower().isin(
                 ["place", "mine_active", "mine_complete"]
             )
@@ -1304,6 +1416,17 @@ def main():
             if bool(invalid_stage0.any()):
                 raise ValueError(
                     f"Audited teacher pool contains {int(invalid_stage0.sum())} positive rows with empty Stage 0 support."
+                )
+            if "teacher_support_threshold" not in df.columns:
+                raise ValueError("Audited teacher pool is missing teacher_support_threshold.")
+            audited_thresholds = set(
+                pd.to_numeric(df["teacher_support_threshold"], errors="raise").astype(float).tolist()
+            )
+            expected_threshold = float(args.interaction_teacher_support_threshold)
+            if audited_thresholds != {expected_threshold}:
+                raise ValueError(
+                    "Audited teacher support threshold does not match training: "
+                    f"manifest={sorted(audited_thresholds)} runtime={expected_threshold}"
                 )
             for required_cache_column in ("teacher_cache_path", "training_cache_path"):
                 if required_cache_column not in df.columns:
@@ -1320,7 +1443,18 @@ def main():
                 raise ValueError(
                     f"Audited teacher pool has missing fixed teacher files: {missing_teacher_cache[:5]}"
                 )
-    exact_args.online_warp_cache = build_online_warp_training_cache(df, exact_args, device)
+    fixed_cache_only = (
+        str(args.training_profile) == "interaction"
+        and not bool(args.export_teacher_candidates_only)
+        and fixed_cache_rows_ready(
+            [row for _, row in df.iterrows()],
+            getattr(exact_args, "data_root", "."),
+        )
+    )
+    exact_args.fixed_cache_only = bool(fixed_cache_only)
+    exact_args.online_warp_cache = (
+        None if fixed_cache_only else build_online_warp_training_cache(df, exact_args, device)
+    )
     if bool(args.export_teacher_candidates_only):
         step_sampler = None
         sampler_meta = {"mode": "teacher_candidate_export", "rows": len(df)}
@@ -1340,6 +1474,8 @@ def main():
         json.dumps(
             {
                 "event": "online_warp_cache_config",
+                "fixed_cache_only": bool(fixed_cache_only),
+                "online_warp_cache_initialized": not bool(fixed_cache_only),
                 "memory_cache_size": int(args.online_warp_memory_cache_size),
                 "disk_cache_dir": str(args.online_warp_disk_cache_dir),
             }
@@ -1364,6 +1500,7 @@ def main():
         pose_convention="opencv_c2w_relative",
         vae_temporal_scale=int(pipe.vae_scale_factor_temporal),
     )
+    exact_args.vae_temporal_scale = int(pipe.vae_scale_factor_temporal)
     if args.resume_from_checkpoint is not None:
         manifest_config_hashes = sorted(
             set(str(value) for value in df["candidate_config_hash"].tolist())
@@ -1373,6 +1510,8 @@ def main():
         exact_args.fixed_teacher_config_hash = manifest_config_hashes[0]
     else:
         exact_args.fixed_teacher_config_hash = candidate_config_hash(args, pipe.transformer._wah_recipe)
+    args.fixed_teacher_config_hash = str(exact_args.fixed_teacher_config_hash)
+    args.training_resume_contract = training_resume_contract(args)
     mean, std = opt.latent_stats(pipe, device)
 
     serialized_train_args = {
@@ -1440,7 +1579,7 @@ def main():
             f"Training requires exactly one WAH LoRA adapter, got {sorted(peft_configs)}."
         )
     initialization = None
-    if args.camera_checkpoint is not None:
+    if args.camera_checkpoint is not None and args.resume_from_checkpoint is None:
         camera_load = opt.load_visible_lora_state(
             pipe.transformer,
             args.camera_checkpoint,
@@ -1510,6 +1649,7 @@ def main():
     )
     wah_lora_lr = float(args.wah_lora_lr if args.wah_lora_lr is not None else default_wah_lr)
     interaction_lr = float(args.interaction_lr if args.interaction_lr is not None else 1.0e-4)
+    router_lr = float(args.router_lr)
     profile = str(args.training_profile)
     interaction_mode = str(getattr(args, "interaction_training_mode", "joint_stage0"))
     wah_params = []
@@ -1565,8 +1705,8 @@ def main():
         groups.append(
             {
                 "params": interaction_router_params,
-                "lr": 5.0e-5,
-                "base_lr": 5.0e-5,
+                "lr": router_lr,
+                "base_lr": router_lr,
                 "name": "interaction_router",
             }
         )
@@ -1618,18 +1758,21 @@ def main():
             raise ValueError("Resume checkpoint interaction_training_mode does not match the current mode.")
         if list(resume_state.get("interaction_active_stages", [0])) != [0]:
             raise ValueError("Resume checkpoint must use interaction_active_stages=[0].")
-        resume_contract = {
-            "teacher_pool_manifest_hash": resume_state.get("teacher_pool_manifest_hash", ""),
-            "approved_teacher_row_ids": resume_state.get("approved_teacher_row_ids", []),
-            "action_history_pool_sizes": resume_state.get("action_history_pool_sizes", {}),
-            "phase_plan": resume_state.get("phase_plan", []),
-        }
-        current_contract = {
-            "teacher_pool_manifest_hash": args.teacher_pool_manifest_hash,
-            "approved_teacher_row_ids": args.approved_teacher_row_ids,
-            "action_history_pool_sizes": args.action_history_pool_sizes,
-            "phase_plan": args.resolved_interaction_phase_plan,
-        }
+        resume_contract = dict(resume_state.get("resume_contract", {}) or {})
+        if not resume_contract:
+            raise ValueError(
+                "Resume checkpoint is missing the fixed teacher/model/hyperparameter resume contract."
+            )
+        camera_fingerprint = (
+            None
+            if args.camera_checkpoint is not None
+            else resume_contract.get("camera_checkpoint_fingerprint")
+        )
+        current_contract = training_resume_contract(
+            args,
+            camera_fingerprint=camera_fingerprint,
+        )
+        args.training_resume_contract = dict(current_contract)
         expected_sampling_plan = step_sampler.report(start_step)
         validate_resume_contract(
             resume_contract,

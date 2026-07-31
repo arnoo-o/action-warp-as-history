@@ -15,8 +15,30 @@ ACTION_HISTORY_KEYS = tuple(
 )
 
 
+def interaction_action_ratios(mode):
+    if str(mode) == "adapter_overfit":
+        return {
+            "place": 0.625,
+            "mine_active": 0.1875,
+            "mine_complete": 0.1875,
+            "negative": 0.0,
+        }
+    return {
+        "place": 0.50,
+        "mine_active": 0.15,
+        "mine_complete": 0.15,
+        "negative": 0.20,
+    }
+
+
 class FixedTeacherIntegrityError(RuntimeError):
     pass
+
+
+def _identity_text(value, default=""):
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return str(default)
+    return str(value).strip()
 
 
 def canonical_pool_action(row):
@@ -78,10 +100,22 @@ def approved_row_id(row, fallback=None):
     )
 
 
-def build_action_history_pools(rows, *, require_approved=True, per_pool_limit=None):
+def build_action_history_pools(
+    rows,
+    *,
+    require_approved=True,
+    require_overfit_selected=False,
+    per_pool_limit=None,
+):
     pools = {key: [] for key in ACTION_HISTORY_KEYS}
     for position, row in enumerate(rows):
         if require_approved and str(row.get("review_status", "")).strip().lower() != "approved":
+            continue
+        if require_overfit_selected and _identity_text(row.get("overfit_selected")).lower() not in {
+            "1",
+            "true",
+            "yes",
+        }:
             continue
         key = action_history_key(row)
         if per_pool_limit is None or len(pools[key]) < int(per_pool_limit):
@@ -113,6 +147,26 @@ def stable_json_hash(payload):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _json_identity_value(value):
+    if isinstance(value, dict):
+        return {str(key): _json_identity_value(item) for key, item in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_json_identity_value(item) for item in value]
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
+def interaction_payload_hash(payload):
+    return stable_json_hash(_json_identity_value(payload or {}))
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -126,7 +180,10 @@ def manifest_sha256(path):
 
 
 def model_artifact_fingerprint(path):
-    path = Path(str(path or ""))
+    text = str(path or "").strip()
+    if not text:
+        return {"path": "", "exists": False}
+    path = Path(text)
     if not path.exists():
         return {"path": str(path), "exists": False}
     if path.is_file():
@@ -164,6 +221,8 @@ def candidate_config_payload(args, wah_recipe):
         "use_minecraft_hud_mask",
         "direction_augmentation",
         "seed",
+        "interaction_teacher_support_threshold",
+        "flow_matching_train_exact_timestep_sampling",
     )
     values = {key: str(getattr(args, key, None)) for key in keys}
     for model_key in ("base_model_path", "transformer_path", "camera_checkpoint"):
@@ -178,7 +237,13 @@ def candidate_config_hash(args, wah_recipe):
 
 def fixed_identity_from_row(row):
     return {
-        "event_id": str(row.get("event_id", "")),
+        "event_id": _identity_text(row.get("event_id")),
+        "action_type": "none" if is_negative_action(row.get("action_type")) else _identity_text(row.get("action_type")).lower(),
+        "block_id": _identity_text(row.get("block_id", row.get("object_id", ""))),
+        "object_id": _identity_text(row.get("object_id", row.get("block_id", ""))),
+        "training_category": _identity_text(row.get("training_category", row.get("category", ""))).lower(),
+        "interaction_payload_hash": _identity_text(row.get("interaction_payload_hash")),
+        "source_video_digest": _identity_text(row.get("source_video_digest")),
         "history_type": canonical_history_type(row.get("history_type")),
         "target_indices": parse_index_sequence(row.get("target_indices"), "target_indices"),
         "history_indices": parse_index_sequence(row.get("history_indices"), "history_indices"),
@@ -188,11 +253,11 @@ def fixed_identity_from_row(row):
         "render_pose_indices": parse_index_sequence(row.get("render_pose_indices"), "render_pose_indices"),
         "target_start_frame": int(row.get("target_start_frame", 0)),
         "event_local_frame": int(row.get("event_local_frame", 0) or 0),
-        "chunk_mode": str(row.get("chunk_mode", "")),
-        "direction": str(row.get("direction", "")),
-        "source_segment_id": str(row.get("source_segment_id", row.get("segment_id", ""))),
-        "candidate_cache_key": str(row.get("candidate_cache_key", "")),
-        "candidate_config_hash": str(row.get("candidate_config_hash", "")),
+        "chunk_mode": _identity_text(row.get("chunk_mode")),
+        "direction": _identity_text(row.get("direction")),
+        "source_segment_id": _identity_text(row.get("source_segment_id", row.get("segment_id", ""))),
+        "candidate_cache_key": _identity_text(row.get("candidate_cache_key")),
+        "candidate_config_hash": _identity_text(row.get("candidate_config_hash")),
     }
 
 
@@ -212,6 +277,45 @@ def validate_fixed_identity(row, cached_identity, expected_config_hash):
         raise FixedTeacherIntegrityError(
             "Fixed teacher identity mismatch "
             f"event_id={expected['event_id']} history_type={expected['history_type']}: "
+            + json.dumps(differences, ensure_ascii=False, sort_keys=True)
+        )
+    return expected
+
+
+def fixed_artifact_hashes_from_row(row):
+    return {
+        "candidate_npz_sha256": _identity_text(row.get("candidate_npz_sha256")),
+        "training_cache_sha256": _identity_text(row.get("training_cache_sha256")),
+    }
+
+
+def validate_fixed_artifact_hashes(
+    row,
+    *,
+    candidate_path=None,
+    training_cache_path=None,
+    teacher_payload=None,
+):
+    expected = fixed_artifact_hashes_from_row(row)
+    differences = {}
+    for field, path in (
+        ("candidate_npz_sha256", candidate_path),
+        ("training_cache_sha256", training_cache_path),
+    ):
+        if not expected[field]:
+            differences[field] = {"manifest": expected[field], "error": "missing_hash"}
+        elif path is not None:
+            actual = file_sha256(path)
+            if actual != expected[field]:
+                differences[field] = {"manifest": expected[field], "file": actual}
+        if teacher_payload is not None and field in teacher_payload:
+            cached = str(teacher_payload[field].item())
+            if cached != expected[field]:
+                differences[f"teacher_{field}"] = {"manifest": expected[field], "teacher": cached}
+    if differences:
+        raise FixedTeacherIntegrityError(
+            "Fixed teacher artifact hash mismatch "
+            f"event_id={_identity_text(row.get('event_id'))} history_type={_identity_text(row.get('history_type'))}: "
             + json.dumps(differences, ensure_ascii=False, sort_keys=True)
         )
     return expected

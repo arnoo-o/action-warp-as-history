@@ -52,7 +52,9 @@ from warp_as_history.training.fixed_teacher import (
     FixedTeacherIntegrityError,
     action_history_key,
     canonical_history_type,
+    interaction_payload_hash,
     parse_index_sequence,
+    validate_fixed_artifact_hashes,
     validate_fixed_identity,
     validate_stage0_positive_tokens,
 )
@@ -427,6 +429,18 @@ def _normalize_frame_to_latent_mapping(num_frames, latent_frames, temporal_scale
             }
         )
     return mapping
+
+
+def rgb_frame_to_latent_indices(num_frames, latent_frames, temporal_scale):
+    """Invert the shared VAE temporal coverage map without linear interpolation."""
+    result = [-1] * int(num_frames)
+    for item in _normalize_frame_to_latent_mapping(num_frames, latent_frames, temporal_scale):
+        for frame_index in range(int(item["frame_start"]), int(item["frame_end_exclusive"])):
+            result[frame_index] = int(item["latent_index"])
+    if result and result[-1] < 0:
+        last = max(int(latent_frames) - 1, 0)
+        result = [last if value < 0 else value for value in result]
+    return result
 
 
 def _load_interaction_history_store(path):
@@ -2377,6 +2391,20 @@ def build_online_warp_training_cache(df, exact_args, device):
     rows = [row for _, row in df.iterrows()]
     return OnlineWarpTrainingCache(rows, exact_args, device)
 
+
+def fixed_cache_rows_ready(rows, data_root="."):
+    rows = [row.to_dict() if hasattr(row, "to_dict") else dict(row) for row in rows]
+    if not rows:
+        return False
+    for row in rows:
+        if str(row.get("review_status", "")).strip().lower() != "approved":
+            return False
+        for field in ("training_cache_path", "teacher_cache_path"):
+            path = resolve_optional_data_path(row.get(field, ""), data_root)
+            if path is None or not path.is_file():
+                return False
+    return True
+
 def prompt_cache_key(exact_args, prompt):
     payload = {
         "base_model_path": str(exact_args.base_model_path),
@@ -2853,31 +2881,52 @@ def load_fixed_teacher_training_item(row, exact_args, device, *, requested_categ
             f"manifest={expected_category} requested={requested_category}"
         )
     data_root = getattr(exact_args, "data_root", ".")
+    candidate_path = resolve_optional_data_path(row.get("teacher_candidate_path", ""), data_root)
     training_cache_path = resolve_optional_data_path(row.get("training_cache_path", ""), data_root)
     teacher_cache_path = resolve_optional_data_path(row.get("teacher_cache_path", ""), data_root)
+    if candidate_path is None or not candidate_path.is_file():
+        raise FixedTeacherIntegrityError(f"Missing fixed candidate cache: {candidate_path}")
     if training_cache_path is None or not training_cache_path.is_file():
         raise FixedTeacherIntegrityError(f"Missing fixed training cache: {training_cache_path}")
     if teacher_cache_path is None or not teacher_cache_path.is_file():
         raise FixedTeacherIntegrityError(f"Missing fixed teacher cache: {teacher_cache_path}")
     cached = torch.load(training_cache_path, map_location="cpu", weights_only=False)
-    if int(cached.get("schema_version", 0)) != 1:
+    if int(cached.get("schema_version", 0)) not in {1, 2}:
         raise FixedTeacherIntegrityError(f"Unsupported fixed training cache schema: {training_cache_path}")
     expected_config_hash = str(getattr(exact_args, "fixed_teacher_config_hash", ""))
     identity = validate_fixed_identity(row, dict(cached.get("candidate_identity", {})), expected_config_hash)
+    if interaction_payload_hash(cached.get("interaction_payload")) != identity["interaction_payload_hash"]:
+        raise FixedTeacherIntegrityError(
+            "Fixed training payload hash mismatch "
+            f"event_id={identity['event_id']} history_type={history_type}"
+        )
+    with np.load(candidate_path) as candidate_payload:
+        candidate_identity = json.loads(str(candidate_payload["candidate_identity_json"].item()))
+        validate_fixed_identity(row, candidate_identity, expected_config_hash)
     teacher_payload = np.load(teacher_cache_path)
+    teacher_identity = json.loads(str(teacher_payload["candidate_identity_json"].item()))
+    validate_fixed_identity(row, teacher_identity, expected_config_hash)
+    validate_fixed_artifact_hashes(
+        row,
+        candidate_path=candidate_path,
+        training_cache_path=training_cache_path,
+        teacher_payload=teacher_payload,
+    )
     teacher_candidate_key = str(teacher_payload["candidate_cache_key"].item())
     teacher_config_hash = str(teacher_payload["candidate_config_hash"].item())
     if teacher_candidate_key != identity["candidate_cache_key"] or teacher_config_hash != expected_config_hash:
         raise FixedTeacherIntegrityError(
-            "Fixed teacher cache hash mismatch "
+            "Fixed teacher cache identity mismatch "
             f"event_id={identity['event_id']} history_type={history_type}: "
             f"manifest_candidate={identity['candidate_cache_key']} teacher_candidate={teacher_candidate_key} "
             f"runtime_config={expected_config_hash} teacher_config={teacher_config_hash}"
         )
+    teacher_array = np.asarray(teacher_payload["teacher"]).copy()
+    teacher_payload.close()
     item = _fixed_tree_to_device(cached, device)
     target_latents = item["target_latents"]
     conditioning = item["interaction_conditioning"]
-    teacher = torch.as_tensor(teacher_payload["teacher"], device=device, dtype=torch.float32)
+    teacher = torch.as_tensor(teacher_array, device=device, dtype=torch.float32)
     if teacher.ndim == 4:
         teacher = teacher.unsqueeze(0)
     if teacher.shape[2:] != target_latents.shape[2:]:
@@ -2987,7 +3036,8 @@ class LazyPreparedItems:
         self.memory_prompt_cache = {}
         self.prompt_cache_status_counts = {}
         self.prepare_counter = 0
-        if getattr(self.exact_args, "online_warp_cache", None) is None:
+        self.fixed_cache_only = bool(getattr(self.exact_args, "fixed_cache_only", False))
+        if getattr(self.exact_args, "online_warp_cache", None) is None and not self.fixed_cache_only:
             self.exact_args.online_warp_cache = build_online_warp_training_cache(df, self.exact_args, self.device)
 
     def __len__(self):

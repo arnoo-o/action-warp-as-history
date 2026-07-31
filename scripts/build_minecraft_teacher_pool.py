@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
+import html
 import json
 from collections import Counter
 from pathlib import Path
@@ -13,7 +13,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 from warp_as_history.training.fixed_teacher import (
     is_negative_action,
+    interaction_payload_hash,
     stable_json_hash,
+    validate_fixed_artifact_hashes,
     validate_fixed_identity,
     validate_stage0_positive_tokens,
 )
@@ -96,16 +98,32 @@ def _map_image(value, size, *, color):
     return Image.fromarray((rgb * 255).astype(np.uint8)).resize(size, Image.Resampling.NEAREST)
 
 
+def review_frame_latent_pairs(payload, row):
+    target = np.asarray(payload["target_rgb"])
+    mapping = np.asarray(payload["rgb_frame_to_latent_index"], dtype=np.int64).reshape(-1)
+    if len(mapping) != len(target):
+        raise ValueError(
+            f"rgb_frame_to_latent_index length {len(mapping)} != target RGB frames {len(target)}"
+        )
+    event = int(row.get("event_local_frame", 0) or 0)
+    if is_negative_action(row.get("action_type", "none")):
+        frame_indices = [0, len(target) // 2, len(target) - 1]
+    else:
+        frame_indices = [
+            max(event - 1, 0),
+            min(event, len(target) - 1),
+            min(event + 1, len(target) - 1),
+        ]
+    return [(frame_index, int(mapping[frame_index])) for frame_index in frame_indices]
+
+
 def save_review_contact_sheet(path, payload, teacher, residual, row, stage0_positive_tokens, reasons):
     target = np.asarray(payload["target_rgb"], dtype=np.uint8)
     warp = np.asarray(payload["warp_rgb"], dtype=np.uint8)
     visibility = np.asarray(payload["visibility"], dtype=np.float32)
     world = np.asarray(payload["world_valid"], dtype=np.float32)
     event = int(row.get("event_local_frame", 0) or 0)
-    if str(row.get("action_type", "none")) == "none":
-        frame_indices = [0, len(target) // 2, len(target) - 1]
-    else:
-        frame_indices = [max(event - 1, 0), min(event, len(target) - 1), min(event + 1, len(target) - 1)]
+    frame_latent_pairs = review_frame_latent_pairs(payload, row)
     panel_size = (240, 135)
     labels = ("target RGB", "warp RGB", "residual", "teacher", "teacher overlay", "visibility / world")
     header_height = 120
@@ -123,8 +141,12 @@ def save_review_contact_sheet(path, payload, teacher, residual, row, stage0_posi
     for column, label in enumerate(labels):
         draw.text((column * panel_size[0] + 4, header_height - 18), label, fill="black", font=font)
     latent_frames = int(teacher.shape[1])
-    for row_number, frame_index in enumerate(frame_indices):
-        latent_index = min(int(round(frame_index * (latent_frames - 1) / max(len(target) - 1, 1))), latent_frames - 1)
+    for row_number, (frame_index, latent_index) in enumerate(frame_latent_pairs):
+        if not 0 <= latent_index < latent_frames:
+            raise ValueError(
+                f"Saved RGB-to-latent mapping points outside teacher grid: frame={frame_index} "
+                f"latent={latent_index} latent_frames={latent_frames}"
+            )
         target_image = Image.fromarray(target[frame_index], mode="RGB").resize(panel_size)
         warp_image = Image.fromarray(warp[frame_index], mode="RGB").resize(panel_size)
         residual_image = _map_image(residual[0, latent_index], panel_size, color=0)
@@ -198,6 +220,81 @@ def fixed_teacher_statistics(
     }
 
 
+def rejected_manifest_row(row, reasons):
+    return {
+        **row,
+        "teacher_cache_path": "",
+        "teacher_overlay_path": "",
+        "teacher_cache_key": "",
+        "teacher_area_ratio": "0.00000000",
+        "stage0_positive_tokens": "0",
+        "teacher_invalid_reasons": "|".join(str(reason) for reason in reasons),
+        "teacher_valid": "false",
+        "review_status": "rejected",
+        "review_note": "",
+        "overfit_selected": "false",
+    }
+
+
+def write_review_index(path, rows):
+    groups = (
+        "place|first",
+        "place|later",
+        "mine_active|first",
+        "mine_active|later",
+        "mine_complete|first",
+        "mine_complete|later",
+        "negative|first",
+        "negative|later",
+    )
+    grouped = {name: [] for name in groups}
+    for row in rows:
+        action = "negative" if is_negative_action(row.get("action_type")) else str(row.get("action_type", ""))
+        key = f"{action}|{row.get('history_type', '')}"
+        if key in grouped:
+            grouped[key].append(row)
+    parts = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        "<title>Minecraft teacher review</title>",
+        "<style>body{font-family:sans-serif;margin:24px;background:#f4f1e8;color:#1d261e}",
+        "section{margin:28px 0}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}",
+        ".card{background:white;border:1px solid #c7c2b5;padding:10px}.card img{width:100%;height:auto}",
+        "code{font-size:12px;overflow-wrap:anywhere}.rejected{border-color:#b64632}</style></head><body>",
+        "<h1>Minecraft fixed teacher review</h1>",
+        "<p>This page is read-only. Edit teacher_pool_review_manifest.csv to approve or reject samples.</p>",
+    ]
+    for group in groups:
+        entries = grouped[group]
+        parts.append(f"<section><h2>{html.escape(group)} ({len(entries)})</h2><div class='grid'>")
+        for row in entries:
+            overlay = str(row.get("teacher_overlay_path", "") or "")
+            image_markup = "<p>No preview generated.</p>"
+            if overlay:
+                overlay_path = Path(overlay)
+                try:
+                    overlay = overlay_path.resolve().relative_to(path.parent.resolve()).as_posix()
+                except ValueError:
+                    overlay = overlay_path.as_posix()
+                image_markup = f"<img loading='lazy' src='{html.escape(overlay, quote=True)}'>"
+            css_class = "card rejected" if row.get("review_status") == "rejected" else "card"
+            metadata = "<br>".join(
+                f"{html.escape(label)}: <code>{html.escape(str(row.get(field, '')))}</code>"
+                for label, field in (
+                    ("event_id", "event_id"),
+                    ("action_type", "action_type"),
+                    ("block_id", "block_id"),
+                    ("history_type", "history_type"),
+                    ("teacher_area_ratio", "teacher_area_ratio"),
+                    ("stage0_positive_tokens", "stage0_positive_tokens"),
+                    ("teacher_invalid_reasons", "teacher_invalid_reasons"),
+                )
+            )
+            parts.append(f"<article class='{css_class}'>{image_markup}<p>{metadata}</p></article>")
+        parts.append("</div></section>")
+    parts.append("</body></html>")
+    path.write_text("\n".join(parts), encoding="utf-8")
+
+
 def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -219,8 +316,33 @@ def main():
         "temporal_smoothing": "0.5 current + 0.25 previous + 0.25 following",
     }
     for row in rows:
-        candidate_path = Path(row["teacher_candidate_path"])
-        payload = np.load(candidate_path)
+        precheck_reasons = []
+        candidate_error = str(row.get("candidate_error", "") or "").strip()
+        candidate_path_text = str(row.get("teacher_candidate_path", "") or "").strip()
+        training_cache_text = str(row.get("training_cache_path", "") or "").strip()
+        if candidate_error:
+            precheck_reasons.append(f"candidate_error:{candidate_error}")
+        if not candidate_path_text:
+            precheck_reasons.append("missing_teacher_candidate_path")
+        candidate_path = Path(candidate_path_text) if candidate_path_text else None
+        if candidate_path is not None and not candidate_path.is_file():
+            precheck_reasons.append(f"candidate_file_missing:{candidate_path}")
+        if not training_cache_text:
+            precheck_reasons.append("missing_training_cache_path")
+        training_cache_path = Path(training_cache_text) if training_cache_text else None
+        if training_cache_path is not None and not training_cache_path.is_file():
+            precheck_reasons.append(f"training_cache_file_missing:{training_cache_path}")
+        if precheck_reasons:
+            rejection_counts.update(precheck_reasons)
+            output.append(rejected_manifest_row(row, precheck_reasons))
+            continue
+        try:
+            payload = np.load(candidate_path)
+        except (OSError, ValueError) as exc:
+            reason = f"candidate_load_error:{type(exc).__name__}:{exc}"
+            rejection_counts[reason] += 1
+            output.append(rejected_manifest_row(row, [reason]))
+            continue
         target = payload["target_latents"]
         warp = payload["warp_latents"]
         if target.shape != warp.shape or target.ndim != 4:
@@ -234,6 +356,17 @@ def main():
         expected_candidate_key = str(row.get("candidate_cache_key", ""))
         reasons = []
         validate_fixed_identity(row, identity, str(row.get("candidate_config_hash", "")))
+        validate_fixed_artifact_hashes(
+            row,
+            candidate_path=candidate_path,
+            training_cache_path=training_cache_path,
+        )
+        payload_json = json.loads(str(payload["interaction_payload_json"].item()))
+        if interaction_payload_hash(payload_json) != str(row.get("interaction_payload_hash", "")):
+            raise ValueError(
+                f"Candidate payload hash mismatch event_id={row.get('event_id')} "
+                f"history_type={row.get('history_type')}"
+            )
         action_type = str(row.get("action_type", "none") or "none").strip().lower()
         is_negative = action_type in {"", "none", "negative"}
         if is_negative:
@@ -297,7 +430,7 @@ def main():
                 reasons.append("teacher_too_large")
         cache_payload = {
             "candidate": str(candidate_path.resolve()),
-            "candidate_sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
+            "candidate_sha256": str(row.get("candidate_npz_sha256", "")),
             "recipe": recipe,
             "event_id": row.get("event_id"),
             "history_type": row.get("history_type"),
@@ -314,6 +447,8 @@ def main():
             valid=valid.astype(np.float16),
             candidate_cache_key=np.asarray(expected_candidate_key),
             candidate_config_hash=np.asarray(str(row.get("candidate_config_hash", ""))),
+            candidate_npz_sha256=np.asarray(str(row.get("candidate_npz_sha256", ""))),
+            training_cache_sha256=np.asarray(str(row.get("training_cache_sha256", ""))),
             candidate_identity_json=np.asarray(json.dumps(identity, ensure_ascii=False, sort_keys=True)),
         )
         row["teacher_area_ratio"] = f"{area:.8f}"
@@ -334,25 +469,39 @@ def main():
                 "teacher_invalid_reasons": "|".join(reasons),
                 "teacher_valid": str(not reasons).lower(),
                 "review_status": "pending" if not reasons else "rejected",
+                "review_note": "",
+                "overfit_selected": "false",
+                "teacher_support_threshold": str(float(args.support_threshold)),
                 "stage0_grid_t": str(int(args.stage0_grid[0])),
                 "stage0_grid_h": str(int(args.stage0_grid[1])),
                 "stage0_grid_w": str(int(args.stage0_grid[2])),
             }
         )
+        payload.close()
     manifest_path = args.output_dir / "teacher_pool_review_manifest.csv"
     columns = sorted({key for row in output for key in row})
     with manifest_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(output)
+    review_index_path = args.output_dir / "review_index.html"
+    write_review_index(review_index_path, output)
+    combination_counts = Counter()
+    for row in output:
+        action = "negative" if is_negative_action(row.get("action_type")) else str(row.get("action_type", ""))
+        combination_counts[f"{action}|{row.get('history_type', '')}"] += 1
     (args.output_dir / "teacher_pool_audit.json").write_text(
         json.dumps(
             {
                 "candidate_count": len(rows),
                 "valid_for_review": sum(not row["teacher_invalid_reasons"] for row in output),
+                "pending": sum(row.get("review_status") == "pending" for row in output),
+                "rejected": sum(row.get("review_status") == "rejected" for row in output),
                 "rejection_counts": dict(rejection_counts),
+                "action_history_counts": dict(combination_counts),
                 "recipe": recipe,
                 "manifest": str(manifest_path),
+                "review_index": str(review_index_path),
             },
             indent=2,
             ensure_ascii=False,
