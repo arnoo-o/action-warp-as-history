@@ -27,6 +27,7 @@ require_executable() {
 }
 
 cd "${ROOT}"
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 require_executable "${PYTHON}"
 require_dir "${DATA_ROOT}"
 require_file "${DATA_ROOT}/mc_training_samples.csv"

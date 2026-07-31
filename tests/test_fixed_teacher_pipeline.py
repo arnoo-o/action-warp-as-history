@@ -356,6 +356,12 @@ class FixedTeacherPoolTest(unittest.TestCase):
         teacher_lookup = source.index('row.get("teacher_cache_path", "")', function_start)
         self.assertLess(row_binding, teacher_lookup)
 
+    def test_teacher_preparation_launcher_exports_repo_pythonpath(self):
+        launcher = (ROOT / "scripts" / "run_h100_mc_teacher_preparation.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"', launcher)
+
 
 class NegativeCandidateReviewTest(unittest.TestCase):
     def test_negative_candidate_enters_pending_pool(self):
