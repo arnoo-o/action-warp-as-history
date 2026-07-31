@@ -105,6 +105,41 @@ def base_output_row(row):
     return result
 
 
+def validate_event_metadata(row, args):
+    reasons = []
+    try:
+        fps = float(row.get("fps", 0.0))
+    except (TypeError, ValueError):
+        fps = 0.0
+    if not math.isfinite(fps) or fps <= 0:
+        reasons.append("invalid_fps")
+    try:
+        source_start = int(row.get("source_frame_start", 0))
+        source_end = int(row.get("source_frame_end_exclusive", 0))
+        event_global = int(row.get("event_source_frame", -1))
+    except (TypeError, ValueError):
+        return [*reasons, "invalid_source_frame_mapping"]
+    event_local = event_global - source_start
+    if source_end <= source_start or not (source_start <= event_global < source_end):
+        reasons.append("invalid_source_frame_mapping")
+    if event_local < 6 or (source_end - event_global) < (int(args.num_frames) - 16):
+        reasons.append("event_window_boundary")
+    if not str(row.get("block_id", row.get("object_id", "")) or "").strip():
+        reasons.append("missing_block_id")
+    rotation = row.get("rotation_degrees", row.get("cumulative_rotation", ""))
+    if str(rotation).strip():
+        try:
+            if float(rotation) > float(args.max_cumulative_rotation):
+                reasons.append("camera_rotation")
+        except ValueError:
+            reasons.append("invalid_camera_rotation")
+    if fps > 0 and not str(row.get("source_event_time_ms", "")).strip():
+        row["source_event_time_ms"] = f"{1000.0 * event_global / fps:.6f}"
+    row["verified_event_local_frame"] = str(event_local)
+    row["metadata_filter_status"] = "passed" if not reasons else "rejected"
+    return reasons
+
+
 def make_repo_relative_data_paths(rows, data_root):
     repo_root = data_root.parents[2]
     for row in rows:
@@ -129,10 +164,15 @@ def main():
     audit_json = args.audit_json or root / "mc_interaction_manifest_audit.json"
 
     output = []
+    metadata_rejections = Counter()
     completions_by_segment = defaultdict(list)
     mine_rows = []
     for row in source_rows:
         category = str(row.get("category", "")).strip().lower()
+        reasons = validate_event_metadata(row, args) if category in {"place", "mine"} else []
+        if reasons:
+            metadata_rejections.update(reasons)
+            continue
         if category == "place":
             result = base_output_row(row)
             result["action_type"] = "place"
@@ -255,6 +295,21 @@ def main():
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(output)
+    pool_names = {
+        "place_pool": "place",
+        "mine_active_pool": "mine_active",
+        "mine_complete_pool": "mine_complete",
+        "real_negative_pool": "none",
+    }
+    pool_files = {}
+    for pool_name, action_type in pool_names.items():
+        pool_rows = [row for row in output if str(row.get("action_type", "")) == action_type]
+        pool_path = output_csv.with_name(f"{pool_name}.csv")
+        with pool_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(pool_rows)
+        pool_files[pool_name] = {"path": str(pool_path), "rows": len(pool_rows)}
 
     action_counts = Counter(row.get("action_type", "") for row in output)
     block_counts = {
@@ -268,6 +323,8 @@ def main():
         "action_counts": dict(action_counts),
         "negative_count": negative_count,
         "mine_active_rejections": dict(active_rejections),
+        "metadata_rejections": dict(metadata_rejections),
+        "pool_files": pool_files,
         "block_counts": block_counts,
         "output_csv": str(output_csv),
     }

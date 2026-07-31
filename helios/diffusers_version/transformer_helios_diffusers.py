@@ -813,6 +813,7 @@ class HeliosTransformer3DModel(
         width,
         stage_id=0,
         previous_gate=None,
+        gate_override=None,
     ):
         stack = getattr(self, "interaction_conditioning", None)
         if stack is None:
@@ -831,6 +832,7 @@ class HeliosTransformer3DModel(
             width,
             stage_id=stage_id,
             previous_gate=previous_gate,
+            gate_override=gate_override,
         )
 
     @staticmethod
@@ -959,6 +961,8 @@ class HeliosTransformer3DModel(
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
         self._last_interaction_debug = []
         if interaction_conditioning is not None:
+            if interaction_conditioning.get("gate_override") is not None:
+                raise ValueError("gate_override is training-only and cannot be used by the inference Transformer.")
             hidden_states, interaction_debug = self.apply_interaction_conditioning(
                 hidden_states,
                 interaction_conditioning["warp_latents"],
@@ -970,6 +974,7 @@ class HeliosTransformer3DModel(
                 post_patch_width,
                 stage_id=int(interaction_conditioning.get("stage_id", 0)),
                 previous_gate=interaction_conditioning.get("previous_gate"),
+                gate_override=interaction_conditioning.get("gate_override"),
             )
             self._last_interaction_debug.append(interaction_debug)
         if target_channel_fusion_latents is not None:

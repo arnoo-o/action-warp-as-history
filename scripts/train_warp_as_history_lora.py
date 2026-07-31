@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
 import random
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -67,6 +69,8 @@ import pandas as pd
 import numpy as np
 import torch
 from tqdm import tqdm
+from helios.modules.interaction_conditioning import configure_interaction_trainability
+from helios.modules.interaction_conditioning import align_interaction_signals_to_grid
 
 from warp_as_history.training import core as opt
 from warp_as_history.minecraft_recipe import minecraft_wah_recipe, recipe_mismatches
@@ -177,20 +181,36 @@ class InteractionJointSampler:
 def interaction_training_mode_default_steps(mode):
     mode = str(mode)
     if mode == "joint_pilot":
-        return 300
-    if mode in {"router_overfit", "adapter_overfit"}:
         return 200
+    if mode == "router_overfit":
+        return 200
+    if mode == "adapter_overfit":
+        return 300
     return 1500
 
 
-def interaction_training_mode_phase_plan(mode):
+def interaction_training_mode_phase_plan(mode, total_steps=None, phase_steps=None, first_ratios=None):
     mode = str(mode)
-    if mode == "joint_pilot":
-        return InteractionJointSampler.DEFAULT_PILOT_PHASES
-    if mode == "joint_stage0":
-        return InteractionJointSampler.DEFAULT_STAGE0_PHASES
+    if mode in {"joint_pilot", "joint_stage0"}:
+        total_steps = int(total_steps or interaction_training_mode_default_steps(mode))
+        if phase_steps is None:
+            base, remainder = divmod(total_steps, 3)
+            phase_steps = [base + (1 if index < remainder else 0) for index in range(3)]
+        if first_ratios is None:
+            first_ratios = [0.40, 0.30, 0.25]
+        if len(phase_steps) != 3 or len(first_ratios) != 3:
+            raise ValueError("Interaction Stage 0 curriculum requires exactly three phase steps and ratios.")
+        if sum(int(value) for value in phase_steps) != total_steps:
+            raise ValueError("--interaction_phase_steps must sum to the configured effective steps.")
+        return tuple(
+            {
+                "steps": int(steps),
+                "history": {"first": float(first), "later": 1.0 - float(first)},
+            }
+            for steps, first in zip(phase_steps, first_ratios)
+        )
     return (
-        {"steps": interaction_training_mode_default_steps(mode), "history": {"first": 0.50, "later": 0.50}},
+        {"steps": int(total_steps or interaction_training_mode_default_steps(mode)), "history": {"first": 0.50, "later": 0.50}},
     )
 
 
@@ -250,13 +270,26 @@ def build_minecraft_step_sampler(df, args):
                 source_pools,
                 args.max_steps,
                 args.seed,
-                phases=interaction_training_mode_phase_plan(mode),
+                phases=interaction_training_mode_phase_plan(
+                    mode,
+                    total_steps=args.max_steps,
+                    phase_steps=args.interaction_phase_steps,
+                    first_ratios=args.interaction_first_history_ratios,
+                ),
             )
         else:
-            base_action = "place" if mode == "adapter_overfit" else "mine_active"
-            pools = {base_action: list(source_pools[base_action]), "negative": list(source_pools["negative"])}
-            ratios = {base_action: 0.80, "negative": 0.20}
-            sampler = StepCategorySampler(pools, ratios, args.max_steps, args.seed)
+            clean_subset = {
+                action: list(source_pools[action])[:8]
+                for action in ("place", "mine_active", "mine_complete", "negative")
+            }
+            sampler = InteractionJointSampler(
+                clean_subset,
+                args.max_steps,
+                args.seed,
+                phases=(
+                    {"steps": int(args.max_steps), "history": {"first": 0.50, "later": 0.50}},
+                ),
+            )
         return sampler, {
             "pool_sizes": {name: len(values) for name, values in source_pools.items()},
             "interaction_training_mode": mode,
@@ -459,6 +492,90 @@ def write_interaction_debug_summary(out_dir, step, losses, *, window=150):
     write_json(Path(out_dir) / f"interaction_summary_step{int(step):04d}.json", summary)
 
 
+def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_rows = []
+    maximum = len(df) if int(limit) <= 0 else min(len(df), int(limit))
+    for row_index in range(maximum):
+        row = df.iloc[row_index]
+        action_type = str(row.get("action_type", "none") or "none").strip().lower()
+        category = "negative" if action_type == "none" else "mine" if action_type.startswith("mine") else "place"
+        histories = ["first", "later"]
+        for history_type in histories:
+            try:
+                item = items.get(
+                    row_index,
+                    requested_category=category,
+                    requested_chunk_mode=f"interaction_{history_type}",
+                )
+            except (RuntimeError, ValueError) as exc:
+                manifest_rows.append(
+                    {
+                        **row.to_dict(),
+                        "history_type": history_type,
+                        "teacher_candidate_path": "",
+                        "candidate_error": str(exc),
+                    }
+                )
+                release_cuda_cache()
+                continue
+            conditioning = item.get("interaction_conditioning")
+            if conditioning is None:
+                raise RuntimeError(f"Candidate {row_index}:{history_type} has no interaction conditioning.")
+            target = item["target_latents"].detach().float()
+            aligned = align_interaction_signals_to_grid(
+                conditioning["payload"],
+                batch_size=target.shape[0],
+                temporal=target.shape[2],
+                height=target.shape[3],
+                width=target.shape[4],
+                device=target.device,
+                visibility=conditioning.get("visibility"),
+                world_valid=conditioning.get("world_valid"),
+            )
+            candidate_name = hashlib.sha256(
+                f"{row.get('event_id', row_index)}:{history_type}:{item['seq']}".encode("utf-8")
+            ).hexdigest()
+            candidate_path = output_dir / f"{candidate_name}.npz"
+            np.savez_compressed(
+                candidate_path,
+                target_latents=target[0].cpu().numpy().astype(np.float16),
+                warp_latents=conditioning["warp_latents"][0].detach().float().cpu().numpy().astype(np.float16),
+                action_mask=aligned["action"][0].cpu().numpy().astype(np.float16),
+                visibility=aligned["visibility"][0].cpu().numpy().astype(np.float16),
+                world_valid=aligned["world_valid"][0].cpu().numpy().astype(np.float16),
+            )
+            manifest_rows.append(
+                {
+                    **row.to_dict(),
+                    "history_type": history_type,
+                    "teacher_candidate_path": candidate_path.as_posix(),
+                    "target_reference": str(row.get("video_path", "")),
+                    "warp_reference": str(item.get("seq", "")),
+                    "candidate_error": "",
+                }
+            )
+            del item, target, aligned
+            release_cuda_cache()
+    manifest_path = output_dir / "teacher_candidate_manifest.csv"
+    columns = sorted({key for row in manifest_rows for key in row})
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(manifest_rows)
+    write_json(
+        output_dir / "teacher_candidate_audit.json",
+        {
+            "rows": len(manifest_rows),
+            "successful": sum(not row.get("candidate_error") for row in manifest_rows),
+            "failed": sum(bool(row.get("candidate_error")) for row in manifest_rows),
+            "manifest": str(manifest_path),
+        },
+    )
+    return manifest_path
+
+
 def save_training_state(
     path,
     *,
@@ -471,6 +588,8 @@ def save_training_state(
     distribution_counts=None,
     attempt_step=0,
     skipped_invalid_step=0,
+    adapter_name=None,
+    sampling_plan=None,
 ):
     trainable_state = {
         name: parameter.detach().cpu()
@@ -479,8 +598,20 @@ def save_training_state(
     }
     completed_step = max(int(global_step) - 1, 0)
     payload = {
-        "training_state_version": 3,
+        "training_state_version": 4,
         "trainable_state": trainable_state,
+        "wah_lora_state": {
+            key: value.detach().cpu()
+            for key, value in opt.get_peft_model_state_dict(
+                transformer, adapter_name=adapter_name
+            ).items()
+        },
+        "interaction_state": {
+            key: value.detach().cpu()
+            for key, value in transformer.interaction_conditioning.state_dict().items()
+        }
+        if getattr(transformer, "interaction_conditioning", None) is not None
+        else {},
         "optimizer": optimizer.state_dict(),
         "global_step": int(global_step),
         "current_stage": training_stage_for_step(
@@ -499,6 +630,18 @@ def save_training_state(
         "distribution_counts": dict(distribution_counts or {}),
         "attempt_step": int(attempt_step),
         "skipped_invalid_step": int(skipped_invalid_step),
+        "training_mode": str(args.interaction_training_mode),
+        "interaction_active_stages": [0],
+        "sampling_plan": dict(sampling_plan or {}),
+        "config": vars(args).copy(),
+        "launch_argv": list(sys.argv),
+        "git_commit": subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip(),
         "refined_teacher_cache": {
             key: value.detach().cpu() for key, value in refined_teacher_cache.items()
         },
@@ -515,7 +658,7 @@ def save_training_state(
     torch.save(payload, path)
 
 
-def load_training_state(path, *, transformer, optimizer, device):
+def load_training_state(path, *, transformer, optimizer, device, adapter_name=None):
     payload = torch.load(Path(path), map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or int(payload.get("training_state_version", 0)) < 1:
         print(
@@ -530,6 +673,23 @@ def load_training_state(path, *, transformer, optimizer, device):
         )
         return {"global_step": 0, "refined_teacher_cache": {}, "losses": []}
     named_parameters = dict(transformer.named_parameters())
+    wah_lora_state = dict(payload.get("wah_lora_state", {}))
+    if wah_lora_state:
+        expected_lora = opt.get_peft_model_state_dict(transformer, adapter_name=adapter_name)
+        missing_lora = sorted(set(expected_lora) - set(wah_lora_state))
+        unexpected_lora = sorted(set(wah_lora_state) - set(expected_lora))
+        if missing_lora or unexpected_lora:
+            raise ValueError(
+                f"WAH LoRA checkpoint mismatch: missing={missing_lora[:10]}, unexpected={unexpected_lora[:10]}"
+            )
+        opt.set_peft_model_state_dict(transformer, wah_lora_state, adapter_name=adapter_name)
+    interaction_state = dict(payload.get("interaction_state", {}))
+    if interaction_state:
+        result = transformer.interaction_conditioning.load_state_dict(interaction_state, strict=True)
+        if result.missing_keys or result.unexpected_keys:
+            raise ValueError(
+                f"Interaction checkpoint mismatch: missing={result.missing_keys}, unexpected={result.unexpected_keys}"
+            )
     checkpoint_trainable_state = dict(payload.get("trainable_state", {}))
     missing = []
     for name, value in checkpoint_trainable_state.items():
@@ -602,6 +762,8 @@ def load_training_state(path, *, transformer, optimizer, device):
         },
         "losses": list(payload.get("losses", [])),
         "training_profile": str(payload.get("training_profile", "joint")),
+        "training_mode": str(payload.get("training_mode", "joint_stage0")),
+        "interaction_active_stages": list(payload.get("interaction_active_stages", [0])),
         "wah_recipe": dict(payload.get("wah_recipe", {}) or {}),
         "wah_initialization": dict(payload.get("wah_initialization", {}) or {}),
         "attempt_step": int(payload.get("attempt_step", 0)),
@@ -671,13 +833,29 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=20)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--max_attempt_steps", type=int, default=15000)
-    parser.add_argument("--interaction_router_loss_scale", type=float, default=0.05)
+    parser.add_argument("--interaction_router_loss_scale", type=float, default=0.005)
     parser.add_argument("--interaction_focus_scale", type=float, default=1.0)
     parser.add_argument("--interaction_teacher_support_threshold", type=float, default=0.25)
     parser.add_argument("--interaction_max_metadata_rotation_deg", type=float, default=20.0)
     parser.add_argument("--interaction_max_camera_rotation_deg", type=float, default=20.0)
     parser.add_argument("--interaction_min_telemetry_confidence", type=float, default=0.0)
     parser.add_argument("--interaction_min_mine_active_frames", type=int, default=4)
+    parser.add_argument(
+        "--require_approved_teacher_pool",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--teacher_pool_review_column", default="review_status")
+    parser.add_argument("--export_teacher_candidates_only", action="store_true")
+    parser.add_argument("--teacher_candidate_output_dir", type=Path, default=None)
+    parser.add_argument("--teacher_candidate_limit", type=int, default=0)
+    parser.add_argument("--interaction_phase_steps", type=int, nargs=3, default=None)
+    parser.add_argument(
+        "--interaction_first_history_ratios",
+        type=float,
+        nargs=3,
+        default=[0.40, 0.30, 0.25],
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=384)
     parser.add_argument("--width", type=int, default=640)
@@ -737,7 +915,7 @@ def parse_args():
     parser.add_argument("--interaction_router_spatial_loss_scale", type=float, default=1.0)
     parser.add_argument("--interaction_router_negative_loss_scale", type=float, default=0.25)
     parser.add_argument("--interaction_router_sparsity_loss_scale", type=float, default=0.01)
-    parser.add_argument("--interaction_debug_every", type=int, default=100)
+    parser.add_argument("--interaction_debug_every", type=int, default=0)
     parser.add_argument("--use_minecraft_hud_mask", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--online_frame_stride", type=int, default=1)
     parser.add_argument(
@@ -792,7 +970,7 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--lora_target_modules", default="attn1.to_q,attn1.to_k,attn1.to_v,attn1.to_out.0")
     parser.add_argument("--lora_adapter_name", default="warp_as_history")
-    parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--save_every", type=int, default=150)
     parser.add_argument("--save_steps", type=int, nargs="*", default=[300, 500, 750, 1000, 1500])
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
@@ -961,7 +1139,11 @@ def main():
         )
     if str(args.training_profile) == "camera":
         args.interaction_conditioning_mode = "off"
-    if str(args.training_profile) == "interaction" and args.camera_checkpoint is None:
+    if (
+        str(args.training_profile) == "interaction"
+        and args.camera_checkpoint is None
+        and args.resume_from_checkpoint is None
+    ):
         raise ValueError("--training_profile interaction requires --camera_checkpoint.")
     if args.camera_checkpoint is not None and args.resume_from_checkpoint is not None:
         raise ValueError("--camera_checkpoint initializes a new stage and cannot be combined with --resume_from_checkpoint.")
@@ -1004,6 +1186,39 @@ def main():
         prompts = {str(value).strip() for value in df["prompt"].tolist()}
         if prompts != {NEUTRAL_MINECRAFT_PROMPT}:
             raise ValueError(f"Interaction training requires the exact neutral prompt, got {sorted(prompts)}.")
+        if bool(args.require_approved_teacher_pool) and not bool(args.export_teacher_candidates_only):
+            review_column = str(args.teacher_pool_review_column)
+            if review_column not in df.columns:
+                raise ValueError(
+                    f"Interaction module validation requires an audited teacher pool column {review_column!r}."
+                )
+            approved = df[review_column].fillna("").astype(str).str.lower().eq("approved")
+            df = df.loc[approved].reset_index(drop=True)
+            if df.empty:
+                raise ValueError("The audited teacher pool contains no review_status=approved rows.")
+            positive_rows = df["action_type"].fillna("").astype(str).ne("none")
+            if "stage0_positive_tokens" not in df.columns:
+                raise ValueError("Audited teacher pool is missing stage0_positive_tokens.")
+            invalid_stage0 = positive_rows & (
+                pd.to_numeric(df["stage0_positive_tokens"], errors="coerce").fillna(0) <= 0
+            )
+            if bool(invalid_stage0.any()):
+                raise ValueError(
+                    f"Audited teacher pool contains {int(invalid_stage0.sum())} positive rows with empty Stage 0 support."
+                )
+            if "teacher_cache_path" not in df.columns:
+                raise ValueError("Audited teacher pool is missing teacher_cache_path.")
+            missing_teacher_cache = []
+            for row_index, cache_value in df.loc[positive_rows, "teacher_cache_path"].items():
+                cache_path = Path(str(cache_value))
+                if not cache_path.is_absolute():
+                    cache_path = REPO_ROOT / cache_path
+                if not cache_path.is_file():
+                    missing_teacher_cache.append((int(row_index), str(cache_path)))
+            if missing_teacher_cache:
+                raise ValueError(
+                    f"Audited teacher pool has missing fixed teacher files: {missing_teacher_cache[:5]}"
+                )
     exact_args.online_warp_cache = build_online_warp_training_cache(df, exact_args, device)
     step_sampler, sampler_meta = build_minecraft_step_sampler(df, args)
     skipped_rows = []
@@ -1083,6 +1298,15 @@ def main():
         ),
         flush=True,
     )
+    if bool(args.export_teacher_candidates_only):
+        candidate_dir = args.teacher_candidate_output_dir or (out_dir / "teacher_candidates")
+        manifest_path = export_teacher_candidates(
+            items, df, exact_args, candidate_dir, limit=args.teacher_candidate_limit
+        )
+        print(json.dumps({"event": "teacher_candidates_exported", "manifest": str(manifest_path)}), flush=True)
+        if tb_writer is not None:
+            tb_writer.close()
+        return
 
     opt.seed_global_rng(args.seed)
     adapter_name, lora_params, lora_stats = opt.setup_visible_lora(pipe.transformer, exact_args, "shared")
@@ -1167,9 +1391,6 @@ def main():
     interaction_mode = str(getattr(args, "interaction_training_mode", "joint_stage0"))
     wah_params = []
     interaction_params = []
-    interaction_router_params = []
-    interaction_adapter_params = []
-    interaction_other_params = []
     for param in lora_params:
         name = named_params.get(id(param), "")
         is_interaction = name.startswith("interaction_conditioning.") or ".interaction_conditioning." in name
@@ -1180,24 +1401,24 @@ def main():
         if param.requires_grad:
             if is_interaction:
                 interaction_params.append(param)
-                if ".router." in name:
-                    interaction_router_params.append(param)
-                elif ".adapter." in name:
-                    interaction_adapter_params.append(param)
-                else:
-                    interaction_other_params.append(param)
             else:
                 wah_params.append(param)
-    if profile == "interaction":
-        if interaction_mode == "router_overfit":
-            for param in interaction_adapter_params:
-                param.requires_grad_(False)
-            interaction_params = [param for param in interaction_params if param.requires_grad]
-        elif interaction_mode == "adapter_overfit":
-            for param in interaction_router_params:
-                param.requires_grad_(False)
-            interaction_params = [param for param in interaction_params if param.requires_grad]
-            interaction_router_params = []
+    if profile in {"interaction", "joint"}:
+        interaction_groups = configure_interaction_trainability(
+            pipe.transformer.interaction_conditioning, interaction_mode
+        )
+        interaction_other_params = interaction_groups["interaction_semantic"]
+        interaction_router_params = interaction_groups["interaction_router"]
+        interaction_adapter_params = interaction_groups["interaction_adapter"]
+        interaction_params = [
+            *interaction_other_params,
+            *interaction_router_params,
+            *interaction_adapter_params,
+        ]
+    else:
+        interaction_other_params = []
+        interaction_router_params = []
+        interaction_adapter_params = []
     if profile == "camera" and interaction_params:
         raise RuntimeError("Camera profile must not train interaction parameters.")
     if profile == "interaction" and wah_params:
@@ -1226,6 +1447,32 @@ def main():
                 "name": "interaction_router",
             }
         )
+    if interaction_adapter_params and any(param.requires_grad for param in interaction_adapter_params):
+        groups.append(
+            {
+                "params": [param for param in interaction_adapter_params if param.requires_grad],
+                "lr": interaction_lr,
+                "base_lr": interaction_lr,
+                "name": "interaction_adapter",
+            }
+        )
+    if not groups:
+        raise ValueError(f"No optimizer parameters for training mode {interaction_mode!r}.")
+    for group in groups:
+        group_names = [named_params.get(id(param), "<unnamed>") for param in group["params"]]
+        print(
+            json.dumps(
+                {
+                    "event": "optimizer_group",
+                    "name": group["name"],
+                    "learning_rate": float(group["lr"]),
+                    "parameter_count": int(sum(param.numel() for param in group["params"])),
+                    "parameter_tensors": len(group["params"]),
+                    "parameter_prefixes": group_names[:12],
+                }
+            ),
+            flush=True,
+        )
     optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
 
     losses = []
@@ -1237,10 +1484,17 @@ def main():
             transformer=pipe.transformer,
             optimizer=optimizer,
             device=device,
+            adapter_name=adapter_name,
         )
         start_step = int(resume_state["global_step"])
         if str(resume_state.get("training_profile", args.training_profile)) != str(args.training_profile):
             raise ValueError("Resume checkpoint training_profile does not match the current profile.")
+        if str(resume_state.get("training_mode", args.interaction_training_mode)) != str(
+            args.interaction_training_mode
+        ):
+            raise ValueError("Resume checkpoint interaction_training_mode does not match the current mode.")
+        if list(resume_state.get("interaction_active_stages", [0])) != [0]:
+            raise ValueError("Resume checkpoint must use interaction_active_stages=[0].")
         resume_recipe = resume_state.get("wah_recipe")
         if resume_recipe:
             mismatches = recipe_mismatches(resume_recipe, pipe.transformer._wah_recipe)
@@ -1355,7 +1609,7 @@ def main():
                 if (
                     sampled_action not in {"place", "mine_active", "mine_complete"}
                     and sampled_class != "camera_rollout"
-                ) or retry == max_prepare_retries - 1:
+                ):
                     raise
                 if sampled_action in {"place", "mine_active", "mine_complete"}:
                     distribution_counts["invalid_event_retries"] += 1
@@ -1448,6 +1702,11 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = float(group["base_lr"]) * lr_scale
         optimizer.zero_grad(set_to_none=True)
+        trainable_before = {
+            name: param.detach().float().clone()
+            for name, param in pipe.transformer.named_parameters()
+            if param.requires_grad and name.startswith("interaction_conditioning.")
+        }
         loss, stats, interaction_feedback = opt.flow_matching_loss(
             pipe,
             item["prompt_embeds"],
@@ -1461,6 +1720,11 @@ def main():
             target_channel_fusion_latents=item.get("primary_fire_event_latents"),
             interaction_conditioning=item.get("interaction_conditioning"),
             interaction_teacher_map=router_teacher_map,
+            interaction_gate_override=(
+                router_teacher_map.detach()
+                if str(args.interaction_training_mode) == "adapter_overfit" and router_teacher_map is not None
+                else None
+            ),
             interaction_adapter_enabled=str(args.interaction_training_mode) != "router_overfit",
             compute_bidirectional_feedback=compute_bidirectional_feedback,
             bidirectional_feedback_weight=float(args.bidirectional_feedback_weight),
@@ -1491,10 +1755,33 @@ def main():
                 input_debug=item.get("interaction_debug_inputs"),
             )
         loss.backward()
+        router_grad_sq = 0.0
+        adapter_grad_sq = 0.0
+        for name, param in pipe.transformer.named_parameters():
+            if param.grad is None or not name.startswith("interaction_conditioning."):
+                continue
+            value = float(param.grad.detach().float().square().sum().item())
+            if ".router." in name or ".semantic_encoder." in name:
+                router_grad_sq += value
+            elif ".adapter." in name:
+                adapter_grad_sq += value
         grad_norm = None
         if float(args.max_grad_norm) > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=float(args.max_grad_norm))
         optimizer.step()
+        router_update_sq = 0.0
+        adapter_update_sq = 0.0
+        for name, before in trainable_before.items():
+            param = dict(pipe.transformer.named_parameters())[name]
+            value = float((param.detach().float() - before).square().sum().item())
+            if ".router." in name or ".semantic_encoder." in name:
+                router_update_sq += value
+            elif ".adapter." in name:
+                adapter_update_sq += value
+        stats["interaction_router_grad_norm"] = math.sqrt(router_grad_sq)
+        stats["interaction_adapter_grad_norm"] = math.sqrt(adapter_grad_sq)
+        stats["interaction_router_update_norm"] = math.sqrt(router_update_sq)
+        stats["interaction_adapter_update_norm"] = math.sqrt(adapter_update_sq)
         pipe.transformer.set_adapter(adapter_name)
 
         record = {
@@ -1533,6 +1820,18 @@ def main():
             "event_valid": float((item.get("interaction_payload") or {}).get("event_valid", 0.0)),
             "action_type": str((item.get("interaction_payload") or {}).get("action_type", "none")),
             "block_id": (item.get("interaction_payload") or {}).get("block_id"),
+            "progress_min": min(
+                (item.get("interaction_payload") or {}).get("frame_progress_curve", [0.0]) or [0.0]
+            ),
+            "progress_max": max(
+                (item.get("interaction_payload") or {}).get("frame_progress_curve", [0.0]) or [0.0]
+            ),
+            "source_action_start_frame": (item.get("interaction_payload") or {}).get(
+                "source_action_start_frame"
+            ),
+            "source_complete_frame": (item.get("interaction_payload") or {}).get(
+                "source_complete_frame"
+            ),
             "teacher_valid": bool(item.get("interaction_teacher_valid", False)),
             "teacher_area_ratio": item.get("interaction_teacher_area_ratio"),
             "teacher_visibility_ratio": item.get("interaction_teacher_visibility_ratio"),
@@ -1589,6 +1888,8 @@ def main():
                 distribution_counts=distribution_counts,
                 attempt_step=attempt_step,
                 skipped_invalid_step=skipped_invalid_step,
+                adapter_name=adapter_name,
+                sampling_plan=step_sampler.report(step + 1),
             )
             write_interaction_debug_summary(out_dir, step + 1, losses, window=150)
 
@@ -1612,6 +1913,8 @@ def main():
         distribution_counts=distribution_counts,
         attempt_step=attempt_step,
         skipped_invalid_step=skipped_invalid_step,
+        adapter_name=adapter_name,
+        sampling_plan=step_sampler.report(effective_optimizer_step),
     )
     write_json(loss_path, losses)
     distribution_report = {

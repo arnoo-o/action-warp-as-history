@@ -16,6 +16,128 @@ DEFAULT_STAGE_WARP_SCALES = (1.0, 0.5, 0.25)
 DEFAULT_STAGE_ADAPTER_SCALES = (1.0, 0.5, 0.25)
 
 
+def _as_bcthw(value, batch_size, device, *, default_shape=None):
+    if value is None:
+        if default_shape is None:
+            return None
+        return torch.ones(batch_size, 1, *default_shape, device=device, dtype=torch.float32)
+    value = torch.as_tensor(value, device=device, dtype=torch.float32)
+    if value.ndim == 4:
+        value = value.unsqueeze(1)
+    if value.shape[0] == 1 and batch_size > 1:
+        value = value.expand(batch_size, -1, -1, -1, -1)
+    if value.ndim != 5 or value.shape[0] != batch_size:
+        raise ValueError(f"interaction map must have shape [B,1,T,H,W], got {tuple(value.shape)}")
+    return value
+
+
+def pool_frame_signals_to_time(frame_action_mask, frame_progress_curve, temporal):
+    """Coverage-pool source-frame controls onto an arbitrary latent/token time axis."""
+    frame_count = int(frame_action_mask.shape[1])
+    pooled_mask = []
+    pooled_progress = []
+    for time_index in range(int(temporal)):
+        start = int(math.floor(time_index * frame_count / int(temporal)))
+        end = max(int(math.ceil((time_index + 1) * frame_count / int(temporal))), start + 1)
+        mask_slice = frame_action_mask[:, start:end]
+        progress_slice = frame_progress_curve[:, start:end]
+        coverage = mask_slice.amax(dim=1)
+        progress = (progress_slice * mask_slice).sum(dim=1) / mask_slice.sum(dim=1).clamp_min(1.0)
+        pooled_mask.append(coverage)
+        pooled_progress.append(progress * (coverage > 0).to(progress))
+    return torch.stack(pooled_mask, dim=1), torch.stack(pooled_progress, dim=1)
+
+
+def mine_progress_for_source_frames(source_frames, action_start_frame, complete_frame):
+    """Return source-timeline progress so overlapping windows agree exactly."""
+    start = int(action_start_frame)
+    complete = int(complete_frame)
+    duration = max(complete - start, 1)
+    return [
+        min(max((int(frame) - start) / float(duration), 0.0), 1.0 - 1.0e-6)
+        if start <= int(frame) < complete
+        else 0.0
+        for frame in source_frames
+    ]
+
+
+def align_interaction_signals_to_grid(
+    payload,
+    *,
+    batch_size,
+    temporal,
+    height,
+    width,
+    device,
+    visibility=None,
+    world_valid=None,
+    teacher=None,
+):
+    """Share RGB-frame -> latent/token-grid alignment across Router, Adapter and loss."""
+    frame_action = InteractionConditioningStack._payload_frame_signal(
+        payload, "frame_action_mask", batch_size, device
+    )
+    frame_progress = InteractionConditioningStack._payload_frame_signal(
+        payload, "frame_progress_curve", batch_size, device
+    )
+    action_time, progress_time = pool_frame_signals_to_time(frame_action, frame_progress, temporal)
+    action = action_time.view(batch_size, 1, temporal, 1, 1).expand(-1, 1, -1, height, width)
+    progress = progress_time.view(batch_size, 1, temporal, 1, 1).expand(-1, 1, -1, height, width)
+
+    visibility = _as_bcthw(
+        visibility, batch_size, device, default_shape=(temporal, height, width)
+    )
+    visibility = F.adaptive_avg_pool3d(visibility, (temporal, height, width)).clamp(0.0, 1.0)
+    world_valid = _as_bcthw(
+        world_valid, batch_size, device, default_shape=(temporal, height, width)
+    )
+    world_valid = (
+        F.adaptive_avg_pool3d(world_valid, (temporal, height, width)) >= 0.999
+    ).to(dtype=torch.float32)
+
+    aligned = {
+        "action": action,
+        "progress": progress,
+        "visibility": visibility,
+        "world_valid": world_valid,
+        "valid": action * visibility * world_valid,
+    }
+    if teacher is not None:
+        teacher = _as_bcthw(teacher, batch_size, device)
+        # Adaptive max pooling preserves compact interaction regions on the coarse Stage 0 grid.
+        aligned["teacher"] = F.adaptive_max_pool3d(
+            teacher, (temporal, height, width)
+        ).clamp(0.0, 1.0)
+    return aligned
+
+
+def configure_interaction_trainability(stack, mode):
+    """Apply the four module-validation freeze policies and return named optimizer groups."""
+    mode = str(mode)
+    if mode not in {"router_overfit", "adapter_overfit", "joint_pilot", "joint_stage0"}:
+        raise ValueError(f"Unsupported interaction training mode: {mode}")
+    groups = {"interaction_semantic": [], "interaction_router": [], "interaction_adapter": []}
+    for name, parameter in stack.named_parameters():
+        if name.startswith(("stage_warp_scales", "stage_adapter_scales")):
+            trainable = False
+        elif mode == "router_overfit":
+            trainable = name.startswith(("semantic_encoder.", "stage_embedding.", "router."))
+        elif mode == "adapter_overfit":
+            trainable = name.startswith("adapter.")
+        else:
+            trainable = name.startswith(("semantic_encoder.", "stage_embedding.", "router.", "adapter."))
+        parameter.requires_grad_(trainable)
+        if not trainable:
+            continue
+        if name.startswith("adapter."):
+            groups["interaction_adapter"].append(parameter)
+        elif name.startswith("router."):
+            groups["interaction_router"].append(parameter)
+        else:
+            groups["interaction_semantic"].append(parameter)
+    return groups
+
+
 def interaction_action_id(action_type: str | None) -> int:
     return int(INTERACTION_ACTION_TO_ID.get(str(action_type or "none").strip().lower(), 0))
 
@@ -146,7 +268,7 @@ class InteractionRouter(nn.Module):
 
 
 class InteractionAdapter(nn.Module):
-    def __init__(self, hidden_dim: int, semantic_dim: int = 256, rank: int = 64, scale: float = 0.1):
+    def __init__(self, hidden_dim: int, semantic_dim: int = 256, rank: int = 64, scale: float = 1.0):
         super().__init__()
         rank = int(min(rank, hidden_dim))
         self.target_down = nn.Linear(hidden_dim, rank, bias=False)
@@ -194,6 +316,7 @@ class InteractionConditioningStack(nn.Module):
         self.active_stages = tuple(sorted({int(stage) for stage in active_stages}))
         if not self.active_stages or any(stage < 0 or stage >= INTERACTION_PYRAMID_STAGES for stage in self.active_stages):
             raise ValueError(f"active_stages must be a non-empty subset of [0, 1, 2], got {self.active_stages}.")
+        self.stage_warp_scales.requires_grad_(False)
         self.stage_adapter_scales.requires_grad_(False)
 
     @staticmethod
@@ -229,40 +352,6 @@ class InteractionConditioningStack(nn.Module):
             raise ValueError(f"interaction payload {name} must have shape [B,F], got {tuple(value.shape)}.")
         return value
 
-    @staticmethod
-    def _pool_frame_signals(frame_action_mask, frame_progress_curve, temporal):
-        """Coverage-pool RGB-frame controls onto the actual patch-token time axis."""
-        frame_count = int(frame_action_mask.shape[1])
-        temporal = int(temporal)
-        pooled_mask = []
-        pooled_progress = []
-        for latent_index in range(temporal):
-            start = int(math.floor(latent_index * frame_count / temporal))
-            end = int(math.ceil((latent_index + 1) * frame_count / temporal))
-            end = max(end, start + 1)
-            mask_slice = frame_action_mask[:, start:end]
-            progress_slice = frame_progress_curve[:, start:end]
-            coverage = mask_slice.amax(dim=1)
-            denominator = mask_slice.sum(dim=1).clamp_min(1.0)
-            progress = (progress_slice * mask_slice).sum(dim=1) / denominator
-            pooled_mask.append(coverage)
-            pooled_progress.append(progress * (coverage > 0).to(progress))
-        return torch.stack(pooled_mask, dim=1), torch.stack(pooled_progress, dim=1)
-
-    @staticmethod
-    def _align_spatial_mask(mask, batch_size, temporal, height, width, device, *, conservative):
-        if mask is None:
-            return torch.ones(batch_size, 1, temporal, height, width, device=device, dtype=torch.float32)
-        mask = torch.as_tensor(mask, device=device, dtype=torch.float32)
-        if mask.ndim == 4:
-            mask = mask.unsqueeze(1)
-        if mask.shape[0] == 1 and batch_size > 1:
-            mask = mask.expand(batch_size, -1, -1, -1, -1)
-        if mask.ndim != 5 or mask.shape[0] != batch_size:
-            raise ValueError(f"interaction spatial mask must have shape [B,1,T,H,W], got {tuple(mask.shape)}.")
-        aligned = F.adaptive_avg_pool3d(mask, output_size=(temporal, height, width))
-        return (aligned >= 0.999).to(aligned) if conservative else aligned.clamp(0.0, 1.0)
-
     def forward(
         self,
         target_tokens,
@@ -276,6 +365,7 @@ class InteractionConditioningStack(nn.Module):
         interaction_adapter_enabled=True,
         stage_id=0,
         previous_gate=None,
+        gate_override=None,
     ):
         batch_size = target_tokens.shape[0]
         device = target_tokens.device
@@ -311,19 +401,23 @@ class InteractionConditioningStack(nn.Module):
         stage_ids = torch.full((batch_size,), stage_id, device=device, dtype=torch.long)
         semantic = semantic + self.stage_embedding(stage_ids)
 
-        visibility = self._align_spatial_mask(
-            visibility, batch_size, temporal, height, width, device, conservative=False
+        aligned = align_interaction_signals_to_grid(
+            payload,
+            batch_size=batch_size,
+            temporal=temporal,
+            height=height,
+            width=width,
+            device=device,
+            visibility=visibility,
+            world_valid=world_valid,
+            teacher=gate_override,
         )
-        world_valid = self._align_spatial_mask(
-            world_valid, batch_size, temporal, height, width, device, conservative=True
-        )
+        visibility = aligned["visibility"]
+        world_valid = aligned["world_valid"]
         visibility_tokens = visibility.flatten(2).transpose(1, 2)
         world_valid_tokens = world_valid.flatten(2).transpose(1, 2)
-        frame_action_mask = self._payload_frame_signal(payload, "frame_action_mask", batch_size, device)
-        frame_progress_curve = self._payload_frame_signal(payload, "frame_progress_curve", batch_size, device)
-        temporal_action, temporal_progress = self._pool_frame_signals(
-            frame_action_mask, frame_progress_curve, temporal
-        )
+        temporal_action = aligned["action"][:, 0, :, 0, 0]
+        temporal_progress = aligned["progress"][:, 0, :, 0, 0]
         action_tokens = temporal_action.repeat_interleave(height * width, dim=1).unsqueeze(-1)
         progress_tokens = temporal_progress.repeat_interleave(height * width, dim=1).unsqueeze(-1)
         warp_tokens = warp_tokens * self.stage_warp_scales[stage_id].to(warp_tokens)
@@ -361,8 +455,11 @@ class InteractionConditioningStack(nn.Module):
             previous_support=previous_support_tokens,
             is_refinement=stage_id > 0,
         )
+        injection_gate = raw_gate
+        if gate_override is not None:
+            injection_gate = aligned["teacher"].flatten(2).transpose(1, 2).detach().to(raw_gate)
         final_gate = (
-            raw_gate
+            injection_gate
             * visibility_tokens.to(raw_gate)
             * world_valid_tokens.to(raw_gate)
             * action_tokens.to(raw_gate)
@@ -405,6 +502,7 @@ class InteractionConditioningStack(nn.Module):
             "interaction_active": True,
             "interaction_token": semantic,
             "raw_gate": raw_gate_map,
+            "gate_override_used": bool(gate_override is not None),
             "final_gate": final_gate_map,
             "valid_injection_region": valid_injection_map,
             "world_valid_region": world_valid_map,

@@ -1431,6 +1431,7 @@ class HeliosTransformer3DModel(
         interaction_adapter_enabled=True,
         stage_id=0,
         previous_gate=None,
+        gate_override=None,
     ):
         stack = getattr(self, "interaction_conditioning", None)
         if stack is None:
@@ -1451,6 +1452,7 @@ class HeliosTransformer3DModel(
             interaction_adapter_enabled=interaction_adapter_enabled,
             stage_id=stage_id,
             previous_gate=previous_gate,
+            gate_override=gate_override,
         )
 
     @staticmethod
@@ -1652,6 +1654,7 @@ class HeliosTransformer3DModel(
                         interaction_adapter_enabled=interaction_adapter_enabled,
                         stage_id=int(interaction_stage_ids[idx]),
                         previous_gate=previous_interaction_gate,
+                        gate_override=interaction_conditioning.get("gate_override"),
                     )
                     interaction_debug.append(cur_debug)
                     previous_interaction_gate = cur_debug["predicted_gate"]
@@ -1727,6 +1730,7 @@ class HeliosTransformer3DModel(
                     interaction_adapter_enabled=interaction_adapter_enabled,
                     stage_id=int(interaction_conditioning.get("stage_id", 0)),
                     previous_gate=interaction_conditioning.get("previous_gate"),
+                    gate_override=interaction_conditioning.get("gate_override"),
                 )
                 interaction_debug.append(cur_debug)
             if target_channel_fusion_latents is not None:

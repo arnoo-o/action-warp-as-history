@@ -8,12 +8,17 @@ MODE="${WAH_INTERACTION_MODE:-joint_pilot}"
 STEPS="${WAH_STEPS:-300}"
 RUN_NAME="${WAH_RUN_NAME:-mc_interaction_${MODE}_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="runs/${RUN_NAME}"
+TRAIN_CSV="${WAH_TRAIN_CSV:-data/vpt_9x_100/wah_mc_training/teacher_pool/teacher_pool_review_manifest.csv}"
 LOG_FILE="runs/${RUN_NAME}.log"
 STATUS_FILE="runs/${RUN_NAME}.status"
 PID_FILE="runs/${RUN_NAME}.pid"
 
 cd "${ROOT}"
 mkdir -p runs
+if [[ ! -f "${TRAIN_CSV}" ]]; then
+  echo "Missing audited teacher pool: ${TRAIN_CSV}" >&2
+  exit 2
+fi
 echo "$$" > "${PID_FILE}"
 printf 'starting %s\n' "$(date -Is)" > "${STATUS_FILE}"
 
@@ -31,7 +36,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" PYTHONUNBUFFERED=1 "${PYTHON}" scripts/train_warp_
   --base_model_path checkpoints/helios-distilled \
   --transformer_path checkpoints/helios-distilled \
   --data_root . \
-  --prompt_csv data/vpt_9x_100/wah_mc_training/mc_interaction_training_samples.csv \
+  --prompt_csv "${TRAIN_CSV}" \
   --output_dir "${OUTPUT_DIR}" \
   --training_profile interaction \
   --interaction_training_mode "${MODE}" \
@@ -42,7 +47,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" PYTHONUNBUFFERED=1 "${PYTHON}" scripts/train_warp_
   --warmup_steps 50 \
   --max_grad_norm 1.0 \
   --max_attempt_steps 15000 \
-  --interaction_router_loss_scale 0.01 \
+  --interaction_router_loss_scale 0.005 \
   --interaction_focus_scale 1.0 \
   --interaction_teacher_support_threshold 0.25 \
   --interaction_max_metadata_rotation_deg 20 \
@@ -66,9 +71,10 @@ CUDA_VISIBLE_DEVICES="${GPU}" PYTHONUNBUFFERED=1 "${PYTHON}" scripts/train_warp_
   --warp_history_downsample_mode short \
   --history_positioning last_n_same_order \
   --prompt_cache_dir runs/mc_prompt_cache \
-  --flow_matching_stage_sampling all \
+  --flow_matching_stage_sampling fixed \
+  --flow_matching_stage_id 0 \
   --save_every 150 \
-  --interaction_debug_every 50 \
+  --interaction_debug_every 0 \
   --log_every 1 \
   --no-direction_augmentation \
   --no-enable_bidirectional_training \

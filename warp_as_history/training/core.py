@@ -28,6 +28,7 @@ from diffusers.training_utils import compute_density_for_timestep_sampling, comp
 from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline, calculate_shift
 from helios.diffusers_version.scheduling_helios_diffusers import HeliosScheduler
 from helios.modules.transformer_helios import HeliosTransformer3DModel as TrainingHeliosTransformer3DModel
+from helios.modules.interaction_conditioning import align_interaction_signals_to_grid
 from helios.utils.utils_base import apply_schedule_shift
 from helios.modules.helios_kernels import (
     replace_all_norms_with_flash_norms,
@@ -1499,6 +1500,7 @@ def pyramid_stage_model_forward(
                     "world_valid": stage_interaction.get("world_valid"),
                     "stage_id": stage_id,
                     "previous_gate": previous_gate,
+                    "gate_override": stage_interaction.get("gate_override"),
                 }
             current_fusion = (
                 None
@@ -1537,39 +1539,18 @@ def _interaction_latent_valid_region(interaction_conditioning, target_shape, dev
         return None
     temporal, height, width = (int(value) for value in target_shape)
     payload = interaction_conditioning["payload"]
-    frame_mask = payload.get("frame_action_mask")
-    if frame_mask is None:
-        return None
-    frame_mask = torch.as_tensor(frame_mask, device=device, dtype=torch.float32)
-    if frame_mask.ndim == 1:
-        frame_mask = frame_mask.unsqueeze(0)
-    frame_count = int(frame_mask.shape[1])
-    pooled = []
-    for latent_index in range(temporal):
-        start = int(math.floor(latent_index * frame_count / temporal))
-        end = max(int(math.ceil((latent_index + 1) * frame_count / temporal)), start + 1)
-        pooled.append(frame_mask[:, start:end].amax(dim=1))
-    action = torch.stack(pooled, dim=1).view(frame_mask.shape[0], 1, temporal, 1, 1)
-    visibility = interaction_conditioning.get("visibility")
-    if visibility is None:
-        visibility = torch.ones(
-            frame_mask.shape[0], 1, temporal, height, width, device=device, dtype=torch.float32
-        )
-    else:
-        visibility = F.adaptive_avg_pool3d(
-            visibility.to(device=device, dtype=torch.float32), (temporal, height, width)
-        ).clamp(0.0, 1.0)
-    world = interaction_conditioning.get("world_valid")
-    if world is None:
-        world = torch.ones_like(visibility)
-    else:
-        world = (
-            F.adaptive_avg_pool3d(
-                world.to(device=device, dtype=torch.float32), (temporal, height, width)
-            )
-            >= 0.999
-        ).to(visibility)
-    return action * visibility * world
+    frame_mask = torch.as_tensor(payload.get("frame_action_mask"), device=device)
+    batch_size = int(frame_mask.shape[0]) if frame_mask.ndim > 1 else 1
+    return align_interaction_signals_to_grid(
+        payload,
+        batch_size=batch_size,
+        temporal=temporal,
+        height=height,
+        width=width,
+        device=device,
+        visibility=interaction_conditioning.get("visibility"),
+        world_valid=interaction_conditioning.get("world_valid"),
+    )["valid"]
 
 
 def _masked_per_sample_mean(values, mask):
@@ -1592,6 +1573,7 @@ def flow_matching_loss_train_exact(
     target_channel_fusion_latents=None,
     interaction_conditioning=None,
     interaction_teacher_map=None,
+    interaction_gate_override=None,
     interaction_adapter_enabled=True,
     compute_bidirectional_feedback=False,
     bidirectional_feedback_weight=0.5,
@@ -1646,6 +1628,7 @@ def flow_matching_loss_train_exact(
             "warp_latents": [warp_pyramid[sid] for sid in stage_ids],
             "visibility": [visibility_pyramid[sid] for sid in stage_ids],
             "world_valid": interaction_conditioning.get("world_valid"),
+            "gate_override": interaction_gate_override,
         }
     stage_target_channel_fusion = (
         [
@@ -1783,9 +1766,18 @@ def flow_matching_loss_train_exact(
         final_gate = debug["final_gate"].float()
         valid_tokens = debug["valid_injection_region"].float()
         world_tokens = debug["world_valid_region"].float()
-        teacher_tokens = F.interpolate(
-            router_teacher_map.float(), size=raw_gate.shape[2:], mode="trilinear", align_corners=False
-        ).clamp(0.0, 1.0)
+        token_alignment = align_interaction_signals_to_grid(
+            stage_interaction["payload"],
+            batch_size=raw_gate.shape[0],
+            temporal=raw_gate.shape[2],
+            height=raw_gate.shape[3],
+            width=raw_gate.shape[4],
+            device=raw_gate.device,
+            visibility=interaction_conditioning.get("visibility"),
+            world_valid=interaction_conditioning.get("world_valid"),
+            teacher=router_teacher_map,
+        )
+        teacher_tokens = token_alignment["teacher"]
         support_threshold = float(getattr(args, "interaction_teacher_support_threshold", 0.25))
         positive_tokens = (teacher_tokens > support_threshold).to(raw_gate) * valid_tokens
         negative_tokens = valid_tokens * (1.0 - (positive_tokens > 0).to(valid_tokens))
@@ -1803,12 +1795,19 @@ def flow_matching_loss_train_exact(
             interaction_aux_loss = balanced_bce + 0.5 * dice_loss
 
             stage0_error = stage_flow_errors[stage0_index]
-            latent_teacher = F.interpolate(
-                router_teacher_map.float(), size=stage0_error.shape[2:], mode="trilinear", align_corners=False
-            ).clamp(0.0, 1.0)
-            latent_valid = _interaction_latent_valid_region(
-                interaction_conditioning, stage0_error.shape[2:], stage0_error.device
+            latent_alignment = align_interaction_signals_to_grid(
+                interaction_conditioning["payload"],
+                batch_size=stage0_error.shape[0],
+                temporal=stage0_error.shape[2],
+                height=stage0_error.shape[3],
+                width=stage0_error.shape[4],
+                device=stage0_error.device,
+                visibility=interaction_conditioning.get("visibility"),
+                world_valid=interaction_conditioning.get("world_valid"),
+                teacher=router_teacher_map,
             )
+            latent_teacher = latent_alignment["teacher"]
+            latent_valid = latent_alignment["valid"]
             latent_support = (latent_teacher > support_threshold).to(latent_teacher)
             focus_weight = latent_teacher * latent_support * latent_valid
             background_weight = latent_valid * (1.0 - latent_support)
@@ -1829,10 +1828,13 @@ def flow_matching_loss_train_exact(
             injection_map = debug["interaction_injection_map"].detach().float()
             gate_inside, gate_inside_den = _masked_per_sample_mean(final_gate, positive_tokens)
             gate_outside, gate_outside_den = _masked_per_sample_mean(final_gate, negative_tokens)
-            raw_delta_inside, _ = _masked_per_sample_mean(raw_delta_map, focus_weight)
-            raw_delta_outside, _ = _masked_per_sample_mean(raw_delta_map, background_weight)
-            injection_inside, _ = _masked_per_sample_mean(injection_map, focus_weight)
-            injection_outside, _ = _masked_per_sample_mean(injection_map, background_weight)
+            # Diagnostics live on the Stage 0 token grid, unlike flow error on the latent grid.
+            token_focus = teacher_tokens * (teacher_tokens > support_threshold).to(teacher_tokens) * valid_tokens
+            token_background = valid_tokens * (1.0 - (teacher_tokens > support_threshold).to(valid_tokens))
+            raw_delta_inside, _ = _masked_per_sample_mean(raw_delta_map, token_focus)
+            raw_delta_outside, _ = _masked_per_sample_mean(raw_delta_map, token_background)
+            injection_inside, _ = _masked_per_sample_mean(injection_map, token_focus)
+            injection_outside, _ = _masked_per_sample_mean(injection_map, token_background)
             stats["interaction_router_positive_bce_stage0"] = positive_bce.detach()
             stats["interaction_router_negative_bce_stage0"] = negative_bce.detach()
             stats["interaction_router_dice_stage0"] = dice_loss.detach()
@@ -1840,6 +1842,7 @@ def flow_matching_loss_train_exact(
             stats["interaction_gate_outside_teacher_stage0"] = gate_outside.mean().detach()
             stats["interaction_gate_inside_teacher_elements_stage0"] = gate_inside_den.mean().detach()
             stats["interaction_gate_outside_teacher_elements_stage0"] = gate_outside_den.mean().detach()
+            stats["interaction_teacher_positive_tokens_stage0"] = positive_tokens.detach().sum()
             stats["interaction_raw_delta_inside_teacher_stage0"] = raw_delta_inside.mean().detach()
             stats["interaction_raw_delta_outside_teacher_stage0"] = raw_delta_outside.mean().detach()
             stats["interaction_injection_inside_teacher_stage0"] = injection_inside.mean().detach()
@@ -1853,6 +1856,8 @@ def flow_matching_loss_train_exact(
         router_scale = float(getattr(args, "interaction_router_loss_scale", 0.05))
         if str(getattr(args, "interaction_training_mode", "joint_stage0")) == "router_overfit":
             router_scale = 1.0
+        elif str(getattr(args, "interaction_training_mode", "joint_stage0")) == "adapter_overfit":
+            router_scale = 0.0
         total_loss = total_loss + router_scale * interaction_aux_loss
         stats["interaction_router_loss"] = interaction_aux_loss.detach()
         stats["interaction_aux_loss"] = (router_scale * interaction_aux_loss).detach()
@@ -1888,6 +1893,7 @@ def flow_matching_loss(
     target_channel_fusion_latents=None,
     interaction_conditioning=None,
     interaction_teacher_map=None,
+    interaction_gate_override=None,
     interaction_adapter_enabled=True,
     compute_bidirectional_feedback=False,
     bidirectional_feedback_weight=0.5,
@@ -1906,6 +1912,7 @@ def flow_matching_loss(
         target_channel_fusion_latents=target_channel_fusion_latents,
         interaction_conditioning=interaction_conditioning,
         interaction_teacher_map=interaction_teacher_map,
+        interaction_gate_override=interaction_gate_override,
         interaction_adapter_enabled=interaction_adapter_enabled,
         compute_bidirectional_feedback=compute_bidirectional_feedback,
         bidirectional_feedback_weight=bidirectional_feedback_weight,

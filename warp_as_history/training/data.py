@@ -42,7 +42,11 @@ from warp_as_history.minecraft_sampling import (
 )
 from warp_as_history.training import core as opt
 from warp_as_history.training.utils import detach_tree
-from helios.modules.interaction_conditioning import interaction_action_id, interaction_block_id
+from helios.modules.interaction_conditioning import (
+    interaction_action_id,
+    interaction_block_id,
+    mine_progress_for_source_frames,
+)
 
 
 ONLINE_VIDEO_COLUMNS = ("video", "video_url", "url", "video_path", "path")
@@ -711,6 +715,7 @@ def canonical_interaction_events(payload):
                     "action_end_frame",
                     event.get("event_end_frame", event.get("end_frame", event.get("mine_end_frame"))),
                 ),
+                "complete_frame": event.get("complete_frame"),
             }
         )
     if not events:
@@ -756,6 +761,7 @@ def crop_interaction_payload(interaction_payload, target_indices):
         }
     event = events[0]
     local_event = int(index_to_local[int(event["event_frame"])])
+    source_action_start = int(event.get("action_start_frame", event["event_frame"]))
     end_source = event.get("action_end_frame", event.get("event_end_frame"))
     if event["action_type"] == "mine_active" and end_source is not None:
         end_local = next(
@@ -774,9 +780,10 @@ def crop_interaction_payload(interaction_payload, target_indices):
         time_mask[local] = 1.0
     progress_curve = [0.0] * len(target_indices)
     if event["action_type"] == "mine_active":
-        active_count = max(end_local - local_event, 1)
-        for local in range(local_event, min(end_local, len(progress_curve))):
-            progress_curve[local] = min((local - local_event) / float(active_count), 1.0 - 1.0e-6)
+        complete_source = int(event.get("complete_frame") or end_source or (source_action_start + 1))
+        progress_curve = mine_progress_for_source_frames(
+            target_indices, source_action_start, complete_source
+        )
     elif event["action_type"] == "mine_complete":
         for local in range(local_event, len(progress_curve)):
             progress_curve[local] = 1.0
@@ -791,6 +798,8 @@ def crop_interaction_payload(interaction_payload, target_indices):
         "frame_progress_curve": progress_curve,
         "action_start_frame": local_event,
         "action_end_frame": min(end_local - 1, len(target_indices) - 1),
+        "source_action_start_frame": source_action_start,
+        "source_complete_frame": event.get("complete_frame", end_source),
     }
 
 
@@ -903,6 +912,24 @@ def build_residual_teacher_components(
                 positive / (scale + epsilon) / max(float(z_cap), epsilon)
             ).clamp(0.0, 1.0)
 
+    # A weak, continuous crosshair prior rejects broad camera residuals without hard-coding a box.
+    grid_y = torch.linspace(-1.0, 1.0, raw_residual.shape[-2], device=raw_residual.device)
+    grid_x = torch.linspace(-1.0, 1.0, raw_residual.shape[-1], device=raw_residual.device)
+    yy, xx = torch.meshgrid(grid_y, grid_x, indexing="ij")
+    crosshair_prior = 0.5 + 0.5 * torch.exp(-((xx.square() + yy.square()) / 0.5))
+    teacher_score = teacher_score * crosshair_prior.view(1, 1, 1, *crosshair_prior.shape)
+    local_motion = torch.nn.functional.avg_pool3d(
+        raw_residual, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1)
+    )
+    motion_alignment = (
+        raw_residual / (raw_residual + local_motion + epsilon)
+    ).clamp(0.25, 1.0)
+    teacher_score = teacher_score * motion_alignment
+    if teacher_score.shape[2] > 1:
+        previous = torch.cat([teacher_score[:, :, :1], teacher_score[:, :, :-1]], dim=2)
+        following = torch.cat([teacher_score[:, :, 1:], teacher_score[:, :, -1:]], dim=2)
+        teacher_score = 0.5 * teacher_score + 0.25 * previous + 0.25 * following
+
     valid_action_region = temporal_mask * base_valid
     teacher = (teacher_score * valid_action_region).detach()
     support = ((teacher_score > float(teacher_support_threshold)) & (valid_action_region > 0)).to(teacher)
@@ -957,6 +984,7 @@ def build_residual_teacher_components(
         "temporal_mask": temporal_mask.detach(),
         "valid_action_region": valid_action_region.detach(),
         "teacher_score": teacher_score.detach(),
+        "motion_alignment": motion_alignment.detach(),
         "teacher_support": support.detach(),
         "teacher_area_ratio": area_ratio.detach(),
         "teacher_visibility_ratio": visibility_ratio.detach(),
@@ -1902,6 +1930,18 @@ class OnlineWarpTrainingCache:
                 event_end_frame = int(
                     np.argmin([abs(int(frame) - segment_end) for frame in prepared["source_indices"]])
                 ) + (1 if action_type == "mine_active" else 0)
+            complete_frame = None
+            raw_complete = first_present_data_value(row.get("complete_frame"))
+            if data_value_present(raw_complete):
+                source_start = int(row.get("source_frame_start", 0) or 0)
+                complete_source = int(raw_complete)
+                if complete_source >= source_start:
+                    complete_source -= source_start
+                complete_frame = int(
+                    np.argmin(
+                        [abs(int(frame) - complete_source) for frame in prepared["source_indices"]]
+                    )
+                )
             full_interaction_payload = {
                 "events": [
                     {
@@ -1922,6 +1962,7 @@ class OnlineWarpTrainingCache:
                         "event_end_frame": event_end_frame,
                         "action_start_frame": int(event_resampled_frame),
                         "action_end_frame": None if event_end_frame is None else int(event_end_frame),
+                        "complete_frame": complete_frame,
                         "source_event_frame": event_alignment["source_event_frame"],
                         "source_event_time_ms": event_alignment["source_event_time_ms"],
                     }
@@ -2631,6 +2672,43 @@ def prepare_online_warp_item(
                     )
                     or None,
                 )
+                fixed_teacher_path = resolve_optional_data_path(
+                    row.get("teacher_cache_path", ""), getattr(exact_args, "data_root", ".")
+                )
+                if fixed_teacher_path is not None and fixed_teacher_path.is_file():
+                    fixed_payload = np.load(fixed_teacher_path)
+                    fixed_teacher = torch.as_tensor(
+                        fixed_payload["teacher"], device=target_latents.device, dtype=torch.float32
+                    )
+                    if fixed_teacher.ndim == 4:
+                        fixed_teacher = fixed_teacher.unsqueeze(0)
+                    if fixed_teacher.ndim != 5:
+                        raise ValueError(
+                            f"Fixed teacher must have shape [B,1,T,H,W], got {tuple(fixed_teacher.shape)}"
+                        )
+                    if fixed_teacher.shape[2:] != target_latents.shape[2:]:
+                        fixed_teacher = torch.nn.functional.interpolate(
+                            fixed_teacher,
+                            size=target_latents.shape[2:],
+                            mode="trilinear",
+                            align_corners=False,
+                        )
+                    fixed_teacher = fixed_teacher.clamp(0.0, 1.0).detach()
+                    interaction_teacher_components["clean_teacher_mask"] = fixed_teacher
+                    interaction_teacher_components["teacher_valid"] = torch.tensor(
+                        [str(row.get("review_status", "")).strip().lower() == "approved"],
+                        device=target_latents.device,
+                        dtype=torch.bool,
+                    )
+                    interaction_teacher_components["teacher_invalid_reasons"] = (
+                        []
+                        if bool(interaction_teacher_components["teacher_valid"].all())
+                        else ["teacher_pool_not_approved"]
+                    )
+                    support = fixed_teacher > float(
+                        getattr(exact_args, "interaction_teacher_support_threshold", 0.25)
+                    )
+                    interaction_teacher_components["teacher_area_ratio"] = support.float().mean(dim=(1, 2, 3, 4))
                 interaction_teacher_map = interaction_teacher_components["clean_teacher_mask"]
                 interaction_conditioning = {
                     "payload": interaction_payload_tensors(interaction_payload, device),

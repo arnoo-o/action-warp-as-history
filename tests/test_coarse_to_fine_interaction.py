@@ -117,7 +117,7 @@ class CoarseToFineTorchTest(unittest.TestCase):
         self.assertEqual(float(debug2["interaction_injection_map"].abs().max()), 0.0)
 
     def test_adapter_stage_scale_is_fixed(self):
-        self.assertTrue(self.stack.stage_warp_scales.requires_grad)
+        self.assertFalse(self.stack.stage_warp_scales.requires_grad)
         self.assertFalse(self.stack.stage_adapter_scales.requires_grad)
         self.assertTrue(
             TORCH.allclose(
