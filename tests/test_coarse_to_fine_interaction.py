@@ -58,6 +58,10 @@ class CoarseToFineStaticContractTest(unittest.TestCase):
         source = CORE_PATH.read_text(encoding="utf-8")
         self.assertNotIn("F.smooth_l1_loss(predicted_gate, previous_resized)", source)
 
+    def test_stage0_background_flow_uses_latent_valid_region(self):
+        source = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("background_weight = latent_valid * (1.0 - latent_support)", source)
+
 
 @unittest.skipIf(TORCH is None, "PyTorch is not installed in the local test environment")
 class CoarseToFineTorchTest(unittest.TestCase):

@@ -90,7 +90,7 @@ NEUTRAL_MINECRAFT_PROMPT = "Minecraft first-person gameplay."
 
 
 class InteractionJointSampler:
-    """Deterministic action-by-history quota plan for three 500-step curricula."""
+    """Deterministic action-by-history quota plan for configurable curricula."""
 
     ACTION_RATIOS = {
         "place": 0.50,
@@ -98,20 +98,34 @@ class InteractionJointSampler:
         "mine_complete": 0.15,
         "negative": 0.20,
     }
-    HISTORY_PHASES = (
-        {"first": 0.40, "later": 0.60},
-        {"first": 0.30, "later": 0.70},
-        {"first": 0.25, "later": 0.50, "generated": 0.25},
+    DEFAULT_STAGE0_PHASES = (
+        {"steps": 500, "history": {"first": 0.40, "later": 0.60}},
+        {"steps": 500, "history": {"first": 0.30, "later": 0.70}},
+        {"steps": 500, "history": {"first": 0.25, "later": 0.75}},
+    )
+    DEFAULT_PILOT_PHASES = (
+        {"steps": 100, "history": {"first": 0.40, "later": 0.60}},
+        {"steps": 100, "history": {"first": 0.30, "later": 0.70}},
+        {"steps": 100, "history": {"first": 0.25, "later": 0.75}},
     )
 
-    def __init__(self, source_pools, total_steps, seed):
-        if int(total_steps) != 1500:
-            raise ValueError("The validated interaction curriculum requires exactly 1500 effective steps.")
+    def __init__(self, source_pools, total_steps, seed, *, phases):
+        total_steps = int(total_steps)
+        phase_plan = [dict(item) for item in phases]
+        planned_steps = sum(int(item["steps"]) for item in phase_plan)
+        if total_steps != planned_steps:
+            raise ValueError(f"Interaction curriculum expected {planned_steps} effective steps, got {total_steps}.")
         self.samplers = []
         self.source_pools = {key: list(value) for key, value in source_pools.items()}
         self.seed = int(seed)
-        self.offsets = (0, 500, 1000)
-        for phase_index, history_ratios in enumerate(self.HISTORY_PHASES):
+        self.phase_plan = phase_plan
+        self.total_steps = total_steps
+        self.offsets = []
+        cursor = 0
+        for phase_index, phase in enumerate(phase_plan):
+            self.offsets.append(cursor)
+            cursor += int(phase["steps"])
+            history_ratios = dict(phase["history"])
             pools = {}
             ratios = {}
             for action, action_ratio in self.ACTION_RATIOS.items():
@@ -122,12 +136,17 @@ class InteractionJointSampler:
                     pools[key] = list(source_pools[action])
                     ratios[key] = float(action_ratio) * float(history_ratio)
             self.samplers.append(
-                StepCategorySampler(pools, ratios, 500, int(seed) + phase_index * 10007)
+                StepCategorySampler(pools, ratios, int(phase["steps"]), int(seed) + phase_index * 10007)
             )
 
     def sample(self, effective_step):
         effective_step = int(effective_step)
-        phase = min(effective_step // 500, 2)
+        phase = len(self.samplers) - 1
+        for index, offset in enumerate(self.offsets):
+            phase_steps = int(self.phase_plan[index]["steps"])
+            if effective_step < offset + phase_steps:
+                phase = index
+                break
         local = effective_step - self.offsets[phase]
         return self.samplers[phase].sample(local)
 
@@ -137,21 +156,42 @@ class InteractionJointSampler:
         return pool[int(occurrence) % len(pool)]
 
     def report(self, completed_steps):
-        completed_steps = min(max(int(completed_steps), 0), 1500)
+        completed_steps = min(max(int(completed_steps), 0), self.total_steps)
         reports = []
         remaining = completed_steps
-        for sampler in self.samplers:
-            count = min(remaining, 500)
+        for sampler, phase in zip(self.samplers, self.phase_plan):
+            count = min(remaining, int(phase["steps"]))
             reports.append(sampler.report(count))
             remaining -= count
         actual = Counter()
         for report in reports:
             actual.update(report["actual_steps"])
         return {
-            "target_effective_steps": 1500,
+            "target_effective_steps": self.total_steps,
             "completed_effective_steps": completed_steps,
             "joint_actual_steps": dict(actual),
+            "phase_plan": self.phase_plan,
         }
+
+
+def interaction_training_mode_default_steps(mode):
+    mode = str(mode)
+    if mode == "joint_pilot":
+        return 300
+    if mode in {"router_overfit", "adapter_overfit"}:
+        return 200
+    return 1500
+
+
+def interaction_training_mode_phase_plan(mode):
+    mode = str(mode)
+    if mode == "joint_pilot":
+        return InteractionJointSampler.DEFAULT_PILOT_PHASES
+    if mode == "joint_stage0":
+        return InteractionJointSampler.DEFAULT_STAGE0_PHASES
+    return (
+        {"steps": interaction_training_mode_default_steps(mode), "history": {"first": 0.50, "later": 0.50}},
+    )
 
 
 def training_total_steps(base_train_steps, bidirectional_train_steps, enable_bidirectional_training):
@@ -204,9 +244,22 @@ def build_minecraft_step_sampler(df, args):
         }
         ratios = {"camera_first": 0.25, "camera_later": 0.55, "camera_rollout": 0.20}
     elif profile == "interaction":
-        sampler = InteractionJointSampler(source_pools, args.max_steps, args.seed)
+        mode = str(getattr(args, "interaction_training_mode", "joint_stage0"))
+        if mode in {"joint_pilot", "joint_stage0"}:
+            sampler = InteractionJointSampler(
+                source_pools,
+                args.max_steps,
+                args.seed,
+                phases=interaction_training_mode_phase_plan(mode),
+            )
+        else:
+            base_action = "place" if mode == "adapter_overfit" else "mine_active"
+            pools = {base_action: list(source_pools[base_action]), "negative": list(source_pools["negative"])}
+            ratios = {base_action: 0.80, "negative": 0.20}
+            sampler = StepCategorySampler(pools, ratios, args.max_steps, args.seed)
         return sampler, {
             "pool_sizes": {name: len(values) for name, values in source_pools.items()},
+            "interaction_training_mode": mode,
             **sampler.report(0),
         }
     else:
@@ -355,6 +408,55 @@ def tensorboard_log_record(writer, record, step):
         if key in skip:
             continue
         tensorboard_add_scalar(writer, f"stats/{key}", value, step)
+
+
+def write_interaction_debug_summary(out_dir, step, losses, *, window=150):
+    recent = losses[-max(int(window), 1) :]
+    if not recent:
+        return
+    summary = {
+        "step": int(step),
+        "window": int(min(len(recent), max(int(window), 1))),
+        "records": len(recent),
+        "training_stage": str(recent[-1].get("training_stage", "")),
+        "sampled_category_counts": dict(Counter(str(item.get("sampled_category", "")) for item in recent)),
+        "action_type_counts": dict(Counter(str(item.get("action_type", "")) for item in recent)),
+    }
+    numeric_keys = [
+        "loss",
+        "stage0_weighted_flow",
+        "stage0_focus_flow",
+        "stage0_background_flow",
+        "interaction_router_loss",
+        "router_weighted_ratio",
+        "raw_gate_mean_stage0",
+        "final_gate_mean_stage0",
+        "raw_delta_rms_stage0",
+        "final_injection_rms_stage0",
+        "teacher_mask_area_ratio_stage0",
+        "interaction_router_positive_bce_stage0",
+        "interaction_router_negative_bce_stage0",
+        "interaction_router_dice_stage0",
+        "interaction_gate_inside_teacher_stage0",
+        "interaction_gate_outside_teacher_stage0",
+        "interaction_raw_delta_inside_teacher_stage0",
+        "interaction_raw_delta_outside_teacher_stage0",
+        "interaction_injection_inside_teacher_stage0",
+        "interaction_injection_outside_teacher_stage0",
+    ]
+    for key in numeric_keys:
+        values = [
+            float(item[key])
+            for item in recent
+            if key in item and item[key] is not None and math.isfinite(float(item[key]))
+        ]
+        if values:
+            summary[key] = {
+                "mean": float(sum(values) / len(values)),
+                "min": float(min(values)),
+                "max": float(max(values)),
+            }
+    write_json(Path(out_dir) / f"interaction_summary_step{int(step):04d}.json", summary)
 
 
 def save_training_state(
@@ -556,6 +658,11 @@ def parse_args():
     parser.add_argument("--wah_lora_lr", type=float, default=None)
     parser.add_argument("--interaction_lr", type=float, default=None)
     parser.add_argument("--training_profile", choices=["camera", "interaction", "joint"], default="joint")
+    parser.add_argument(
+        "--interaction_training_mode",
+        choices=["router_overfit", "adapter_overfit", "joint_pilot", "joint_stage0"],
+        default="joint_stage0",
+    )
     parser.add_argument("--place_step_ratio", type=float, default=0.5)
     parser.add_argument("--mine_step_ratio", type=float, default=0.3)
     parser.add_argument("--other_step_ratio", type=float, default=0.2)
@@ -567,6 +674,10 @@ def parse_args():
     parser.add_argument("--interaction_router_loss_scale", type=float, default=0.05)
     parser.add_argument("--interaction_focus_scale", type=float, default=1.0)
     parser.add_argument("--interaction_teacher_support_threshold", type=float, default=0.25)
+    parser.add_argument("--interaction_max_metadata_rotation_deg", type=float, default=20.0)
+    parser.add_argument("--interaction_max_camera_rotation_deg", type=float, default=20.0)
+    parser.add_argument("--interaction_min_telemetry_confidence", type=float, default=0.0)
+    parser.add_argument("--interaction_min_mine_active_frames", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=384)
     parser.add_argument("--width", type=int, default=640)
@@ -760,6 +871,11 @@ def build_exact_args(args):
     exact.interaction_router_loss_scale = float(args.interaction_router_loss_scale)
     exact.interaction_focus_scale = float(args.interaction_focus_scale)
     exact.interaction_teacher_support_threshold = float(args.interaction_teacher_support_threshold)
+    exact.interaction_training_mode = str(args.interaction_training_mode)
+    exact.interaction_max_metadata_rotation_deg = float(args.interaction_max_metadata_rotation_deg)
+    exact.interaction_max_camera_rotation_deg = float(args.interaction_max_camera_rotation_deg)
+    exact.interaction_min_telemetry_confidence = float(args.interaction_min_telemetry_confidence)
+    exact.interaction_min_mine_active_frames = int(args.interaction_min_mine_active_frames)
     exact.interaction_active_stages = [0]
     exact.base_train_steps = int(args.base_train_steps)
     exact.bidirectional_train_steps = int(args.bidirectional_train_steps)
@@ -836,7 +952,13 @@ def build_exact_args(args):
 def main():
     args = parse_args()
     if args.base_train_steps is None:
-        args.base_train_steps = 1000 if str(args.training_profile) == "camera" else 1500
+        args.base_train_steps = (
+            1000
+            if str(args.training_profile) == "camera"
+            else interaction_training_mode_default_steps(args.interaction_training_mode)
+            if str(args.training_profile) == "interaction"
+            else 1500
+        )
     if str(args.training_profile) == "camera":
         args.interaction_conditioning_mode = "off"
     if str(args.training_profile) == "interaction" and args.camera_checkpoint is None:
@@ -936,6 +1058,7 @@ def main():
         "wah_recipe": dict(pipe.transformer._wah_recipe),
     }
     write_json(out_dir / "train_config.json", config)
+    write_json(out_dir / "sampling_audit.json", sampler_meta)
     if tb_writer is not None:
         tb_writer.add_text("config/train_args", _json_text(serialized_train_args), 0)
         tb_writer.add_text("config/exact_args", _json_text(config["exact_args"]), 0)
@@ -1041,9 +1164,11 @@ def main():
     wah_lora_lr = float(args.wah_lora_lr if args.wah_lora_lr is not None else default_wah_lr)
     interaction_lr = float(args.interaction_lr if args.interaction_lr is not None else 1.0e-4)
     profile = str(args.training_profile)
+    interaction_mode = str(getattr(args, "interaction_training_mode", "joint_stage0"))
     wah_params = []
     interaction_params = []
     interaction_router_params = []
+    interaction_adapter_params = []
     interaction_other_params = []
     for param in lora_params:
         name = named_params.get(id(param), "")
@@ -1057,10 +1182,22 @@ def main():
                 interaction_params.append(param)
                 if ".router." in name:
                     interaction_router_params.append(param)
+                elif ".adapter." in name:
+                    interaction_adapter_params.append(param)
                 else:
                     interaction_other_params.append(param)
             else:
                 wah_params.append(param)
+    if profile == "interaction":
+        if interaction_mode == "router_overfit":
+            for param in interaction_adapter_params:
+                param.requires_grad_(False)
+            interaction_params = [param for param in interaction_params if param.requires_grad]
+        elif interaction_mode == "adapter_overfit":
+            for param in interaction_router_params:
+                param.requires_grad_(False)
+            interaction_params = [param for param in interaction_params if param.requires_grad]
+            interaction_router_params = []
     if profile == "camera" and interaction_params:
         raise RuntimeError("Camera profile must not train interaction parameters.")
     if profile == "interaction" and wah_params:
@@ -1304,7 +1441,7 @@ def main():
             target_channel_fusion_latents=item.get("primary_fire_event_latents"),
             interaction_conditioning=item.get("interaction_conditioning"),
             interaction_teacher_map=router_teacher_map,
-            interaction_adapter_enabled=True,
+            interaction_adapter_enabled=str(args.interaction_training_mode) != "router_overfit",
             compute_bidirectional_feedback=compute_bidirectional_feedback,
             bidirectional_feedback_weight=float(args.bidirectional_feedback_weight),
             bidirectional_teacher_floor=float(args.bidirectional_teacher_floor),
@@ -1346,6 +1483,7 @@ def main():
             "attempt_step": int(attempt_step),
             "skipped_invalid_step": int(skipped_invalid_step),
             "training_stage": training_stage,
+            "interaction_training_mode": str(args.interaction_training_mode),
             "base_completed_steps": min(int(step + 1), int(args.base_train_steps)),
             "bidirectional_completed_steps": max(int(step + 1) - int(args.base_train_steps), 0),
             "bidirectional_feedback_computed": bool(compute_bidirectional_feedback),
@@ -1432,6 +1570,7 @@ def main():
                 attempt_step=attempt_step,
                 skipped_invalid_step=skipped_invalid_step,
             )
+            write_interaction_debug_summary(out_dir, step + 1, losses, window=150)
 
         del loss, stats, item, interaction_feedback
         if grad_norm is not None:
@@ -1457,6 +1596,7 @@ def main():
     write_json(loss_path, losses)
     distribution_report = {
         "training_profile": str(args.training_profile),
+        "interaction_training_mode": str(args.interaction_training_mode),
         "requested": step_sampler.report(args.max_steps),
         "counters": distribution_counts,
         "valid_positive_rate": {

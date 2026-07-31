@@ -1818,11 +1818,32 @@ def flow_matching_loss_train_exact(
             flow_parts = background_loss_per_sample
             flow_parts = flow_parts + focus_scale * focus_loss_per_sample
             total_loss = flow_parts.mean()
+            if str(getattr(args, "interaction_training_mode", "joint_stage0")) == "router_overfit":
+                total_loss = torch.zeros_like(interaction_aux_loss)
             stats["stage0_focus_flow"] = focus_loss_per_sample.mean().detach()
             stats["stage0_background_flow"] = background_loss_per_sample.mean().detach()
             stats["stage0_focus_elements"] = focus_den.mean().detach()
             stats["stage0_background_elements"] = background_den.mean().detach()
             stats["stage0_weighted_flow"] = total_loss.detach()
+            raw_delta_map = debug["raw_delta_map"].detach().float()
+            injection_map = debug["interaction_injection_map"].detach().float()
+            gate_inside, gate_inside_den = _masked_per_sample_mean(final_gate, positive_tokens)
+            gate_outside, gate_outside_den = _masked_per_sample_mean(final_gate, negative_tokens)
+            raw_delta_inside, _ = _masked_per_sample_mean(raw_delta_map, focus_weight)
+            raw_delta_outside, _ = _masked_per_sample_mean(raw_delta_map, background_weight)
+            injection_inside, _ = _masked_per_sample_mean(injection_map, focus_weight)
+            injection_outside, _ = _masked_per_sample_mean(injection_map, background_weight)
+            stats["interaction_router_positive_bce_stage0"] = positive_bce.detach()
+            stats["interaction_router_negative_bce_stage0"] = negative_bce.detach()
+            stats["interaction_router_dice_stage0"] = dice_loss.detach()
+            stats["interaction_gate_inside_teacher_stage0"] = gate_inside.mean().detach()
+            stats["interaction_gate_outside_teacher_stage0"] = gate_outside.mean().detach()
+            stats["interaction_gate_inside_teacher_elements_stage0"] = gate_inside_den.mean().detach()
+            stats["interaction_gate_outside_teacher_elements_stage0"] = gate_outside_den.mean().detach()
+            stats["interaction_raw_delta_inside_teacher_stage0"] = raw_delta_inside.mean().detach()
+            stats["interaction_raw_delta_outside_teacher_stage0"] = raw_delta_outside.mean().detach()
+            stats["interaction_injection_inside_teacher_stage0"] = injection_inside.mean().detach()
+            stats["interaction_injection_outside_teacher_stage0"] = injection_outside.mean().detach()
         else:
             negative_den = world_tokens.sum().clamp_min(1.0)
             interaction_aux_loss = (raw_gate * world_tokens).sum() / negative_den
@@ -1830,6 +1851,8 @@ def flow_matching_loss_train_exact(
             stats["stage0_weighted_flow"] = total_loss.detach()
             stats["interaction_negative_raw_gate_loss"] = interaction_aux_loss.detach()
         router_scale = float(getattr(args, "interaction_router_loss_scale", 0.05))
+        if str(getattr(args, "interaction_training_mode", "joint_stage0")) == "router_overfit":
+            router_scale = 1.0
         total_loss = total_loss + router_scale * interaction_aux_loss
         stats["interaction_router_loss"] = interaction_aux_loss.detach()
         stats["interaction_aux_loss"] = (router_scale * interaction_aux_loss).detach()

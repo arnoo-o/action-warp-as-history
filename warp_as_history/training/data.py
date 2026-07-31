@@ -831,6 +831,8 @@ def build_residual_teacher_components(
     min_valid_pixels=8,
     min_visibility_ratio=0.05,
     z_cap=3.0,
+    camera_rotation_degrees=None,
+    max_camera_rotation_degrees=None,
 ):
     """Build a detached latent-grid residual teacher and per-sample validity audit."""
     warp = warp_latents.to(device=target_latents.device, dtype=target_latents.dtype)
@@ -924,6 +926,13 @@ def build_residual_teacher_components(
         & (area_ratio >= min_area)
         & (area_ratio <= float(teacher_max_area))
     )
+    if max_camera_rotation_degrees is not None and camera_rotation_degrees is not None:
+        rotation_ok = torch.as_tensor(
+            [float(camera_rotation_degrees) <= float(max_camera_rotation_degrees)],
+            device=teacher_valid.device,
+            dtype=torch.bool,
+        )
+        teacher_valid = teacher_valid & rotation_ok
     invalid_reason = []
     for index in range(raw_residual.shape[0]):
         reasons = []
@@ -935,6 +944,12 @@ def build_residual_teacher_components(
             reasons.append("teacher_too_small")
         if float(area_ratio[index]) > float(teacher_max_area):
             reasons.append("teacher_too_large")
+        if (
+            max_camera_rotation_degrees is not None
+            and camera_rotation_degrees is not None
+            and float(camera_rotation_degrees) > float(max_camera_rotation_degrees)
+        ):
+            reasons.append("camera_rotation_exceeds_threshold")
         invalid_reason.append(reasons)
     return {
         "raw_residual": raw_residual.detach(),
@@ -1771,6 +1786,44 @@ class OnlineWarpTrainingCache:
         reverse_prob = float(getattr(self.exact_args, "online_direction_reverse_prob", 0.5))
         return "reverse" if rng.random() < reverse_prob else "forward"
 
+    def _interaction_metadata_prefilter(
+        self,
+        row,
+        *,
+        category,
+        requested_chunk_mode,
+        event_local_frame,
+    ):
+        if str(getattr(self.exact_args, "training_profile", "joint")) != "interaction":
+            return None
+        if category not in {"place", "mine"}:
+            return None
+        max_rotation = float(getattr(self.exact_args, "interaction_max_metadata_rotation_deg", 0.0) or 0.0)
+        if max_rotation > 0.0:
+            rotation_value = first_present_data_value(row.get("cumulative_rotation"), default=None)
+            if data_value_present(rotation_value) and float(rotation_value) > max_rotation:
+                return f"metadata_rotation_exceeds_threshold:{float(rotation_value):.3f}"
+        min_conf = float(getattr(self.exact_args, "interaction_min_telemetry_confidence", 0.0) or 0.0)
+        if min_conf > 0.0:
+            conf_value = first_present_data_value(row.get("telemetry_confidence"), default=None)
+            if data_value_present(conf_value) and float(conf_value) < min_conf:
+                return f"telemetry_confidence_below_threshold:{float(conf_value):.3f}"
+        min_active_frames = int(getattr(self.exact_args, "interaction_min_mine_active_frames", 0) or 0)
+        if (
+            category == "mine"
+            and str(row.get("action_type", "") or "").strip().lower() == "mine_active"
+            and min_active_frames > 0
+        ):
+            active_frames = int(first_present_data_value(row.get("stable_active_frames"), default=0) or 0)
+            if active_frames < min_active_frames:
+                return f"mine_active_too_short:{active_frames}"
+        if requested_chunk_mode == "interaction_first" and event_local_frame is not None:
+            local_min = int(getattr(self.exact_args, "interaction_event_local_min", 6))
+            local_max = int(getattr(self.exact_args, "interaction_event_local_max", 16))
+            if not (local_min <= int(event_local_frame) <= local_max):
+                return f"event_local_out_of_range:{int(event_local_frame)}"
+        return None
+
     def sample_case(
         self,
         row_index,
@@ -1921,6 +1974,14 @@ class OnlineWarpTrainingCache:
                 if requested_chunk_mode == "interaction_generated"
                 else "later"
             )
+            filter_reason = self._interaction_metadata_prefilter(
+                row,
+                category=category,
+                requested_chunk_mode=requested_chunk_mode,
+                event_local_frame=event_local_frame,
+            )
+            if filter_reason is not None:
+                raise ValueError(filter_reason)
         elif requested_chunk_mode == "camera_first":
             target_indices = list(range(num_frames))
             chunk_mode = "first"
@@ -1986,6 +2047,25 @@ class OnlineWarpTrainingCache:
             render_pose_indices = [geometry_keyframe_frames[-1], *target_indices]
             drop_renderer_source = True
             condition_frame = frames[geometry_keyframe_frames[-1]]
+
+        preview_rotation = None
+        max_rotation = float(getattr(self.exact_args, "interaction_max_camera_rotation_deg", 0.0) or 0.0)
+        if (
+            category in {"place", "mine"}
+            and max_rotation > 0.0
+            and prepared.get("pose_rows") is not None
+        ):
+            preview_poses = vpt_relative_camera_poses(
+                prepared["pose_rows"],
+                int(render_pose_indices[0]),
+                render_pose_indices,
+                translation_scale=1.0,
+            )
+            preview_rotation = float(
+                pose_motion_statistics(preview_poses, preview_poses)["rotation_degrees"]
+            )
+            if preview_rotation > max_rotation:
+                raise ValueError(f"camera_rotation_exceeds_threshold:{preview_rotation:.3f}")
 
         keyframe_indices = list(geometry_keyframe_frames)
         geometry = self._estimate_conditioning_geometry(
@@ -2195,6 +2275,7 @@ class OnlineWarpTrainingCache:
                 "effective_translation_scale": float(effective_scale),
                 "rendered_translation_norm": motion_stats["rendered_translation_norm"],
                 "rotation_degrees": motion_stats["rotation_degrees"],
+                "metadata_prefilter_rotation_degrees": preview_rotation,
             },
             "interaction_history_text": interaction_memory.get("merged", ""),
             "interaction_memory": interaction_memory,
@@ -2544,6 +2625,11 @@ def prepare_online_warp_item(
                     visibility_latents,
                     world_valid_mask_latents,
                     interaction_payload,
+                    camera_rotation_degrees=case.get("metadata", {}).get("rotation_degrees"),
+                    max_camera_rotation_degrees=float(
+                        getattr(exact_args, "interaction_max_camera_rotation_deg", 0.0) or 0.0
+                    )
+                    or None,
                 )
                 interaction_teacher_map = interaction_teacher_components["clean_teacher_mask"]
                 interaction_conditioning = {
