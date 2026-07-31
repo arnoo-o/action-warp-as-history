@@ -6,7 +6,7 @@ import csv
 import json
 import math
 from collections import Counter, defaultdict
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
 
@@ -43,6 +43,46 @@ def read_jsonl(path):
             payload["_frame"] = int(payload.get("segment_frame", line_index))
             rows.append(payload)
     return rows
+
+
+def resolve_dataset_path(value, data_root):
+    """Relocate stale Windows paths only by their dataset-root-relative suffix."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    direct = Path(text)
+    if direct.is_file():
+        return str(direct.resolve())
+    candidates = []
+    for path_type in (PureWindowsPath, Path):
+        parts = list(path_type(text).parts)
+        lowered = [str(part).lower() for part in parts]
+        if data_root.name.lower() in lowered:
+            root_index = lowered.index(data_root.name.lower())
+            suffix = parts[root_index + 1 :]
+            if suffix:
+                candidates.append(data_root.joinpath(*suffix))
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        normalized = str(candidate)
+        if normalized not in seen:
+            seen.add(normalized)
+            unique.append(candidate)
+    existing = [candidate.resolve() for candidate in unique if candidate.is_file()]
+    if len(existing) == 1:
+        return str(existing[0])
+    raise FileNotFoundError(
+        f"Cannot relocate dataset path {text!r} under {data_root}; "
+        f"checked={[str(candidate) for candidate in unique]} existing={[str(path) for path in existing]}"
+    )
+
+
+def resolve_manifest_paths(rows, data_root):
+    for row in rows:
+        for field in ("video_path", "actions_path", "mc_event_path"):
+            if str(row.get(field, "") or "").strip():
+                row[field] = resolve_dataset_path(row[field], data_root)
 
 
 def gui_open(row):
@@ -160,6 +200,8 @@ def main():
     root = args.data_root.resolve()
     source_rows = read_csv(root / "mc_training_samples.csv")
     segment_rows = read_csv(root / "mc_long_segments.csv")
+    resolve_manifest_paths(source_rows, root)
+    resolve_manifest_paths(segment_rows, root)
     output_csv = args.output_csv or root / "mc_interaction_training_samples.csv"
     audit_json = args.audit_json or root / "mc_interaction_manifest_audit.json"
 

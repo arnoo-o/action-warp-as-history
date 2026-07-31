@@ -43,6 +43,17 @@ def load_teacher_builder():
 BUILDER = load_teacher_builder()
 
 
+def load_manifest_builder():
+    path = ROOT / "scripts" / "build_minecraft_interaction_manifest.py"
+    spec = importlib.util.spec_from_file_location("interaction_manifest_builder_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MANIFEST_BUILDER = load_manifest_builder()
+
+
 def identity_row(action, history, index):
     start = index * 40
     target = list(range(start, start + 33))
@@ -307,6 +318,18 @@ class FixedTeacherPoolTest(unittest.TestCase):
         self.assertIn("and not self.fixed_cache_only", source)
         train_source = TRAIN_PATH.read_text(encoding="utf-8")
         self.assertIn("None if fixed_cache_only else build_online_warp_training_cache", train_source)
+
+    def test_windows_dataset_path_is_relocated_by_dataset_suffix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "wah_mc_training"
+            target = root / "segments" / "sample.jsonl"
+            target.parent.mkdir(parents=True)
+            target.write_text("{}\n", encoding="utf-8")
+            resolved = MANIFEST_BUILDER.resolve_dataset_path(
+                r"F:\video-gen\Warp-as-History\data\vpt_9x_100\wah_mc_training\segments\sample.jsonl",
+                root,
+            )
+            self.assertEqual(Path(resolved), target.resolve())
 
 
 class NegativeCandidateReviewTest(unittest.TestCase):
