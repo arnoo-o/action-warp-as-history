@@ -281,6 +281,10 @@ def main():
                     "prompt": NEUTRAL_PROMPT,
                     "prompt_raw": NEUTRAL_PROMPT,
                     "telemetry_confidence": "protected_event_free_window",
+                    "no_interaction_event_verified": "true",
+                    "gui_closed_verified": "true",
+                    "frame_contiguous_verified": "true",
+                    "source_mapping_valid": "true",
                 }
             )
             negative_count += 1

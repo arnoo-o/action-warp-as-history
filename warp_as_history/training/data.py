@@ -43,9 +43,18 @@ from warp_as_history.minecraft_sampling import (
 from warp_as_history.training import core as opt
 from warp_as_history.training.utils import detach_tree
 from helios.modules.interaction_conditioning import (
+    align_interaction_signals_to_grid,
     interaction_action_id,
     interaction_block_id,
     mine_progress_for_source_frames,
+)
+from warp_as_history.training.fixed_teacher import (
+    FixedTeacherIntegrityError,
+    action_history_key,
+    canonical_history_type,
+    parse_index_sequence,
+    validate_fixed_identity,
+    validate_stage0_positive_tokens,
 )
 
 
@@ -921,14 +930,17 @@ def build_residual_teacher_components(
     local_motion = torch.nn.functional.avg_pool3d(
         raw_residual, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1)
     )
-    motion_alignment = (
+    local_residual_suppression = (
         raw_residual / (raw_residual + local_motion + epsilon)
     ).clamp(0.25, 1.0)
-    teacher_score = teacher_score * motion_alignment
+    teacher_score = teacher_score * local_residual_suppression
     if teacher_score.shape[2] > 1:
         previous = torch.cat([teacher_score[:, :, :1], teacher_score[:, :, :-1]], dim=2)
         following = torch.cat([teacher_score[:, :, 1:], teacher_score[:, :, -1:]], dim=2)
-        teacher_score = 0.5 * teacher_score + 0.25 * previous + 0.25 * following
+        temporal_smoothing = 0.5 * teacher_score + 0.25 * previous + 0.25 * following
+        teacher_score = temporal_smoothing
+    else:
+        temporal_smoothing = teacher_score
 
     valid_action_region = temporal_mask * base_valid
     teacher = (teacher_score * valid_action_region).detach()
@@ -984,7 +996,8 @@ def build_residual_teacher_components(
         "temporal_mask": temporal_mask.detach(),
         "valid_action_region": valid_action_region.detach(),
         "teacher_score": teacher_score.detach(),
-        "motion_alignment": motion_alignment.detach(),
+        "local_residual_suppression": local_residual_suppression.detach(),
+        "temporal_smoothing": temporal_smoothing.detach(),
         "teacher_support": support.detach(),
         "teacher_area_ratio": area_ratio.detach(),
         "teacher_visibility_ratio": visibility_ratio.detach(),
@@ -2812,6 +2825,156 @@ def prepare_online_warp_item(
     return item
 
 
+def _fixed_tree_to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device=device)
+    if isinstance(value, dict):
+        return {key: _fixed_tree_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_fixed_tree_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_fixed_tree_to_device(item, device) for item in value)
+    return value
+
+
+def load_fixed_teacher_training_item(row, exact_args, device, *, requested_category, requested_chunk_mode):
+    row = dict(row)
+    history_type = canonical_history_type(row.get("history_type"))
+    requested_history = str(requested_chunk_mode or "").replace("interaction_", "")
+    if requested_history and requested_history != history_type:
+        raise FixedTeacherIntegrityError(
+            f"Fixed teacher history mismatch event_id={row.get('event_id')} manifest={history_type} "
+            f"requested={requested_history}"
+        )
+    expected_category = canonical_training_category(row.get("training_category", row.get("category")))
+    if requested_category and canonical_training_category(requested_category) != expected_category:
+        raise FixedTeacherIntegrityError(
+            f"Fixed teacher category mismatch event_id={row.get('event_id')} "
+            f"manifest={expected_category} requested={requested_category}"
+        )
+    data_root = getattr(exact_args, "data_root", ".")
+    training_cache_path = resolve_optional_data_path(row.get("training_cache_path", ""), data_root)
+    teacher_cache_path = resolve_optional_data_path(row.get("teacher_cache_path", ""), data_root)
+    if training_cache_path is None or not training_cache_path.is_file():
+        raise FixedTeacherIntegrityError(f"Missing fixed training cache: {training_cache_path}")
+    if teacher_cache_path is None or not teacher_cache_path.is_file():
+        raise FixedTeacherIntegrityError(f"Missing fixed teacher cache: {teacher_cache_path}")
+    cached = torch.load(training_cache_path, map_location="cpu", weights_only=False)
+    if int(cached.get("schema_version", 0)) != 1:
+        raise FixedTeacherIntegrityError(f"Unsupported fixed training cache schema: {training_cache_path}")
+    expected_config_hash = str(getattr(exact_args, "fixed_teacher_config_hash", ""))
+    identity = validate_fixed_identity(row, dict(cached.get("candidate_identity", {})), expected_config_hash)
+    teacher_payload = np.load(teacher_cache_path)
+    teacher_candidate_key = str(teacher_payload["candidate_cache_key"].item())
+    teacher_config_hash = str(teacher_payload["candidate_config_hash"].item())
+    if teacher_candidate_key != identity["candidate_cache_key"] or teacher_config_hash != expected_config_hash:
+        raise FixedTeacherIntegrityError(
+            "Fixed teacher cache hash mismatch "
+            f"event_id={identity['event_id']} history_type={history_type}: "
+            f"manifest_candidate={identity['candidate_cache_key']} teacher_candidate={teacher_candidate_key} "
+            f"runtime_config={expected_config_hash} teacher_config={teacher_config_hash}"
+        )
+    item = _fixed_tree_to_device(cached, device)
+    target_latents = item["target_latents"]
+    conditioning = item["interaction_conditioning"]
+    teacher = torch.as_tensor(teacher_payload["teacher"], device=device, dtype=torch.float32)
+    if teacher.ndim == 4:
+        teacher = teacher.unsqueeze(0)
+    if teacher.shape[2:] != target_latents.shape[2:]:
+        raise FixedTeacherIntegrityError(
+            f"Fixed teacher grid mismatch event_id={identity['event_id']}: "
+            f"teacher={tuple(teacher.shape)} target={tuple(target_latents.shape)}"
+        )
+    aligned = align_interaction_signals_to_grid(
+        conditioning["payload"],
+        batch_size=target_latents.shape[0],
+        temporal=teacher.shape[2],
+        height=teacher.shape[3],
+        width=teacher.shape[4],
+        device=device,
+        visibility=conditioning.get("visibility"),
+        world_valid=conditioning.get("world_valid"),
+        teacher=teacher,
+    )
+    action = aligned["action"]
+    visibility = aligned["visibility"]
+    world_valid = aligned["world_valid"]
+    valid_action_region = action * visibility * world_valid
+    support_threshold = float(getattr(exact_args, "interaction_teacher_support_threshold", 0.25))
+    teacher = aligned["teacher"].detach()
+    teacher_support = (teacher > support_threshold).to(teacher)
+    valid_denominator = valid_action_region.flatten(1).sum(dim=1)
+    teacher_area_ratio = (
+        (teacher_support * valid_action_region).flatten(1).sum(dim=1)
+        / valid_denominator.clamp_min(1.0)
+    )
+    visibility_denominator = (action * world_valid).flatten(1).sum(dim=1)
+    teacher_visibility_ratio = (
+        valid_action_region.flatten(1).sum(dim=1) / visibility_denominator.clamp_min(1.0)
+    )
+    stage0_grid = tuple(
+        int(row.get(key, default))
+        for key, default in (
+            ("stage0_grid_t", 9),
+            ("stage0_grid_h", 6),
+            ("stage0_grid_w", 10),
+        )
+    )
+    stage0_teacher = torch.nn.functional.adaptive_max_pool3d(teacher, stage0_grid)
+    stage0_positive_tokens = int((stage0_teacher > support_threshold).sum().item())
+    action_key = action_history_key(row)
+    is_negative = action_key.startswith("negative|")
+    validate_stage0_positive_tokens(
+        action_key.split("|", 1)[0],
+        stage0_positive_tokens,
+        event_id=identity["event_id"],
+        history_type=history_type,
+    )
+    if is_negative:
+        teacher = torch.zeros_like(teacher)
+        teacher_area_ratio = torch.zeros_like(teacher_area_ratio)
+        teacher_visibility_ratio = torch.ones_like(teacher_visibility_ratio)
+    training = dict(item.get("training", {}))
+    for field in ("target_indices", "history_indices", "render_pose_indices"):
+        if [int(value) for value in training.get(field, [])] != identity[field]:
+            raise FixedTeacherIntegrityError(
+                f"Fixed cached training index mismatch event_id={identity['event_id']} history_type={history_type} "
+                f"field={field} manifest={identity[field]} cache={training.get(field)}"
+            )
+    if [int(value) for value in training.get("keyframe_indices", [])] != identity["geometry_keyframe_frames"]:
+        raise FixedTeacherIntegrityError(
+            f"Fixed cached geometry index mismatch event_id={identity['event_id']} history_type={history_type}"
+        )
+    training["fixed_history_type"] = history_type
+    result = {
+        "seq": str(item["seq"]),
+        "prompt": "Minecraft first-person gameplay.",
+        "prompt_raw": "Minecraft first-person gameplay.",
+        "target_latents": target_latents,
+        "prompt_embeds": item["prompt_embeds"],
+        "histories": item["histories"],
+        "base_histories": item.get("base_histories"),
+        "prompt_cache_status": "fixed_teacher_cache",
+        "training": training,
+        "training_category": str(item.get("training_category", expected_category)),
+        "interaction_payload": item.get("interaction_payload"),
+        "interaction_conditioning": conditioning,
+        "interaction_teacher_map": teacher,
+        "initial_teacher_map": teacher,
+        "interaction_teacher_valid": True,
+        "interaction_teacher_area_ratio": float(teacher_area_ratio.mean().item()),
+        "interaction_teacher_visibility_ratio": float(teacher_visibility_ratio.mean().item()),
+        "interaction_teacher_stage0_positive_tokens": stage0_positive_tokens,
+        "interaction_teacher_invalid_reasons": [],
+        "world_valid_mask_latents": item.get("world_valid_mask_latents"),
+        "loss_focus_mask_latents": None,
+        "primary_fire_event_latents": None,
+        "interaction_debug_inputs": None,
+        "fixed_teacher_identity": identity,
+    }
+    return result
+
+
 class LazyPreparedItems:
     def __init__(self, pipe, df, exact_args, device, mean, std, cache_dir):
         self.pipe = pipe
@@ -2833,9 +2996,19 @@ class LazyPreparedItems:
     def _remember_status(self, status):
         self.prompt_cache_status_counts[status] = self.prompt_cache_status_counts.get(status, 0) + 1
 
-    def get(self, idx, requested_category=None, requested_chunk_mode=None):
+    def get(self, idx, requested_category=None, requested_chunk_mode=None, keep_frames=False):
         idx = int(idx)
         print(json.dumps({"event": "prepare_item_start", "index": idx, "seq": str(self.rows[idx]["id"])}), flush=True)
+        if str(self.rows[idx].get("review_status", "")).strip().lower() == "approved":
+            item = load_fixed_teacher_training_item(
+                self.rows[idx],
+                self.exact_args,
+                self.device,
+                requested_category=requested_category,
+                requested_chunk_mode=requested_chunk_mode,
+            )
+            self._remember_status(item["prompt_cache_status"])
+            return item
         self.prepare_counter += 1
         row_index = int(self.rows[idx]["online_row_index"]) if "online_row_index" in self.rows[idx] else idx
         item = prepare_online_warp_item(
@@ -2845,7 +3018,7 @@ class LazyPreparedItems:
             self.device,
             self.mean,
             self.std,
-            keep_frames=False,
+            keep_frames=bool(keep_frames),
             cache_dir=self.cache_dir,
             memory_prompt_cache=self.memory_prompt_cache,
             prepare_index=self.prepare_counter,

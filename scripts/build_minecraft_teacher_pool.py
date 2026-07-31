@@ -9,7 +9,14 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
+
+from warp_as_history.training.fixed_teacher import (
+    is_negative_action,
+    stable_json_hash,
+    validate_fixed_identity,
+    validate_stage0_positive_tokens,
+)
 
 
 def parse_args():
@@ -51,8 +58,17 @@ def robust_teacher(target, warp, valid, z_cap):
         for y in range(3)
         for x in range(3)
     ) / 9.0
-    motion_alignment = np.clip(residual / (residual + local_motion + 1.0e-6), 0.25, 1.0)
-    return residual, teacher * motion_alignment * valid
+    local_residual_suppression = np.clip(
+        residual / (residual + local_motion + 1.0e-6), 0.25, 1.0
+    )
+    teacher = teacher * local_residual_suppression
+    if teacher.shape[1] > 1:
+        previous = np.concatenate([teacher[:, :1], teacher[:, :-1]], axis=1)
+        following = np.concatenate([teacher[:, 1:], teacher[:, -1:]], axis=1)
+        temporal_smoothing = 0.5 * teacher + 0.25 * previous + 0.25 * following
+    else:
+        temporal_smoothing = teacher
+    return residual, temporal_smoothing * valid
 
 
 def normalize_map(value, shape, *, conservative=False):
@@ -72,6 +88,67 @@ def save_preview(path, residual, teacher):
     Image.fromarray((np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)).save(path)
 
 
+def _map_image(value, size, *, color):
+    value = np.asarray(value, dtype=np.float32)
+    value = value / max(float(value.max()), 1.0e-6)
+    rgb = np.zeros((*value.shape, 3), dtype=np.float32)
+    rgb[..., color] = value
+    return Image.fromarray((rgb * 255).astype(np.uint8)).resize(size, Image.Resampling.NEAREST)
+
+
+def save_review_contact_sheet(path, payload, teacher, residual, row, stage0_positive_tokens, reasons):
+    target = np.asarray(payload["target_rgb"], dtype=np.uint8)
+    warp = np.asarray(payload["warp_rgb"], dtype=np.uint8)
+    visibility = np.asarray(payload["visibility"], dtype=np.float32)
+    world = np.asarray(payload["world_valid"], dtype=np.float32)
+    event = int(row.get("event_local_frame", 0) or 0)
+    if str(row.get("action_type", "none")) == "none":
+        frame_indices = [0, len(target) // 2, len(target) - 1]
+    else:
+        frame_indices = [max(event - 1, 0), min(event, len(target) - 1), min(event + 1, len(target) - 1)]
+    panel_size = (240, 135)
+    labels = ("target RGB", "warp RGB", "residual", "teacher", "teacher overlay", "visibility / world")
+    header_height = 120
+    row_height = panel_size[1] + 24
+    sheet = Image.new("RGB", (panel_size[0] * len(labels), header_height + row_height * 3), "white")
+    draw = ImageDraw.Draw(sheet)
+    font = ImageFont.load_default()
+    summary = (
+        f"event_id={row.get('event_id')}  action={row.get('action_type')}  block={row.get('block_id', row.get('object_id'))}\n"
+        f"history={row.get('history_type')}  event_local={event}  area={row.get('teacher_area_ratio')}  "
+        f"stage0_positive_tokens={stage0_positive_tokens}\n"
+        f"target_indices={row.get('target_indices')}\ninvalid_reasons={'|'.join(reasons) or 'none'}"
+    )
+    draw.multiline_text((8, 8), summary, fill="black", font=font, spacing=3)
+    for column, label in enumerate(labels):
+        draw.text((column * panel_size[0] + 4, header_height - 18), label, fill="black", font=font)
+    latent_frames = int(teacher.shape[1])
+    for row_number, frame_index in enumerate(frame_indices):
+        latent_index = min(int(round(frame_index * (latent_frames - 1) / max(len(target) - 1, 1))), latent_frames - 1)
+        target_image = Image.fromarray(target[frame_index], mode="RGB").resize(panel_size)
+        warp_image = Image.fromarray(warp[frame_index], mode="RGB").resize(panel_size)
+        residual_image = _map_image(residual[0, latent_index], panel_size, color=0)
+        teacher_image = _map_image(teacher[0, latent_index], panel_size, color=1)
+        overlay = Image.blend(target_image, _map_image(teacher[0, latent_index], panel_size, color=0), 0.35)
+        valid_rgb = np.stack(
+            [
+                np.zeros_like(visibility[0, latent_index]),
+                visibility[0, latent_index],
+                world[0, latent_index],
+            ],
+            axis=-1,
+        )
+        valid_image = Image.fromarray((np.clip(valid_rgb, 0.0, 1.0) * 255).astype(np.uint8)).resize(
+            panel_size, Image.Resampling.NEAREST
+        )
+        panels = (target_image, warp_image, residual_image, teacher_image, overlay, valid_image)
+        top = header_height + row_number * row_height
+        draw.text((4, top), f"RGB frame {frame_index} / latent {latent_index}", fill="black", font=font)
+        for column, panel in enumerate(panels):
+            sheet.paste(panel, (column * panel_size[0], top + 20))
+    sheet.save(path)
+
+
 def adaptive_max_pool_3d(value, output_size):
     output = np.zeros((value.shape[0], *output_size), dtype=value.dtype)
     for t in range(output_size[0]):
@@ -87,10 +164,45 @@ def adaptive_max_pool_3d(value, output_size):
     return output
 
 
+def fixed_teacher_statistics(
+    teacher,
+    action_mask,
+    visibility,
+    world,
+    support_threshold,
+    stage0_grid,
+    *,
+    action_type,
+):
+    teacher = np.asarray(teacher, dtype=np.float32)
+    action_mask = np.asarray(action_mask, dtype=np.float32)
+    visibility = np.asarray(visibility, dtype=np.float32)
+    world = np.asarray(world, dtype=np.float32)
+    valid_action_region = action_mask * visibility * world
+    support = (teacher > float(support_threshold)).astype(np.float32)
+    denominator = float(valid_action_region.sum())
+    area_ratio = float((support * valid_action_region).sum() / max(denominator, 1.0))
+    visibility_denominator = float((action_mask * world).sum())
+    visibility_ratio = float(valid_action_region.sum() / max(visibility_denominator, 1.0))
+    stage0_teacher = adaptive_max_pool_3d(teacher, tuple(int(value) for value in stage0_grid))
+    positive_tokens = int((stage0_teacher > float(support_threshold)).sum())
+    if is_negative_action(action_type):
+        area_ratio = 0.0
+        positive_tokens = 0
+    return {
+        "valid_action_region": valid_action_region,
+        "teacher_support": support,
+        "teacher_area_ratio": area_ratio,
+        "teacher_visibility_ratio": visibility_ratio,
+        "stage0_positive_tokens": positive_tokens,
+    }
+
+
 def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    rows = list(csv.DictReader(args.candidate_manifest.open("r", encoding="utf-8-sig", newline="")))
+    with args.candidate_manifest.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
     output = []
     rejection_counts = Counter()
     recipe = {
@@ -103,6 +215,8 @@ def main():
             "mine_active": args.min_area_mine_active,
         },
         "teacher": "per-time median/MAD residual with quantile fallback",
+        "local_residual_suppression": "residual/(residual+3x3 local mean)",
+        "temporal_smoothing": "0.5 current + 0.25 previous + 0.25 following",
     }
     for row in rows:
         candidate_path = Path(row["teacher_candidate_path"])
@@ -116,25 +230,71 @@ def main():
         visibility = normalize_map(payload["visibility"], grid_shape)
         world = normalize_map(payload["world_valid"], grid_shape, conservative=True)
         valid = action * visibility * world
-        residual, teacher = robust_teacher(target, warp, valid, args.z_cap)
-        support = (teacher > float(args.support_threshold)).astype(np.float32)
-        stage0_teacher = adaptive_max_pool_3d(teacher, tuple(int(value) for value in args.stage0_grid))
-        stage0_positive_tokens = int((stage0_teacher > float(args.support_threshold)).sum())
-        valid_count = float(valid.sum())
-        area = float((support * valid).sum() / max(valid_count, 1.0))
-        action_type = str(row.get("action_type", ""))
-        min_area = float(recipe["min_area"].get(action_type, args.min_area_place))
+        identity = json.loads(str(payload["candidate_identity_json"].item()))
+        expected_candidate_key = str(row.get("candidate_cache_key", ""))
         reasons = []
-        if valid_count <= 0:
-            reasons.append("empty_valid_region")
-        if float(support.sum()) <= 0:
-            reasons.append("empty_stage0_positive_tokens")
-        if stage0_positive_tokens <= 0 and "empty_stage0_positive_tokens" not in reasons:
-            reasons.append("empty_stage0_positive_tokens")
-        if area < min_area:
-            reasons.append("teacher_too_small")
-        if area > float(args.max_area):
-            reasons.append("teacher_too_large")
+        validate_fixed_identity(row, identity, str(row.get("candidate_config_hash", "")))
+        action_type = str(row.get("action_type", "none") or "none").strip().lower()
+        is_negative = action_type in {"", "none", "negative"}
+        if is_negative:
+            residual = np.mean(np.abs(target.astype(np.float32) - warp.astype(np.float32)), axis=0, keepdims=True)
+            teacher = np.zeros_like(residual, dtype=np.float32)
+        else:
+            residual, teacher = robust_teacher(target, warp, valid, args.z_cap)
+        statistics = fixed_teacher_statistics(
+            teacher,
+            action,
+            visibility,
+            world,
+            args.support_threshold,
+            args.stage0_grid,
+            action_type=action_type,
+        )
+        support = statistics["teacher_support"]
+        stage0_positive_tokens = statistics["stage0_positive_tokens"]
+        valid_count = float(statistics["valid_action_region"].sum())
+        area = statistics["teacher_area_ratio"]
+        min_area = float(recipe["min_area"].get(action_type, args.min_area_place))
+        if is_negative:
+            target_indices = [int(value) for value in identity.get("target_indices", [])]
+            if float(np.asarray(payload["world_valid"]).sum()) <= 0:
+                reasons.append("empty_world_valid")
+            if len(target_indices) != int(row.get("window_frames", 33) or 33):
+                reasons.append("invalid_target_window")
+            if target_indices and target_indices != list(range(target_indices[0], target_indices[0] + len(target_indices))):
+                reasons.append("non_contiguous_frames")
+            if identity.get("history_type") not in {"first", "later"}:
+                reasons.append("invalid_history_type")
+            for flag, reason in (
+                ("no_interaction_event_verified", "interaction_event_in_negative_window"),
+                ("gui_closed_verified", "gui_open"),
+                ("frame_contiguous_verified", "non_contiguous_frames"),
+                ("source_mapping_valid", "invalid_source_mapping"),
+            ):
+                if str(row.get(flag, "false")).strip().lower() != "true":
+                    reasons.append(reason)
+            if not identity.get("source_segment_id"):
+                reasons.append("missing_source_segment_id")
+            if str(row.get("candidate_error", "")).strip():
+                reasons.append("candidate_error")
+            if str(row.get("metadata_filter_status", "passed")).strip().lower() == "rejected":
+                reasons.append("metadata_filter_rejected")
+        else:
+            if valid_count <= 0:
+                reasons.append("empty_valid_region")
+            try:
+                validate_stage0_positive_tokens(
+                    action_type,
+                    stage0_positive_tokens,
+                    event_id=row.get("event_id", ""),
+                    history_type=row.get("history_type", ""),
+                )
+            except RuntimeError:
+                reasons.append("empty_stage0_positive_tokens")
+            if area < min_area:
+                reasons.append("teacher_too_small")
+            if area > float(args.max_area):
+                reasons.append("teacher_too_large")
         cache_payload = {
             "candidate": str(candidate_path.resolve()),
             "candidate_sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
@@ -142,7 +302,7 @@ def main():
             "event_id": row.get("event_id"),
             "history_type": row.get("history_type"),
         }
-        cache_key = hashlib.sha256(json.dumps(cache_payload, sort_keys=True).encode("utf-8")).hexdigest()
+        cache_key = stable_json_hash(cache_payload)
         npz_path = args.output_dir / f"{cache_key}.npz"
         preview_path = args.output_dir / f"{cache_key}_overlay.png"
         np.savez_compressed(
@@ -150,9 +310,17 @@ def main():
             residual=residual.astype(np.float16),
             teacher=teacher.astype(np.float16),
             visibility=visibility.astype(np.float16),
+            world_valid=world.astype(np.float16),
             valid=valid.astype(np.float16),
+            candidate_cache_key=np.asarray(expected_candidate_key),
+            candidate_config_hash=np.asarray(str(row.get("candidate_config_hash", ""))),
+            candidate_identity_json=np.asarray(json.dumps(identity, ensure_ascii=False, sort_keys=True)),
         )
-        save_preview(preview_path, residual, teacher)
+        row["teacher_area_ratio"] = f"{area:.8f}"
+        save_review_contact_sheet(
+            preview_path, payload, teacher, residual, row, stage0_positive_tokens, reasons
+        )
+        save_preview(args.output_dir / f"{cache_key}_summary.png", residual, teacher)
         for reason in reasons:
             rejection_counts[reason] += 1
         output.append(
@@ -166,6 +334,9 @@ def main():
                 "teacher_invalid_reasons": "|".join(reasons),
                 "teacher_valid": str(not reasons).lower(),
                 "review_status": "pending" if not reasons else "rejected",
+                "stage0_grid_t": str(int(args.stage0_grid[0])),
+                "stage0_grid_h": str(int(args.stage0_grid[1])),
+                "stage0_grid_w": str(int(args.stage0_grid[2])),
             }
         )
     manifest_path = args.output_dir / "teacher_pool_review_manifest.csv"

@@ -79,6 +79,19 @@ from warp_as_history.training.data import (
     build_online_warp_training_cache,
     normalize_online_training_dataframe,
 )
+from warp_as_history.training.fixed_teacher import (
+    ACTION_HISTORY_KEYS,
+    FixedTeacherIntegrityError,
+    approved_row_id,
+    build_action_history_pools,
+    candidate_config_hash,
+    encode_index_sequence,
+    manifest_sha256,
+    restore_training_counters,
+    stable_json_hash,
+    validate_resume_contract,
+    validate_required_pools,
+)
 from warp_as_history.training.utils import (
     current_train_lr,
     release_cuda_cache,
@@ -120,7 +133,7 @@ class InteractionJointSampler:
         if total_steps != planned_steps:
             raise ValueError(f"Interaction curriculum expected {planned_steps} effective steps, got {total_steps}.")
         self.samplers = []
-        self.source_pools = {key: list(value) for key, value in source_pools.items()}
+        self.source_pools = {key: list(source_pools.get(key, [])) for key in ACTION_HISTORY_KEYS}
         self.seed = int(seed)
         self.phase_plan = phase_plan
         self.total_steps = total_steps
@@ -133,12 +146,11 @@ class InteractionJointSampler:
             pools = {}
             ratios = {}
             for action, action_ratio in self.ACTION_RATIOS.items():
-                if not source_pools.get(action):
-                    raise ValueError(f"Required interaction pool is empty: {action}.")
                 for history, history_ratio in history_ratios.items():
                     key = f"{action}|{history}"
-                    pools[key] = list(source_pools[action])
+                    pools[key] = list(self.source_pools[key])
                     ratios[key] = float(action_ratio) * float(history_ratio)
+            validate_required_pools(self.source_pools, [phase], self.ACTION_RATIOS)
             self.samplers.append(
                 StepCategorySampler(pools, ratios, int(phase["steps"]), int(seed) + phase_index * 10007)
             )
@@ -155,8 +167,8 @@ class InteractionJointSampler:
         return self.samplers[phase].sample(local)
 
     def sample_category(self, category, occurrence):
-        action = str(category).split("|", 1)[0]
-        pool = self.source_pools[action]
+        category = str(category)
+        pool = self.source_pools[category]
         return pool[int(occurrence) % len(pool)]
 
     def report(self, completed_steps):
@@ -265,31 +277,34 @@ def build_minecraft_step_sampler(df, args):
         ratios = {"camera_first": 0.25, "camera_later": 0.55, "camera_rollout": 0.20}
     elif profile == "interaction":
         mode = str(getattr(args, "interaction_training_mode", "joint_stage0"))
-        if mode in {"joint_pilot", "joint_stage0"}:
-            sampler = InteractionJointSampler(
-                source_pools,
-                args.max_steps,
-                args.seed,
-                phases=interaction_training_mode_phase_plan(
-                    mode,
-                    total_steps=args.max_steps,
-                    phase_steps=args.interaction_phase_steps,
-                    first_ratios=args.interaction_first_history_ratios,
-                ),
-            )
-        else:
-            clean_subset = {
-                action: list(source_pools[action])[:8]
-                for action in ("place", "mine_active", "mine_complete", "negative")
-            }
-            sampler = InteractionJointSampler(
-                clean_subset,
-                args.max_steps,
-                args.seed,
-                phases=(
-                    {"steps": int(args.max_steps), "history": {"first": 0.50, "later": 0.50}},
-                ),
-            )
+        phase_plan = interaction_training_mode_phase_plan(
+            mode,
+            total_steps=args.max_steps,
+            phase_steps=args.interaction_phase_steps,
+            first_ratios=args.interaction_first_history_ratios,
+        )
+        source_pools = build_action_history_pools(
+            df.to_dict(orient="records"),
+            require_approved=True,
+            per_pool_limit=4 if mode in {"router_overfit", "adapter_overfit"} else None,
+        )
+        validate_required_pools(source_pools, phase_plan, InteractionJointSampler.ACTION_RATIOS)
+        print(
+            json.dumps(
+                {
+                    "event": "approved_action_history_pools",
+                    "interaction_training_mode": mode,
+                    "pool_sizes": {key: len(source_pools[key]) for key in ACTION_HISTORY_KEYS},
+                }
+            ),
+            flush=True,
+        )
+        sampler = InteractionJointSampler(
+            source_pools,
+            args.max_steps,
+            args.seed,
+            phases=phase_plan,
+        )
         return sampler, {
             "pool_sizes": {name: len(values) for name, values in source_pools.items()},
             "interaction_training_mode": mode,
@@ -492,6 +507,18 @@ def write_interaction_debug_summary(out_dir, step, losses, *, window=150):
     write_json(Path(out_dir) / f"interaction_summary_step{int(step):04d}.json", summary)
 
 
+def _cpu_tree(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_tree(item) for item in value)
+    return value
+
+
 def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -508,6 +535,7 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                     row_index,
                     requested_category=category,
                     requested_chunk_mode=f"interaction_{history_type}",
+                    keep_frames=True,
                 )
             except (RuntimeError, ValueError) as exc:
                 manifest_rows.append(
@@ -534,10 +562,31 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 visibility=conditioning.get("visibility"),
                 world_valid=conditioning.get("world_valid"),
             )
-            candidate_name = hashlib.sha256(
-                f"{row.get('event_id', row_index)}:{history_type}:{item['seq']}".encode("utf-8")
-            ).hexdigest()
+            training = dict(item["training"])
+            identity = {
+                "event_id": str(row.get("event_id", "")),
+                "history_type": history_type,
+                "target_indices": [int(value) for value in training.get("target_indices", [])],
+                "history_indices": [int(value) for value in training.get("history_indices", [])],
+                "geometry_keyframe_frames": [int(value) for value in training.get("keyframe_indices", [])],
+                "render_pose_indices": [int(value) for value in training.get("render_pose_indices", [])],
+                "target_start_frame": int(training.get("target_start_frame", 0)),
+                "event_local_frame": int(training.get("event_local_frame", 0) or 0),
+                "chunk_mode": str(training.get("chunk_mode", "")),
+                "direction": str(training.get("direction", "")),
+                "source_segment_id": str(row.get("segment_id", row.get("id", ""))),
+                "candidate_config_hash": str(exact_args.fixed_teacher_config_hash),
+            }
+            candidate_name = stable_json_hash(identity)
+            identity["candidate_cache_key"] = candidate_name
             candidate_path = output_dir / f"{candidate_name}.npz"
+            training_cache_path = output_dir / f"{candidate_name}.pt"
+            target_rgb = np.stack(
+                [np.asarray(frame.convert("RGB"), dtype=np.uint8) for frame in item.get("target_frames", [])]
+            )
+            warp_rgb = np.stack(
+                [np.asarray(frame.convert("RGB"), dtype=np.uint8) for frame in item.get("history_frames", [])]
+            )
             np.savez_compressed(
                 candidate_path,
                 target_latents=target[0].cpu().numpy().astype(np.float16),
@@ -545,12 +594,47 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 action_mask=aligned["action"][0].cpu().numpy().astype(np.float16),
                 visibility=aligned["visibility"][0].cpu().numpy().astype(np.float16),
                 world_valid=aligned["world_valid"][0].cpu().numpy().astype(np.float16),
+                target_rgb=target_rgb,
+                warp_rgb=warp_rgb,
+                interaction_payload_json=np.asarray(
+                    json.dumps(item.get("interaction_payload") or {}, ensure_ascii=False)
+                ),
+                candidate_identity_json=np.asarray(json.dumps(identity, ensure_ascii=False, sort_keys=True)),
+            )
+            torch.save(
+                {
+                    "schema_version": 1,
+                    "candidate_identity": identity,
+                    "target_latents": _cpu_tree(item["target_latents"]),
+                    "prompt_embeds": _cpu_tree(item["prompt_embeds"]),
+                    "histories": _cpu_tree(item["histories"]),
+                    "base_histories": _cpu_tree(item.get("base_histories")),
+                    "interaction_conditioning": _cpu_tree(item["interaction_conditioning"]),
+                    "interaction_payload": item.get("interaction_payload"),
+                    "world_valid_mask_latents": _cpu_tree(item.get("world_valid_mask_latents")),
+                    "training": training,
+                    "seq": str(item["seq"]),
+                    "training_category": str(item.get("training_category", "")),
+                },
+                training_cache_path,
             )
             manifest_rows.append(
                 {
                     **row.to_dict(),
                     "history_type": history_type,
                     "teacher_candidate_path": candidate_path.as_posix(),
+                    "training_cache_path": training_cache_path.as_posix(),
+                    "target_indices": encode_index_sequence(identity["target_indices"]),
+                    "target_start_frame": identity["target_start_frame"],
+                    "event_local_frame": identity["event_local_frame"],
+                    "history_indices": encode_index_sequence(identity["history_indices"]),
+                    "geometry_keyframe_frames": encode_index_sequence(identity["geometry_keyframe_frames"]),
+                    "render_pose_indices": encode_index_sequence(identity["render_pose_indices"]),
+                    "chunk_mode": identity["chunk_mode"],
+                    "direction": identity["direction"],
+                    "source_segment_id": identity["source_segment_id"],
+                    "candidate_cache_key": candidate_name,
+                    "candidate_config_hash": identity["candidate_config_hash"],
                     "target_reference": str(row.get("video_path", "")),
                     "warp_reference": str(item.get("seq", "")),
                     "candidate_error": "",
@@ -633,6 +717,11 @@ def save_training_state(
         "training_mode": str(args.interaction_training_mode),
         "interaction_active_stages": [0],
         "sampling_plan": dict(sampling_plan or {}),
+        "phase_plan": list(getattr(args, "resolved_interaction_phase_plan", []) or []),
+        "approved_teacher_row_ids": list(getattr(args, "approved_teacher_row_ids", []) or []),
+        "teacher_pool_manifest_hash": str(getattr(args, "teacher_pool_manifest_hash", "")),
+        "action_history_pool_sizes": dict(getattr(args, "action_history_pool_sizes", {}) or {}),
+        "effective_optimizer_step": int(global_step),
         "config": vars(args).copy(),
         "launch_argv": list(sys.argv),
         "git_commit": subprocess.run(
@@ -768,6 +857,13 @@ def load_training_state(path, *, transformer, optimizer, device, adapter_name=No
         "wah_initialization": dict(payload.get("wah_initialization", {}) or {}),
         "attempt_step": int(payload.get("attempt_step", 0)),
         "skipped_invalid_step": int(payload.get("skipped_invalid_step", 0)),
+        "distribution_counts": dict(payload.get("distribution_counts", {}) or {}),
+        "sampling_plan": dict(payload.get("sampling_plan", {}) or {}),
+        "phase_plan": list(payload.get("phase_plan", []) or []),
+        "approved_teacher_row_ids": list(payload.get("approved_teacher_row_ids", []) or []),
+        "teacher_pool_manifest_hash": str(payload.get("teacher_pool_manifest_hash", "")),
+        "action_history_pool_sizes": dict(payload.get("action_history_pool_sizes", {}) or {}),
+        "effective_optimizer_step": int(payload.get("effective_optimizer_step", payload.get("global_step", 0))),
     }
 
 
@@ -971,7 +1067,7 @@ def parse_args():
     parser.add_argument("--lora_target_modules", default="attn1.to_q,attn1.to_k,attn1.to_v,attn1.to_out.0")
     parser.add_argument("--lora_adapter_name", default="warp_as_history")
     parser.add_argument("--save_every", type=int, default=150)
-    parser.add_argument("--save_steps", type=int, nargs="*", default=[300, 500, 750, 1000, 1500])
+    parser.add_argument("--save_steps", type=int, nargs="*", default=[])
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tensorboard_log_dir", default="")
@@ -1176,6 +1272,7 @@ def main():
     opt.seed_global_rng(args.seed)
     device = torch.device("cuda")
 
+    args.teacher_pool_manifest_hash = manifest_sha256(args.prompt_csv)
     df = pd.read_csv(args.prompt_csv)
     if args.limit is not None and int(args.limit) > 0:
         df = df.head(int(args.limit))
@@ -1196,7 +1293,9 @@ def main():
             df = df.loc[approved].reset_index(drop=True)
             if df.empty:
                 raise ValueError("The audited teacher pool contains no review_status=approved rows.")
-            positive_rows = df["action_type"].fillna("").astype(str).ne("none")
+            positive_rows = df["action_type"].fillna("").astype(str).str.lower().isin(
+                ["place", "mine_active", "mine_complete"]
+            )
             if "stage0_positive_tokens" not in df.columns:
                 raise ValueError("Audited teacher pool is missing stage0_positive_tokens.")
             invalid_stage0 = positive_rows & (
@@ -1206,21 +1305,36 @@ def main():
                 raise ValueError(
                     f"Audited teacher pool contains {int(invalid_stage0.sum())} positive rows with empty Stage 0 support."
                 )
-            if "teacher_cache_path" not in df.columns:
-                raise ValueError("Audited teacher pool is missing teacher_cache_path.")
+            for required_cache_column in ("teacher_cache_path", "training_cache_path"):
+                if required_cache_column not in df.columns:
+                    raise ValueError(f"Audited teacher pool is missing {required_cache_column}.")
             missing_teacher_cache = []
-            for row_index, cache_value in df.loc[positive_rows, "teacher_cache_path"].items():
-                cache_path = Path(str(cache_value))
-                if not cache_path.is_absolute():
-                    cache_path = REPO_ROOT / cache_path
-                if not cache_path.is_file():
-                    missing_teacher_cache.append((int(row_index), str(cache_path)))
+            for cache_column in ("teacher_cache_path", "training_cache_path"):
+                for row_index, cache_value in df[cache_column].items():
+                    cache_path = Path(str(cache_value))
+                    if not cache_path.is_absolute():
+                        cache_path = REPO_ROOT / cache_path
+                    if not cache_path.is_file():
+                        missing_teacher_cache.append((cache_column, int(row_index), str(cache_path)))
             if missing_teacher_cache:
                 raise ValueError(
                     f"Audited teacher pool has missing fixed teacher files: {missing_teacher_cache[:5]}"
                 )
     exact_args.online_warp_cache = build_online_warp_training_cache(df, exact_args, device)
-    step_sampler, sampler_meta = build_minecraft_step_sampler(df, args)
+    if bool(args.export_teacher_candidates_only):
+        step_sampler = None
+        sampler_meta = {"mode": "teacher_candidate_export", "rows": len(df)}
+        args.approved_teacher_row_ids = []
+        args.action_history_pool_sizes = {}
+        args.resolved_interaction_phase_plan = []
+    else:
+        step_sampler, sampler_meta = build_minecraft_step_sampler(df, args)
+        args.approved_teacher_row_ids = sorted(
+            approved_row_id(row, fallback=index)
+            for index, row in enumerate(df.to_dict(orient="records"))
+        )
+        args.action_history_pool_sizes = dict(sampler_meta.get("pool_sizes", {}))
+        args.resolved_interaction_phase_plan = list(sampler_meta.get("phase_plan", []))
     skipped_rows = []
     print(
         json.dumps(
@@ -1250,6 +1364,15 @@ def main():
         pose_convention="opencv_c2w_relative",
         vae_temporal_scale=int(pipe.vae_scale_factor_temporal),
     )
+    if args.resume_from_checkpoint is not None:
+        manifest_config_hashes = sorted(
+            set(str(value) for value in df["candidate_config_hash"].tolist())
+        )
+        if len(manifest_config_hashes) != 1:
+            raise ValueError(f"Resume requires one candidate_config_hash, got {manifest_config_hashes}.")
+        exact_args.fixed_teacher_config_hash = manifest_config_hashes[0]
+    else:
+        exact_args.fixed_teacher_config_hash = candidate_config_hash(args, pipe.transformer._wah_recipe)
     mean, std = opt.latent_stats(pipe, device)
 
     serialized_train_args = {
@@ -1495,6 +1618,25 @@ def main():
             raise ValueError("Resume checkpoint interaction_training_mode does not match the current mode.")
         if list(resume_state.get("interaction_active_stages", [0])) != [0]:
             raise ValueError("Resume checkpoint must use interaction_active_stages=[0].")
+        resume_contract = {
+            "teacher_pool_manifest_hash": resume_state.get("teacher_pool_manifest_hash", ""),
+            "approved_teacher_row_ids": resume_state.get("approved_teacher_row_ids", []),
+            "action_history_pool_sizes": resume_state.get("action_history_pool_sizes", {}),
+            "phase_plan": resume_state.get("phase_plan", []),
+        }
+        current_contract = {
+            "teacher_pool_manifest_hash": args.teacher_pool_manifest_hash,
+            "approved_teacher_row_ids": args.approved_teacher_row_ids,
+            "action_history_pool_sizes": args.action_history_pool_sizes,
+            "phase_plan": args.resolved_interaction_phase_plan,
+        }
+        expected_sampling_plan = step_sampler.report(start_step)
+        validate_resume_contract(
+            resume_contract,
+            current_contract,
+            resume_state.get("sampling_plan", {}),
+            expected_sampling_plan,
+        )
         resume_recipe = resume_state.get("wah_recipe")
         if resume_recipe:
             mismatches = recipe_mismatches(resume_recipe, pipe.transformer._wah_recipe)
@@ -1535,12 +1677,15 @@ def main():
     if start_step > int(args.max_steps):
         raise ValueError(f"Checkpoint step {start_step} exceeds configured total steps {args.max_steps}.")
     start_time = time.perf_counter()
-    distribution_counts = distribution_counts_from_losses(losses)
-    effective_optimizer_step = int(start_step)
-    attempt_step = int(resume_state.get("attempt_step", 0)) if args.resume_from_checkpoint is not None else 0
-    skipped_invalid_step = (
-        int(resume_state.get("skipped_invalid_step", 0)) if args.resume_from_checkpoint is not None else 0
+    fallback_counts = distribution_counts_from_losses(losses)
+    restored_counters = restore_training_counters(
+        resume_state if args.resume_from_checkpoint is not None else {"global_step": start_step},
+        fallback_counts=fallback_counts,
     )
+    distribution_counts = Counter(restored_counters["distribution_counts"])
+    effective_optimizer_step = restored_counters["effective_optimizer_step"]
+    attempt_step = restored_counters["attempt_step"]
+    skipped_invalid_step = restored_counters["skipped_invalid_step"]
     progress = tqdm(total=args.max_steps, initial=start_step, desc="train shared lora")
     while effective_optimizer_step < int(args.max_steps):
         if attempt_step >= int(args.max_attempt_steps):
@@ -1605,6 +1750,8 @@ def main():
                     continue
                 break
             except (RuntimeError, ValueError) as exc:
+                if isinstance(exc, FixedTeacherIntegrityError):
+                    raise
                 last_prepare_error = exc
                 if (
                     sampled_action not in {"place", "mine_active", "mine_complete"}
@@ -1665,7 +1812,8 @@ def main():
         if category in {"place", "mine"} and float((item.get("interaction_payload") or {}).get("event_valid", 0.0)) == 1.0:
             distribution_counts[f"valid_{category}"] += 1
         chunk_mode = str(item.get("training", {}).get("chunk_mode", ""))
-        distribution_counts["first" if chunk_mode == "first" else "later"] += 1
+        resolved_history_type = sampled_history or item.get("training", {}).get("fixed_history_type")
+        distribution_counts["first" if resolved_history_type == "first" else "later"] += 1
         pose_source = str(item.get("training", {}).get("pose_source", ""))
         if pose_source == "vpt_telemetry":
             distribution_counts["pose_vpt"] += 1

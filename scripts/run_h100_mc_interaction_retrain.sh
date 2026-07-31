@@ -5,7 +5,14 @@ ROOT="${WAH_ROOT:-/ephemeral/mdu/action-warp-as-history}"
 PYTHON="${WAH_PYTHON:-/ephemeral/mdu/venvs/wah/bin/python}"
 GPU="${WAH_GPU:-1}"
 MODE="${WAH_INTERACTION_MODE:-joint_pilot}"
-STEPS="${WAH_STEPS:-300}"
+case "${MODE}" in
+  router_overfit) DEFAULT_STEPS=200 ;;
+  adapter_overfit) DEFAULT_STEPS=300 ;;
+  joint_pilot) DEFAULT_STEPS=200 ;;
+  joint_stage0) DEFAULT_STEPS=1500 ;;
+  *) echo "Unsupported WAH_INTERACTION_MODE: ${MODE}" >&2; exit 2 ;;
+esac
+STEPS="${WAH_STEPS:-${DEFAULT_STEPS}}"
 RUN_NAME="${WAH_RUN_NAME:-mc_interaction_${MODE}_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="runs/${RUN_NAME}"
 TRAIN_CSV="${WAH_TRAIN_CSV:-data/vpt_9x_100/wah_mc_training/teacher_pool/teacher_pool_review_manifest.csv}"
@@ -31,6 +38,11 @@ on_exit() {
   fi
 }
 trap on_exit EXIT
+
+EXTRA_ARGS=()
+case "${WAH_OVERWRITE:-0}" in
+  1|true|TRUE|yes|YES) EXTRA_ARGS+=(--overwrite) ;;
+esac
 
 CUDA_VISIBLE_DEVICES="${GPU}" PYTHONUNBUFFERED=1 "${PYTHON}" scripts/train_warp_as_history_lora.py \
   --base_model_path checkpoints/helios-distilled \
@@ -79,5 +91,5 @@ CUDA_VISIBLE_DEVICES="${GPU}" PYTHONUNBUFFERED=1 "${PYTHON}" scripts/train_warp_
   --no-direction_augmentation \
   --no-enable_bidirectional_training \
   --tensorboard \
-  --overwrite \
+  "${EXTRA_ARGS[@]}" \
   >> "${LOG_FILE}" 2>&1
