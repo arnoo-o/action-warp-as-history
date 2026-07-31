@@ -1305,7 +1305,9 @@ def main():
             sampled_action, sampled_history = sampled_class, None
         item = None
         step_invalid_event_retries = 0
-        for retry in range(8):
+        max_prepare_retries = 32 if sampled_action in {"place", "mine_active", "mine_complete"} else 8
+        last_prepare_error = None
+        for retry in range(max_prepare_retries):
             try:
                 requested_category = (
                     "movement"
@@ -1349,10 +1351,11 @@ def main():
                     continue
                 break
             except (RuntimeError, ValueError) as exc:
+                last_prepare_error = exc
                 if (
                     sampled_action not in {"place", "mine_active", "mine_complete"}
                     and sampled_class != "camera_rollout"
-                ) or retry == 7:
+                ) or retry == max_prepare_retries - 1:
                     raise
                 if sampled_action in {"place", "mine_active", "mine_complete"}:
                     distribution_counts["invalid_event_retries"] += 1
@@ -1360,6 +1363,23 @@ def main():
                 item_idx = step_sampler.sample_category(sampled_class, step + retry + 1)
                 print(json.dumps({"event": "invalid_interaction_retry", "step": step, "category": sampled_class, "reason": str(exc)}), flush=True)
         if item is None:
+            if sampled_action in {"place", "mine_active", "mine_complete"}:
+                skipped_invalid_step += 1
+                print(
+                    json.dumps(
+                        {
+                            "event": "invalid_interaction_skip",
+                            "attempt_step": attempt_step,
+                            "effective_optimizer_step": effective_optimizer_step,
+                            "sampled_class": sampled_class,
+                            "retries": int(max_prepare_retries),
+                            "reason": None if last_prepare_error is None else str(last_prepare_error),
+                        }
+                    ),
+                    flush=True,
+                )
+                release_cuda_cache()
+                continue
             raise RuntimeError("Failed to prepare a sampled training item.")
         is_positive_interaction = sampled_action in {"place", "mine_active", "mine_complete"}
         if is_positive_interaction and not bool(item.get("interaction_teacher_valid", False)):
