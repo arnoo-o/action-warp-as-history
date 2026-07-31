@@ -349,6 +349,13 @@ class FixedTeacherPoolTest(unittest.TestCase):
             )
             self.assertEqual(Path(resolved), target.resolve())
 
+    def test_online_candidate_preparation_binds_source_row(self):
+        source = DATA_PATH.read_text(encoding="utf-8")
+        function_start = source.index("def prepare_online_warp_item(")
+        row_binding = source.index("row = online_cache.rows[int(row_index)]", function_start)
+        teacher_lookup = source.index('row.get("teacher_cache_path", "")', function_start)
+        self.assertLess(row_binding, teacher_lookup)
+
 
 class NegativeCandidateReviewTest(unittest.TestCase):
     def test_negative_candidate_enters_pending_pool(self):

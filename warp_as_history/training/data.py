@@ -2489,6 +2489,7 @@ def prepare_online_warp_item(
         requested_category=requested_category,
         requested_chunk_mode=requested_chunk_mode,
     )
+    row = online_cache.rows[int(row_index)]
     seq = case["seq"]
     prompt_text = str(case["prompt"])
     first_frame = case["condition_frame"]
