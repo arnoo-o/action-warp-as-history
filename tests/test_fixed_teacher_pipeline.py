@@ -24,6 +24,7 @@ from warp_as_history.training.fixed_teacher import (
     interaction_action_ratios,
     interaction_payload_hash,
     restore_training_counters,
+    stratified_candidate_indices,
     validate_fixed_identity,
     validate_fixed_artifact_hashes,
     validate_required_pools,
@@ -260,6 +261,23 @@ class FixedTeacherPoolTest(unittest.TestCase):
         self.assertEqual(ratios["negative"], 0.0)
         self.assertAlmostEqual(sum(ratios.values()), 1.0)
         self.assertTrue(all(ratios[action] > 0 for action in ("place", "mine_active", "mine_complete")))
+
+    def test_candidate_limit_is_stratified_across_all_actions(self):
+        rows = []
+        for action, count in (
+            ("place", 1000),
+            ("mine_active", 500),
+            ("mine_complete", 500),
+            ("none", 300),
+        ):
+            rows.extend({"action_type": action} for _ in range(count))
+        indices = stratified_candidate_indices(rows, 500)
+        selected = [rows[index]["action_type"] for index in indices]
+        self.assertEqual(len(indices), len(set(indices)))
+        self.assertEqual(selected.count("place"), 250)
+        self.assertEqual(selected.count("mine_active"), 75)
+        self.assertEqual(selected.count("mine_complete"), 75)
+        self.assertEqual(selected.count("none"), 100)
 
     def test_artifact_hash_mismatch_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:

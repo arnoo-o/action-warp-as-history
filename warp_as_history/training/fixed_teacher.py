@@ -31,6 +31,42 @@ def interaction_action_ratios(mode):
     }
 
 
+def stratified_candidate_indices(rows, limit, action_ratios=None):
+    rows = list(rows)
+    limit = int(limit)
+    if limit <= 0 or limit >= len(rows):
+        return list(range(len(rows)))
+    ratios = dict(action_ratios or interaction_action_ratios("joint_stage0"))
+    pools = {action: [] for action in INTERACTION_ACTIONS}
+    for index, row in enumerate(rows):
+        action = canonical_pool_action(row)
+        if action in pools:
+            pools[action].append(index)
+    available = {action: values for action, values in pools.items() if values and ratios.get(action, 0) > 0}
+    if not available:
+        raise ValueError("Candidate stratification found no supported interaction actions.")
+    ratio_sum = sum(float(ratios[action]) for action in available)
+    ideals = {action: limit * float(ratios[action]) / ratio_sum for action in available}
+    counts = {action: min(len(available[action]), int(ideals[action])) for action in available}
+    remaining = limit - sum(counts.values())
+    while remaining > 0:
+        candidates = [action for action in available if counts[action] < len(available[action])]
+        if not candidates:
+            break
+        action = max(candidates, key=lambda name: (ideals[name] - counts[name], ratios[name], name))
+        counts[action] += 1
+        remaining -= 1
+    selected = []
+    for action in INTERACTION_ACTIONS:
+        pool = available.get(action, [])
+        count = counts.get(action, 0)
+        if count <= 0:
+            continue
+        positions = [min(int((offset + 0.5) * len(pool) / count), len(pool) - 1) for offset in range(count)]
+        selected.extend(pool[position] for position in positions)
+    return selected
+
+
 class FixedTeacherIntegrityError(RuntimeError):
     pass
 

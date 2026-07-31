@@ -96,6 +96,7 @@ from warp_as_history.training.fixed_teacher import (
     model_artifact_fingerprint,
     restore_training_counters,
     stable_json_hash,
+    stratified_candidate_indices,
     validate_resume_contract,
     validate_required_pools,
 )
@@ -587,8 +588,29 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows = []
     source_digest_cache = {}
-    maximum = len(df) if int(limit) <= 0 else min(len(df), int(limit))
-    for row_index in range(maximum):
+    row_indices = stratified_candidate_indices(
+        df.to_dict(orient="records"),
+        limit,
+        interaction_action_ratios("joint_stage0"),
+    )
+    selected_actions = Counter(
+        "negative"
+        if _row_text(df.iloc[index], "action_type", default="none").lower() in {"", "none", "negative"}
+        else _row_text(df.iloc[index], "action_type").lower()
+        for index in row_indices
+    )
+    print(
+        json.dumps(
+            {
+                "event": "teacher_candidate_stratified_selection",
+                "source_rows": len(row_indices),
+                "source_action_counts": dict(selected_actions),
+                "requested_limit": int(limit),
+            }
+        ),
+        flush=True,
+    )
+    for row_index in row_indices:
         row = df.iloc[row_index]
         action_type = str(row.get("action_type", "none") or "none").strip().lower()
         category = "negative" if action_type == "none" else "mine" if action_type.startswith("mine") else "place"
@@ -748,6 +770,8 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
         output_dir / "teacher_candidate_audit.json",
         {
             "rows": len(manifest_rows),
+            "selected_source_rows": len(row_indices),
+            "selected_source_action_counts": dict(selected_actions),
             "successful": sum(not row.get("candidate_error") for row in manifest_rows),
             "failed": sum(bool(row.get("candidate_error")) for row in manifest_rows),
             "manifest": str(manifest_path),
