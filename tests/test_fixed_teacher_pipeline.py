@@ -428,6 +428,9 @@ class NegativeCandidateReviewTest(unittest.TestCase):
             self.assertEqual(reviewed[0]["review_status"], "rejected")
             self.assertIn("candidate_error:metadata rotation rejected", reviewed[0]["teacher_invalid_reasons"])
             self.assertEqual(reviewed[1]["review_status"], "pending")
+            review_html = (temp / "teacher_pool" / "review_index.html").read_text(encoding="utf-8")
+            self.assertNotIn("No preview generated", review_html)
+            self.assertEqual(review_html.count("<article"), 1)
 
     def test_missing_candidate_file_does_not_stop_builder(self):
         with tempfile.TemporaryDirectory() as temp_dir:

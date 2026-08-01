@@ -399,6 +399,8 @@ def write_review_index(path, rows):
     )
     grouped = {name: [] for name in groups}
     for row in rows:
+        if row.get("review_status") != "pending" or not str(row.get("teacher_overlay_path", "") or "").strip():
+            continue
         action = "negative" if is_negative_action(row.get("action_type")) else str(row.get("action_type", ""))
         key = f"{action}|{row.get('history_type', '')}"
         if key in grouped:
@@ -411,7 +413,7 @@ def write_review_index(path, rows):
         ".card{background:white;border:1px solid #c7c2b5;padding:10px}.card img{width:100%;height:auto}",
         "code{font-size:12px;overflow-wrap:anywhere}.rejected{border-color:#b64632}</style></head><body>",
         "<h1>Minecraft fixed teacher review</h1>",
-        "<p>This page is read-only. Edit the adjacent review manifest CSV to approve or reject samples.</p>",
+        "<p>This page shows pending candidates only. Rejected preparation rows remain in the adjacent CSV and audit JSON.</p>",
     ]
     for group in groups:
         entries = grouped[group]
