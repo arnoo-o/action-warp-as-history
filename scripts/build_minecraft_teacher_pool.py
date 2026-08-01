@@ -704,7 +704,7 @@ def main():
                 reasons.append("invalid_target_window")
             if target_indices and target_indices != list(range(target_indices[0], target_indices[0] + len(target_indices))):
                 reasons.append("non_contiguous_frames")
-            if identity.get("history_type") not in {"first", "later"}:
+            if identity.get("history_type") not in {"first", "later", "multi"}:
                 reasons.append("invalid_history_type")
             for flag, reason in (
                 ("no_interaction_event_verified", "interaction_event_in_negative_window"),

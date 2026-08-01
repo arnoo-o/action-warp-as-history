@@ -124,9 +124,9 @@ class InteractionJointSampler:
         "negative": 0.20,
     }
     DEFAULT_STAGE0_PHASES = (
-        {"steps": 500, "history": {"first": 0.40, "later": 0.60}},
-        {"steps": 500, "history": {"first": 0.30, "later": 0.70}},
-        {"steps": 500, "history": {"first": 0.25, "later": 0.75}},
+        {"steps": 500, "history": {"first": 0.40, "later": 0.50, "multi": 0.10}},
+        {"steps": 500, "history": {"first": 0.30, "later": 0.50, "multi": 0.20}},
+        {"steps": 500, "history": {"first": 0.20, "later": 0.50, "multi": 0.30}},
     )
     DEFAULT_PILOT_PHASES = (
         {"steps": 100, "history": {"first": 0.40, "later": 0.60}},
@@ -210,26 +210,30 @@ def interaction_training_mode_default_steps(mode):
     return 1500
 
 
-def interaction_training_mode_phase_plan(mode, total_steps=None, phase_steps=None, first_ratios=None):
+def interaction_training_mode_phase_plan(
+    mode, total_steps=None, phase_steps=None, first_ratios=None, later_ratios=None, multi_ratios=None
+):
     mode = str(mode)
     if mode in {"joint_pilot", "joint_stage0"}:
         total_steps = int(total_steps or interaction_training_mode_default_steps(mode))
         if phase_steps is None:
             base, remainder = divmod(total_steps, 3)
             phase_steps = [base + (1 if index < remainder else 0) for index in range(3)]
-        if first_ratios is None:
-            first_ratios = [0.40, 0.30, 0.25]
-        if len(phase_steps) != 3 or len(first_ratios) != 3:
+        first_ratios = [0.40, 0.30, 0.20] if first_ratios is None else list(first_ratios)
+        later_ratios = [0.50, 0.50, 0.50] if later_ratios is None else list(later_ratios)
+        multi_ratios = [0.10, 0.20, 0.30] if multi_ratios is None else list(multi_ratios)
+        if any(len(values) != 3 for values in (phase_steps, first_ratios, later_ratios, multi_ratios)):
             raise ValueError("Interaction Stage 0 curriculum requires exactly three phase steps and ratios.")
         if sum(int(value) for value in phase_steps) != total_steps:
             raise ValueError("--interaction_phase_steps must sum to the configured effective steps.")
-        return tuple(
-            {
-                "steps": int(steps),
-                "history": {"first": float(first), "later": 1.0 - float(first)},
-            }
-            for steps, first in zip(phase_steps, first_ratios)
-        )
+        phases = []
+        for steps, first, later, multi in zip(phase_steps, first_ratios, later_ratios, multi_ratios):
+            if abs(float(first) + float(later) + float(multi) - 1.0) > 1.0e-6:
+                raise ValueError("Each first/later/multi history ratio triplet must sum to 1.0.")
+            phases.append(
+                {"steps": int(steps), "history": {"first": float(first), "later": float(later), "multi": float(multi)}}
+            )
+        return tuple(phases)
     return (
         {"steps": int(total_steps or interaction_training_mode_default_steps(mode)), "history": {"first": 0.50, "later": 0.50}},
     )
@@ -316,6 +320,8 @@ def build_minecraft_step_sampler(df, args):
             total_steps=args.max_steps,
             phase_steps=args.interaction_phase_steps,
             first_ratios=args.interaction_first_history_ratios,
+            later_ratios=args.interaction_later_history_ratios,
+            multi_ratios=args.interaction_multi_history_ratios,
         )
         action_ratios = interaction_action_ratios(mode)
         require_selected = mode in {"router_overfit", "adapter_overfit"}
@@ -618,11 +624,12 @@ def _event_aligned_conflict(df, row_index, target_fps, window_frames):
     return None
 
 
-def _event_aligned_success_quotas(limit):
+def _event_aligned_success_quotas(limit, action_ratios, history_ratios):
     limit = int(limit)
     if limit <= 0:
         return {}
-    action_ratios = (("place", 0.5), ("mine_active", 0.25), ("mine_complete", 0.25))
+    action_ratios = tuple(zip(("place", "mine_active", "mine_complete", "negative"), action_ratios))
+    history_ratios = tuple(zip(("first", "later", "multi"), history_ratios))
     action_counts = {action: int(math.floor(limit * ratio)) for action, ratio in action_ratios}
     for action, _ in action_ratios:
         if sum(action_counts.values()) >= limit:
@@ -630,8 +637,11 @@ def _event_aligned_success_quotas(limit):
         action_counts[action] += 1
     quotas = {}
     for action, count in action_counts.items():
-        quotas[(action, "first")] = int(math.ceil(count / 2.0))
-        quotas[(action, "later")] = int(count // 2)
+        history_counts = {history: int(math.floor(count * ratio)) for history, ratio in history_ratios}
+        while sum(history_counts.values()) < count:
+            history = max(history_ratios, key=lambda item: count * item[1] - history_counts[item[0]])[0]
+            history_counts[history] += 1
+        quotas.update({(action, history): value for history, value in history_counts.items()})
     return quotas
 
 
@@ -641,7 +651,13 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
     manifest_rows = []
     source_digest_cache = {}
     event_aligned = bool(getattr(exact_args, "event_aligned_interaction", False))
-    success_quotas = _event_aligned_success_quotas(limit) if event_aligned else {}
+    candidate_action_ratios = tuple(float(value) for value in exact_args.teacher_candidate_action_ratios)
+    candidate_history_ratios = tuple(float(value) for value in exact_args.teacher_candidate_history_ratios)
+    success_quotas = (
+        _event_aligned_success_quotas(limit, candidate_action_ratios, candidate_history_ratios)
+        if event_aligned
+        else {}
+    )
     successful_by_cell = Counter()
     if event_aligned and int(limit) > 0:
         # Rejections are common under event isolation and rotation constraints.
@@ -650,7 +666,7 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
     else:
         source_limit = limit
     candidate_ratios = (
-        {"place": 0.5, "mine_active": 0.25, "mine_complete": 0.25, "negative": 0.0}
+        dict(zip(("place", "mine_active", "mine_complete", "negative"), candidate_action_ratios))
         if event_aligned
         else interaction_action_ratios("joint_stage0")
     )
@@ -679,24 +695,26 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
     attempted_source_rows = 0
     for row_index in row_indices:
         row = df.iloc[row_index]
-        action_type = str(row.get("action_type", "none") or "none").strip().lower()
+        raw_action_type = row.get("action_type", "none")
+        action_type = "none" if pd.isna(raw_action_type) else str(raw_action_type or "none").strip().lower()
+        pool_action = "negative" if action_type in {"", "none", "negative"} else action_type
         if event_aligned and success_quotas and all(
             successful_by_cell[cell] >= quota for cell, quota in success_quotas.items()
         ):
             break
         if event_aligned and success_quotas and all(
-            successful_by_cell[(action_type, history)] >= success_quotas.get((action_type, history), 0)
-            for history in ("first", "later")
+            successful_by_cell[(pool_action, history)] >= success_quotas.get((pool_action, history), 0)
+            for history in ("first", "later", "multi")
         ):
             continue
         attempted_source_rows += 1
         category = "negative" if action_type == "none" else "mine" if action_type.startswith("mine") else "place"
-        histories = ["first", "later"]
+        histories = ["first", "later", "multi"]
         for history_type in histories:
-            cell = (action_type, history_type)
+            cell = (pool_action, history_type)
             if event_aligned and success_quotas and successful_by_cell[cell] >= success_quotas.get(cell, 0):
                 continue
-            if event_aligned:
+            if event_aligned and action_type not in {"", "none", "negative"}:
                 conflict = _event_aligned_conflict(
                     df, row_index, exact_args.online_target_fps, exact_args.num_frames
                 )
@@ -715,8 +733,10 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                     row_index,
                     requested_category=category,
                     requested_chunk_mode=(
-                        f"interaction_event_{history_type}"
-                        if event_aligned
+                        "interaction_event_multi"
+                        if history_type == "multi"
+                        else f"interaction_event_{history_type}"
+                        if event_aligned and action_type not in {"", "none", "negative"}
                         else f"interaction_{history_type}"
                     ),
                     keep_frames=True,
@@ -1217,7 +1237,23 @@ def parse_args():
         "--interaction_first_history_ratios",
         type=float,
         nargs=3,
-        default=[0.40, 0.30, 0.25],
+        default=[0.40, 0.30, 0.20],
+    )
+    parser.add_argument("--interaction_later_history_ratios", type=float, nargs=3, default=[0.50, 0.50, 0.50])
+    parser.add_argument("--interaction_multi_history_ratios", type=float, nargs=3, default=[0.10, 0.20, 0.30])
+    parser.add_argument(
+        "--teacher_candidate_action_ratios",
+        type=float,
+        nargs=4,
+        default=[0.40, 0.25, 0.15, 0.20],
+        metavar=("PLACE", "MINE_ACTIVE", "MINE_COMPLETE", "NEGATIVE"),
+    )
+    parser.add_argument(
+        "--teacher_candidate_history_ratios",
+        type=float,
+        nargs=3,
+        default=[0.40, 0.50, 0.10],
+        metavar=("FIRST", "LATER", "MULTI"),
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=384)

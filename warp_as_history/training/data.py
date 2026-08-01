@@ -2073,6 +2073,7 @@ class OnlineWarpTrainingCache:
             event_aligned_mode = requested_chunk_mode in {
                 "interaction_event_first",
                 "interaction_event_later",
+                "interaction_event_multi",
             }
             if event_aligned_mode:
                 aligned_window = event_aligned_indices(event_resampled_frame, n, num_frames)
@@ -2093,6 +2094,8 @@ class OnlineWarpTrainingCache:
                 if requested_chunk_mode == "interaction_event_first"
                 else "event_later"
                 if requested_chunk_mode == "interaction_event_later"
+                else "generated"
+                if requested_chunk_mode == "interaction_event_multi"
                 else "first"
                 if requested_chunk_mode == "interaction_first"
                 else "generated"
@@ -2133,6 +2136,7 @@ class OnlineWarpTrainingCache:
         event_aligned_mode = requested_chunk_mode in {
             "interaction_event_first",
             "interaction_event_later",
+            "interaction_event_multi",
         }
         reference_frame_index = None
         if event_aligned_mode:
@@ -2187,8 +2191,8 @@ class OnlineWarpTrainingCache:
                 for frame_index in geometry_frame_indices
                 if history_indices[0] <= frame_index < target_start
             ]
-            if requested_chunk_mode in {"camera_rollout", "interaction_generated"}:
-                rollout_source = int(target_start) - (int(num_frames) - 1)
+            if requested_chunk_mode in {"camera_rollout", "interaction_generated", "interaction_event_multi"}:
+                rollout_source = int(target_start) - int(num_frames)
                 if rollout_source < 0:
                     raise ValueError("Generated history requires a complete preceding chunk.")
                 geometry_keyframe_frames = [max(rollout_source, 0)]
@@ -2476,9 +2480,9 @@ class OnlineWarpTrainingCache:
             if world_valid_mask is None
             else [world_valid_mask.copy() for _ in range(num_frames)],
         }
-        if requested_chunk_mode in {"camera_rollout", "interaction_generated"}:
-            previous_start = int(target_start) - (int(num_frames) - 1)
-            previous_indices = list(range(previous_start, int(target_start) + 1))
+        if requested_chunk_mode in {"camera_rollout", "interaction_generated", "interaction_event_multi"}:
+            previous_start = int(target_start) - int(num_frames)
+            previous_indices = list(range(previous_start, int(target_start)))
             if previous_start < 0 or prepared.get("pose_rows") is None:
                 raise ValueError("Two-chunk rollout requires an earlier VPT-controlled chunk.")
             result["rollout_source_frame"] = frames[previous_start]
@@ -2779,6 +2783,15 @@ def prepare_online_warp_item(
                     device,
                     video_latents=rollout_video_latents.detach(),
                     seq=f"{seq}:generated_rollout_history",
+                )
+                histories = opt.make_histories(
+                    pipe,
+                    rollout_image_latents,
+                    rollout_fake_image_latents,
+                    exact_args,
+                    device,
+                    video_latents=rollout_video_latents.detach(),
+                    seq=f"{seq}:generated_rollout_wah_history",
                 )
             loss_focus_mask_latents = online_mask_frames_to_latent_mask(
                 case.get("focus_mask_frames"),

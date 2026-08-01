@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 INTERACTION_ACTIONS = ("place", "mine_active", "mine_complete", "negative")
-INTERACTION_HISTORIES = ("first", "later")
+INTERACTION_HISTORIES = ("first", "later", "multi")
 ACTION_HISTORY_KEYS = tuple(
     f"{action}|{history}"
     for action in INTERACTION_ACTIONS
@@ -24,8 +24,8 @@ def interaction_action_ratios(mode):
             "negative": 0.0,
         }
     return {
-        "place": 0.50,
-        "mine_active": 0.15,
+        "place": 0.40,
+        "mine_active": 0.25,
         "mine_complete": 0.15,
         "negative": 0.20,
     }
@@ -93,8 +93,10 @@ def is_negative_action(value):
 
 def canonical_history_type(value):
     value = str(value or "").strip().lower()
+    if value in {"generated", "generated_history", "multi_chunk"}:
+        value = "multi"
     if value not in INTERACTION_HISTORIES:
-        raise ValueError(f"history_type must be first or later, got {value!r}")
+        raise ValueError(f"history_type must be first, later or multi, got {value!r}")
     return value
 
 
