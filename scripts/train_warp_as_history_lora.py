@@ -134,7 +134,18 @@ class InteractionJointSampler:
         {"steps": 100, "history": {"first": 0.25, "later": 0.75}},
     )
 
-    def __init__(self, source_pools, total_steps, seed, *, phases, action_ratios=None):
+    def __init__(
+        self,
+        source_pools,
+        total_steps,
+        seed,
+        *,
+        phases,
+        action_ratios=None,
+        rows=None,
+        later_damage_ratios=(0.25, 0.40, 0.50),
+        require_later_damaged=False,
+    ):
         total_steps = int(total_steps)
         phase_plan = [dict(item) for item in phases]
         planned_steps = sum(int(item["steps"]) for item in phase_plan)
@@ -147,6 +158,29 @@ class InteractionJointSampler:
         self.phase_plan = phase_plan
         self.total_steps = total_steps
         self.offsets = []
+        self.rows = list(rows or [])
+        self.later_damage_ratios = tuple(float(value) for value in later_damage_ratios)
+        if len(self.later_damage_ratios) != len(phase_plan):
+            raise ValueError("later damage ratios must match the number of curriculum phases")
+        self.later_variant_pools = {}
+        for action in self.action_ratios:
+            key = f"{action}|later"
+            values = self.source_pools.get(key, [])
+            self.later_variant_pools[key] = {
+                variant: [
+                    index for index in values
+                    if (
+                        str(self.rows[index].get("history_variant", "clean") or "clean").lower()
+                        if self.rows
+                        else "clean"
+                    ) == variant
+                ]
+                for variant in ("clean", "damaged")
+            }
+            if not self.later_variant_pools[key]["damaged"]:
+                if bool(require_later_damaged) and any(self.later_damage_ratios):
+                    raise ValueError(f"Formal curriculum requires pre-generated damaged cache rows for {key}.")
+                self.later_variant_pools[key]["damaged"] = list(self.later_variant_pools[key]["clean"])
         cursor = 0
         for phase_index, phase in enumerate(phase_plan):
             self.offsets.append(cursor)
@@ -173,10 +207,29 @@ class InteractionJointSampler:
                 phase = index
                 break
         local = effective_step - self.offsets[phase]
-        return self.samplers[phase].sample(local)
+        category, index = self.samplers[phase].sample(local)
+        self.current_phase = phase
+        if category.endswith("|later"):
+            ratio = self.later_damage_ratios[phase]
+            choose_damaged = random.Random(self.seed + effective_step * 104729).random() < ratio
+            variant = "damaged" if choose_damaged else "clean"
+            pool = self.later_variant_pools[category][variant]
+            if not pool:
+                raise ValueError(f"Curriculum requested {variant} cache but pool {category} is empty.")
+            index = pool[effective_step % len(pool)]
+        return category, index
 
     def sample_category(self, category, occurrence):
         category = str(category)
+        if category.endswith("|later"):
+            phase = int(getattr(self, "current_phase", 0))
+            ratio = self.later_damage_ratios[phase]
+            choose_damaged = random.Random(self.seed + int(occurrence) * 104729).random() < ratio
+            variant = "damaged" if choose_damaged else "clean"
+            pool = self.later_variant_pools[category][variant]
+            if not pool:
+                raise ValueError(f"Curriculum requested {variant} cache but pool {category} is empty.")
+            return pool[int(occurrence) % len(pool)]
         pool = self.source_pools[category]
         return pool[int(occurrence) % len(pool)]
 
@@ -267,6 +320,7 @@ def training_resume_contract(args, *, camera_fingerprint=None):
             args.flow_matching_train_exact_timestep_sampling
         ),
         "candidate_config_hash": str(getattr(args, "fixed_teacher_config_hash", "")),
+        "later_damage_ratios": [float(value) for value in args.interaction_later_damage_ratios],
     }
 
 
@@ -353,6 +407,9 @@ def build_minecraft_step_sampler(df, args):
             args.seed,
             phases=phase_plan,
             action_ratios=action_ratios,
+            rows=df.to_dict(orient="records"),
+            later_damage_ratios=args.interaction_later_damage_ratios,
+            require_later_damaged=args.require_later_damaged_cache,
         )
         return sampler, {
             "pool_sizes": {name: len(values) for name, values in source_pools.items()},
@@ -1250,6 +1307,8 @@ def parse_args():
     )
     parser.add_argument("--interaction_later_history_ratios", type=float, nargs=3, default=[0.50, 0.50, 0.50])
     parser.add_argument("--interaction_multi_history_ratios", type=float, nargs=3, default=[0.10, 0.20, 0.30])
+    parser.add_argument("--interaction_later_damage_ratios", type=float, nargs=3, default=[0.25, 0.40, 0.50])
+    parser.add_argument("--require_later_damaged_cache", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--teacher_candidate_action_ratios",
         type=float,
