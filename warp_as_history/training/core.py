@@ -1496,6 +1496,7 @@ def pyramid_stage_model_forward(
                 current_interaction = {
                     "payload": stage_interaction["payload"],
                     "warp_latents": stage_interaction["warp_latents"][index],
+                    "reference_latents": stage_interaction["reference_latents"][index],
                     "visibility": stage_interaction["visibility"][index],
                     "world_valid": stage_interaction.get("world_valid"),
                     "stage_id": stage_id,
@@ -1623,9 +1624,18 @@ def flow_matching_loss_train_exact(
         visibility_pyramid = training_exact_pyramid_latents(
             interaction_conditioning["visibility"], len(args.pyramid_num_inference_steps_list)
         )
+        reference_source = interaction_conditioning.get("reference_latents")
+        reference_pyramid = (
+            [None] * len(warp_pyramid)
+            if reference_source is None
+            else training_exact_pyramid_latents(
+                reference_source, len(args.pyramid_num_inference_steps_list)
+            )
+        )
         stage_interaction = {
             "payload": interaction_conditioning["payload"],
             "warp_latents": [warp_pyramid[sid] for sid in stage_ids],
+            "reference_latents": [reference_pyramid[sid] for sid in stage_ids],
             "visibility": [visibility_pyramid[sid] for sid in stage_ids],
             "world_valid": interaction_conditioning.get("world_valid"),
             "gate_override": interaction_gate_override,

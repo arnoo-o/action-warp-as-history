@@ -121,15 +121,26 @@ def configure_interaction_trainability(stack, mode):
         if name.startswith(("stage_warp_scales", "stage_adapter_scales")):
             trainable = False
         elif mode == "router_overfit":
-            trainable = name.startswith(("semantic_encoder.", "stage_embedding.", "router."))
+            trainable = name.startswith(
+                ("semantic_encoder.", "stage_embedding.", "router.", "router_reference_projection.")
+            )
         elif mode == "adapter_overfit":
-            trainable = name.startswith("adapter.")
+            trainable = name.startswith(("adapter.", "adapter_reference_projection."))
         else:
-            trainable = name.startswith(("semantic_encoder.", "stage_embedding.", "router.", "adapter."))
+            trainable = name.startswith(
+                (
+                    "semantic_encoder.",
+                    "stage_embedding.",
+                    "router.",
+                    "adapter.",
+                    "router_reference_projection.",
+                    "adapter_reference_projection.",
+                )
+            )
         parameter.requires_grad_(trainable)
         if not trainable:
             continue
-        if name.startswith("adapter."):
+        if name.startswith(("adapter.", "adapter_reference_projection.")):
             groups["interaction_adapter"].append(parameter)
         elif name.startswith("router."):
             groups["interaction_router"].append(parameter)
@@ -309,6 +320,10 @@ class InteractionConditioningStack(nn.Module):
         nn.init.zeros_(self.stage_embedding.weight)
         self.router = InteractionRouter(hidden_dim, semantic_dim=semantic_dim, rank=rank)
         self.adapter = InteractionAdapter(hidden_dim, semantic_dim=semantic_dim, rank=rank)
+        self.router_reference_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.adapter_reference_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.router_reference_projection.weight)
+        nn.init.zeros_(self.adapter_reference_projection.weight)
         self.stage_warp_scales = nn.Parameter(self._stage_scale_tensor(stage_warp_scales, "stage_warp_scales"))
         self.stage_adapter_scales = nn.Parameter(
             self._stage_scale_tensor(stage_adapter_scales, "stage_adapter_scales")
@@ -366,6 +381,7 @@ class InteractionConditioningStack(nn.Module):
         stage_id=0,
         previous_gate=None,
         gate_override=None,
+        reference_tokens=None,
     ):
         batch_size = target_tokens.shape[0]
         device = target_tokens.device
@@ -421,6 +437,20 @@ class InteractionConditioningStack(nn.Module):
         action_tokens = temporal_action.repeat_interleave(height * width, dim=1).unsqueeze(-1)
         progress_tokens = temporal_progress.repeat_interleave(height * width, dim=1).unsqueeze(-1)
         warp_tokens = warp_tokens * self.stage_warp_scales[stage_id].to(warp_tokens)
+        reference_conditioning_used = reference_tokens is not None
+        if reference_tokens is None:
+            reference_tokens = torch.zeros_like(warp_tokens)
+        if reference_tokens.shape != warp_tokens.shape:
+            raise ValueError(
+                f"reference tokens must align with event-local warp tokens: "
+                f"{tuple(reference_tokens.shape)} != {tuple(warp_tokens.shape)}"
+            )
+        router_warp_tokens = warp_tokens + self.router_reference_projection(
+            reference_tokens.to(dtype=self.router_reference_projection.weight.dtype)
+        ).to(warp_tokens)
+        adapter_warp_tokens = warp_tokens + self.adapter_reference_projection(
+            reference_tokens.to(dtype=self.adapter_reference_projection.weight.dtype)
+        ).to(warp_tokens)
         frame_axis = torch.linspace(0.0, 1.0, temporal, device=device, dtype=torch.float32)
         frame_positions = frame_axis.repeat_interleave(height * width).unsqueeze(0).expand(batch_size, -1)
         event_positions = event_frames / (total_frames - 1.0).clamp_min(1.0)
@@ -444,7 +474,7 @@ class InteractionConditioningStack(nn.Module):
             ).flatten(2).transpose(1, 2)
         raw_gate = self.router(
             semantic,
-            warp_tokens,
+            router_warp_tokens,
             target_tokens,
             visibility_tokens,
             action_tokens,
@@ -473,7 +503,7 @@ class InteractionConditioningStack(nn.Module):
         if bool(interaction_adapter_enabled):
             output, raw_delta, injection = self.adapter(
                 target_tokens,
-                warp_tokens,
+                adapter_warp_tokens,
                 semantic,
                 progress_tokens,
                 final_gate,
@@ -514,5 +544,6 @@ class InteractionConditioningStack(nn.Module):
             "previous_gate": previous_gate,
             "stage_warp_scale": self.stage_warp_scales[stage_id],
             "stage_adapter_scale": torch.ones((), device=device, dtype=torch.float32),
+            "reference_conditioning_used": bool(reference_conditioning_used),
         }
         return output, debug

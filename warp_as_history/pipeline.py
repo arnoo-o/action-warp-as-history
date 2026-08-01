@@ -61,6 +61,7 @@ from .defaults import (
     WAH_VISIBLE_TOKEN_THRESHOLD,
 )
 from .minecraft_sampling import interaction_event_identity, interaction_payload_for_chunk
+from .event_aligned import run_scripted_event_timeline, scripted_event_segments
 
 
 LORA_AUTO_VALUES = frozenset({"auto", "default"})
@@ -158,6 +159,29 @@ class WarpAsHistoryPipeline(HeliosPipeline):
     _wah_adapter_name = "wah"
     _camera_warp_renderer: Pi3XWarpRenderer | None = None
     _camera_warp_renderer_key: tuple[Any, ...] | None = None
+
+    @staticmethod
+    def plan_scripted_action_timeline(events, total_frames: int, window_frames: int = WAH_NUM_FRAMES):
+        return scripted_event_segments(events, total_frames, window_frames)
+
+    @staticmethod
+    def run_scripted_action_timeline(
+        initial_reference,
+        events,
+        total_frames: int,
+        generate_segment: Callable,
+        *,
+        window_frames: int = WAH_NUM_FRAMES,
+        oracle_reference_frames=None,
+    ):
+        return run_scripted_event_timeline(
+            initial_reference,
+            events,
+            total_frames,
+            generate_segment,
+            window_frames=window_frames,
+            oracle_reference_frames=oracle_reference_frames,
+        )
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str | Path, *args: Any, **kwargs: Any):
@@ -1385,6 +1409,17 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         )
         state["interaction_warp_latents"] = clean_warp_latents.detach()
         state["interaction_visibility_latents"] = visibility_latents.detach()
+        reference_mean, reference_std = self._latent_stats(device)
+        _, interaction_reference_latents = self.prepare_video_latents(
+            source_frame,
+            latents_mean=reference_mean,
+            latents_std=reference_std,
+            num_latent_frames_per_chunk=1,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        state["interaction_reference_latents"] = interaction_reference_latents[:, :, :1].detach()
 
         prev_chunk_history_sizes = tuple(int(x) for x in state.get("prev_chunk_history_sizes", (0, 0, 0)))
         total_prev_history = sum(prev_chunk_history_sizes)
@@ -2917,6 +2952,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                                 "warp_latents": warp_for_router,
                                 "visibility": visibility_for_router,
                                 "world_valid": state.get("interaction_world_valid_latents"),
+                                "reference_latents": state.get("interaction_reference_latents"),
                                 "stage_id": int(i_s),
                                 "previous_gate": stage_previous_interaction_gate,
                             }

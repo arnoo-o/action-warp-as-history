@@ -583,15 +583,57 @@ def _source_video_digest(row, exact_args, digest_cache):
     return digest_cache[cache_key]
 
 
+def _event_aligned_conflict(df, row_index, target_fps, window_frames):
+    row = df.iloc[int(row_index)]
+    segment = str(row.get("segment_id", row.get("source_segment_id", "")))
+    current = row.get("event_source_frame", row.get("source_event_frame"))
+    if not segment or current is None or pd.isna(current):
+        return None
+    current = int(current)
+    source_fps = float(row.get("fps", target_fps) or target_fps)
+    horizon = int(math.ceil(int(window_frames) * source_fps / max(float(target_fps), 1.0e-6)))
+    current_action = str(row.get("action_type", "")).strip().lower()
+    current_complete = row.get("complete_frame")
+    for other_index, other in df.iterrows():
+        if int(other_index) == int(row_index):
+            continue
+        if str(other.get("segment_id", other.get("source_segment_id", ""))) != segment:
+            continue
+        action = str(other.get("action_type", "")).strip().lower()
+        if action not in {"place", "mine_active", "mine_complete"}:
+            continue
+        frame = other.get("event_source_frame", other.get("source_event_frame"))
+        if frame is None or pd.isna(frame):
+            continue
+        frame = int(frame)
+        same_mine_completion = (
+            current_action == "mine_active"
+            and action == "mine_complete"
+            and current_complete is not None
+            and not pd.isna(current_complete)
+            and frame == int(current_complete)
+        )
+        if current < frame <= current + horizon and not same_mine_completion:
+            return f"second_structural_event:{frame}:{action}"
+    return None
+
+
 def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows = []
     source_digest_cache = {}
+    event_aligned = bool(getattr(exact_args, "event_aligned_interaction", False))
+    source_limit = int(math.ceil(int(limit) / 2.0)) if event_aligned and int(limit) > 0 else limit
+    candidate_ratios = (
+        {"place": 0.5, "mine_active": 0.25, "mine_complete": 0.25, "negative": 0.0}
+        if event_aligned
+        else interaction_action_ratios("joint_stage0")
+    )
     row_indices = stratified_candidate_indices(
         df.to_dict(orient="records"),
-        limit,
-        interaction_action_ratios("joint_stage0"),
+        source_limit,
+        candidate_ratios,
     )
     selected_actions = Counter(
         "negative"
@@ -616,11 +658,29 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
         category = "negative" if action_type == "none" else "mine" if action_type.startswith("mine") else "place"
         histories = ["first", "later"]
         for history_type in histories:
+            if event_aligned:
+                conflict = _event_aligned_conflict(
+                    df, row_index, exact_args.online_target_fps, exact_args.num_frames
+                )
+                if conflict:
+                    manifest_rows.append(
+                        {
+                            **row.to_dict(),
+                            "history_type": history_type,
+                            "teacher_candidate_path": "",
+                            "candidate_error": conflict,
+                        }
+                    )
+                    continue
             try:
                 item = items.get(
                     row_index,
                     requested_category=category,
-                    requested_chunk_mode=f"interaction_{history_type}",
+                    requested_chunk_mode=(
+                        f"interaction_event_{history_type}"
+                        if event_aligned
+                        else f"interaction_{history_type}"
+                    ),
                     keep_frames=True,
                 )
             except (RuntimeError, ValueError) as exc:
@@ -670,6 +730,9 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 "source_video_digest": source_digest,
                 "history_type": history_type,
                 "target_indices": [int(value) for value in training.get("target_indices", [])],
+                "reference_frame_index": int(
+                    -1 if training.get("reference_frame_index") is None else training["reference_frame_index"]
+                ),
                 "history_indices": [int(value) for value in training.get("history_indices", [])],
                 "geometry_keyframe_frames": [int(value) for value in training.get("keyframe_indices", [])],
                 "render_pose_indices": [int(value) for value in training.get("render_pose_indices", [])],
@@ -699,11 +762,13 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 candidate_path,
                 target_latents=target[0].cpu().numpy().astype(np.float16),
                 warp_latents=conditioning["warp_latents"][0].detach().float().cpu().numpy().astype(np.float16),
+                reference_latents=item["reference_latents"][0].detach().float().cpu().numpy().astype(np.float16),
                 action_mask=aligned["action"][0].cpu().numpy().astype(np.float16),
                 visibility=aligned["visibility"][0].cpu().numpy().astype(np.float16),
                 world_valid=aligned["world_valid"][0].cpu().numpy().astype(np.float16),
                 target_rgb=target_rgb,
                 warp_rgb=warp_rgb,
+                reference_rgb=np.asarray(item["reference_frame"].convert("RGB"), dtype=np.uint8),
                 interaction_payload_json=np.asarray(json.dumps(interaction_payload, ensure_ascii=False)),
                 rgb_frame_to_latent_index=np.asarray(rgb_to_latent, dtype=np.int16),
                 candidate_identity_json=np.asarray(json.dumps(identity, ensure_ascii=False, sort_keys=True)),
@@ -734,6 +799,7 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                     "teacher_candidate_path": candidate_path.as_posix(),
                     "training_cache_path": training_cache_path.as_posix(),
                     "target_indices": encode_index_sequence(identity["target_indices"]),
+                    "reference_frame_index": identity["reference_frame_index"],
                     "target_start_frame": identity["target_start_frame"],
                     "event_local_frame": identity["event_local_frame"],
                     "history_indices": encode_index_sequence(identity["history_indices"]),
@@ -1068,6 +1134,7 @@ def parse_args():
     parser.add_argument("--export_teacher_candidates_only", action="store_true")
     parser.add_argument("--teacher_candidate_output_dir", type=Path, default=None)
     parser.add_argument("--teacher_candidate_limit", type=int, default=0)
+    parser.add_argument("--event_aligned_interaction", action="store_true")
     parser.add_argument("--interaction_phase_steps", type=int, nargs=3, default=None)
     parser.add_argument(
         "--interaction_first_history_ratios",
@@ -1274,6 +1341,7 @@ def build_exact_args(args):
     exact.interaction_min_telemetry_confidence = float(args.interaction_min_telemetry_confidence)
     exact.interaction_min_mine_active_frames = int(args.interaction_min_mine_active_frames)
     exact.interaction_active_stages = [0]
+    exact.event_aligned_interaction = bool(args.event_aligned_interaction)
     exact.base_train_steps = int(args.base_train_steps)
     exact.bidirectional_train_steps = int(args.bidirectional_train_steps)
     exact.enable_bidirectional_training = bool(args.enable_bidirectional_training)

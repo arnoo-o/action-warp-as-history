@@ -34,12 +34,18 @@ def parse_args():
     parser.add_argument("--min_area_mine_active", type=float, default=0.0005)
     parser.add_argument("--max_area", type=float, default=0.25)
     parser.add_argument("--stage0_grid", type=int, nargs=3, default=[9, 6, 10], metavar=("T", "H", "W"))
+    parser.add_argument("--review_manifest_name", default="teacher_pool_review_manifest.csv")
     return parser.parse_args()
 
 
-def robust_teacher(target, warp, valid, z_cap):
-    residual = np.mean(np.abs(target.astype(np.float32) - warp.astype(np.float32)), axis=0, keepdims=True)
-    teacher = np.zeros_like(residual, dtype=np.float32)
+def robust_normalized_residual(target, source, valid, z_cap):
+    source = np.asarray(source, dtype=np.float32)
+    if source.shape[1] == 1 and target.shape[1] > 1:
+        source = np.repeat(source, target.shape[1], axis=1)
+    if source.shape != target.shape:
+        raise ValueError(f"Dual residual sources must match target: {source.shape} != {target.shape}")
+    residual = np.mean(np.abs(target.astype(np.float32) - source), axis=0, keepdims=True)
+    normalized = np.zeros_like(residual, dtype=np.float32)
     for time_index in range(residual.shape[1]):
         values = residual[0, time_index][valid[0, time_index] > 0]
         if values.size == 0:
@@ -51,17 +57,24 @@ def robust_teacher(target, warp, valid, z_cap):
             scale = float(np.quantile(values, 0.90) - np.quantile(values, 0.50))
         if scale < 1.0e-6:
             continue
-        teacher[0, time_index] = np.clip(
+        normalized[0, time_index] = np.clip(
             np.maximum(residual[0, time_index] - median, 0.0) / (scale * float(z_cap)), 0.0, 1.0
         )
-    padded = np.pad(residual, ((0, 0), (0, 0), (1, 1), (1, 1)), mode="edge")
+    return residual, normalized
+
+
+def robust_teacher(target, warp, reference, valid, z_cap):
+    d_warp, warp_normalized = robust_normalized_residual(target, warp, valid, z_cap)
+    d_raw, raw_normalized = robust_normalized_residual(target, reference, valid, z_cap)
+    teacher = np.sqrt(np.clip(warp_normalized * raw_normalized, 0.0, 1.0))
+    padded = np.pad(d_warp, ((0, 0), (0, 0), (1, 1), (1, 1)), mode="edge")
     local_motion = sum(
-        padded[:, :, y : y + residual.shape[2], x : x + residual.shape[3]]
+        padded[:, :, y : y + d_warp.shape[2], x : x + d_warp.shape[3]]
         for y in range(3)
         for x in range(3)
     ) / 9.0
     local_residual_suppression = np.clip(
-        residual / (residual + local_motion + 1.0e-6), 0.25, 1.0
+        d_warp / (d_warp + local_motion + 1.0e-6), 0.25, 1.0
     )
     teacher = teacher * local_residual_suppression
     if teacher.shape[1] > 1:
@@ -70,7 +83,7 @@ def robust_teacher(target, warp, valid, z_cap):
         temporal_smoothing = 0.5 * teacher + 0.25 * previous + 0.25 * following
     else:
         temporal_smoothing = teacher
-    return residual, temporal_smoothing * valid
+    return d_warp, d_raw, temporal_smoothing * valid
 
 
 def normalize_map(value, shape, *, conservative=False):
@@ -108,6 +121,8 @@ def review_frame_latent_pairs(payload, row):
     event = int(row.get("event_local_frame", 0) or 0)
     if is_negative_action(row.get("action_type", "none")):
         frame_indices = [0, len(target) // 2, len(target) - 1]
+    elif int(row.get("event_local_frame", 0) or 0) == 0:
+        frame_indices = [0, min(1, len(target) - 1), min(3, len(target) - 1)]
     else:
         frame_indices = [
             max(event - 1, 0),
@@ -117,15 +132,22 @@ def review_frame_latent_pairs(payload, row):
     return [(frame_index, int(mapping[frame_index])) for frame_index in frame_indices]
 
 
-def save_review_contact_sheet(path, payload, teacher, residual, row, stage0_positive_tokens, reasons):
+def save_review_contact_sheet(path, payload, teacher, d_warp, d_raw, row, stage0_positive_tokens, reasons):
     target = np.asarray(payload["target_rgb"], dtype=np.uint8)
     warp = np.asarray(payload["warp_rgb"], dtype=np.uint8)
+    reference = np.asarray(
+        payload["reference_rgb"] if "reference_rgb" in payload else payload["target_rgb"][0],
+        dtype=np.uint8,
+    )
     visibility = np.asarray(payload["visibility"], dtype=np.float32)
     world = np.asarray(payload["world_valid"], dtype=np.float32)
     event = int(row.get("event_local_frame", 0) or 0)
     frame_latent_pairs = review_frame_latent_pairs(payload, row)
     panel_size = (240, 135)
-    labels = ("target RGB", "warp RGB", "residual", "teacher", "teacher overlay", "visibility / world")
+    labels = (
+        "reference RGB", "target RGB", "event-local warp RGB", "D_warp", "D_raw",
+        "fused teacher", "teacher overlay", "visibility / world",
+    )
     header_height = 120
     row_height = panel_size[1] + 24
     sheet = Image.new("RGB", (panel_size[0] * len(labels), header_height + row_height * 3), "white")
@@ -135,7 +157,8 @@ def save_review_contact_sheet(path, payload, teacher, residual, row, stage0_posi
         f"event_id={row.get('event_id')}  action={row.get('action_type')}  block={row.get('block_id', row.get('object_id'))}\n"
         f"history={row.get('history_type')}  event_local={event}  area={row.get('teacher_area_ratio')}  "
         f"stage0_positive_tokens={stage0_positive_tokens}\n"
-        f"target_indices={row.get('target_indices')}\ninvalid_reasons={'|'.join(reasons) or 'none'}"
+        f"reference={row.get('reference_frame_index')}  target_indices={row.get('target_indices')}\n"
+        f"invalid_reasons={'|'.join(reasons) or 'none'}"
     )
     draw.multiline_text((8, 8), summary, fill="black", font=font, spacing=3)
     for column, label in enumerate(labels):
@@ -149,7 +172,9 @@ def save_review_contact_sheet(path, payload, teacher, residual, row, stage0_posi
             )
         target_image = Image.fromarray(target[frame_index], mode="RGB").resize(panel_size)
         warp_image = Image.fromarray(warp[frame_index], mode="RGB").resize(panel_size)
-        residual_image = _map_image(residual[0, latent_index], panel_size, color=0)
+        reference_image = Image.fromarray(reference, mode="RGB").resize(panel_size)
+        d_warp_image = _map_image(d_warp[0, latent_index], panel_size, color=0)
+        d_raw_image = _map_image(d_raw[0, latent_index], panel_size, color=0)
         teacher_image = _map_image(teacher[0, latent_index], panel_size, color=1)
         overlay = Image.blend(target_image, _map_image(teacher[0, latent_index], panel_size, color=0), 0.35)
         valid_rgb = np.stack(
@@ -163,7 +188,10 @@ def save_review_contact_sheet(path, payload, teacher, residual, row, stage0_posi
         valid_image = Image.fromarray((np.clip(valid_rgb, 0.0, 1.0) * 255).astype(np.uint8)).resize(
             panel_size, Image.Resampling.NEAREST
         )
-        panels = (target_image, warp_image, residual_image, teacher_image, overlay, valid_image)
+        panels = (
+            reference_image, target_image, warp_image, d_warp_image, d_raw_image,
+            teacher_image, overlay, valid_image,
+        )
         top = header_height + row_number * row_height
         draw.text((4, top), f"RGB frame {frame_index} / latent {latent_index}", fill="black", font=font)
         for column, panel in enumerate(panels):
@@ -261,7 +289,7 @@ def write_review_index(path, rows):
         ".card{background:white;border:1px solid #c7c2b5;padding:10px}.card img{width:100%;height:auto}",
         "code{font-size:12px;overflow-wrap:anywhere}.rejected{border-color:#b64632}</style></head><body>",
         "<h1>Minecraft fixed teacher review</h1>",
-        "<p>This page is read-only. Edit teacher_pool_review_manifest.csv to approve or reject samples.</p>",
+        "<p>This page is read-only. Edit the adjacent review manifest CSV to approve or reject samples.</p>",
     ]
     for group in groups:
         entries = grouped[group]
@@ -345,13 +373,37 @@ def main():
             continue
         target = payload["target_latents"]
         warp = payload["warp_latents"]
+        reference = payload["reference_latents"] if "reference_latents" in payload else None
+        action_type = str(row.get("action_type", "none") or "none").strip().lower()
+        is_negative = action_type in {"", "none", "negative"}
         if target.shape != warp.shape or target.ndim != 4:
+            payload.close()
             raise ValueError(f"Expected [C,T,H,W] matching latents in {candidate_path}")
+        if reference is None:
+            if is_negative:
+                reference = target[:, :1].copy()
+            else:
+                reason = "missing_reference_latents"
+                rejection_counts[reason] += 1
+                payload.close()
+                output.append(rejected_manifest_row(row, [reason]))
+                continue
         grid_shape = (1, *target.shape[1:])
         action = normalize_map(payload["action_mask"], grid_shape)
         visibility = normalize_map(payload["visibility"], grid_shape)
         world = normalize_map(payload["world_valid"], grid_shape, conservative=True)
-        valid = action * visibility * world
+        teacher_action = action.copy()
+        if action_type in {"place", "mine_complete"}:
+            mapping = np.asarray(payload["rgb_frame_to_latent_index"], dtype=np.int64).reshape(-1)
+            keep_latents = set(int(value) for value in mapping[:4])
+            for time_index in range(teacher_action.shape[1]):
+                if time_index not in keep_latents:
+                    teacher_action[:, time_index] = 0.0
+        hand_valid = np.ones_like(world, dtype=np.float32)
+        hand_valid[..., int(round(world.shape[-2] * 0.58)) :, int(round(world.shape[-1] * 0.65)) :] = 0.0
+        payload_json = json.loads(str(payload["interaction_payload_json"].item()))
+        event_valid = float(payload_json.get("event_valid", 1.0))
+        valid = teacher_action * visibility * world * hand_valid * event_valid
         identity = json.loads(str(payload["candidate_identity_json"].item()))
         expected_candidate_key = str(row.get("candidate_cache_key", ""))
         reasons = []
@@ -361,22 +413,21 @@ def main():
             candidate_path=candidate_path,
             training_cache_path=training_cache_path,
         )
-        payload_json = json.loads(str(payload["interaction_payload_json"].item()))
         if interaction_payload_hash(payload_json) != str(row.get("interaction_payload_hash", "")):
             raise ValueError(
                 f"Candidate payload hash mismatch event_id={row.get('event_id')} "
                 f"history_type={row.get('history_type')}"
             )
-        action_type = str(row.get("action_type", "none") or "none").strip().lower()
-        is_negative = action_type in {"", "none", "negative"}
         if is_negative:
-            residual = np.mean(np.abs(target.astype(np.float32) - warp.astype(np.float32)), axis=0, keepdims=True)
-            teacher = np.zeros_like(residual, dtype=np.float32)
+            d_warp = np.mean(np.abs(target.astype(np.float32) - warp.astype(np.float32)), axis=0, keepdims=True)
+            reference_broadcast = np.repeat(reference, target.shape[1], axis=1) if reference.shape[1] == 1 else reference
+            d_raw = np.mean(np.abs(target.astype(np.float32) - reference_broadcast.astype(np.float32)), axis=0, keepdims=True)
+            teacher = np.zeros_like(d_warp, dtype=np.float32)
         else:
-            residual, teacher = robust_teacher(target, warp, valid, args.z_cap)
+            d_warp, d_raw, teacher = robust_teacher(target, warp, reference, valid, args.z_cap)
         statistics = fixed_teacher_statistics(
             teacher,
-            action,
+            teacher_action,
             visibility,
             world,
             args.support_threshold,
@@ -440,7 +491,9 @@ def main():
         preview_path = args.output_dir / f"{cache_key}_overlay.png"
         np.savez_compressed(
             npz_path,
-            residual=residual.astype(np.float16),
+            residual=d_warp.astype(np.float16),
+            d_warp=d_warp.astype(np.float16),
+            d_raw=d_raw.astype(np.float16),
             teacher=teacher.astype(np.float16),
             visibility=visibility.astype(np.float16),
             world_valid=world.astype(np.float16),
@@ -453,9 +506,9 @@ def main():
         )
         row["teacher_area_ratio"] = f"{area:.8f}"
         save_review_contact_sheet(
-            preview_path, payload, teacher, residual, row, stage0_positive_tokens, reasons
+            preview_path, payload, teacher, d_warp, d_raw, row, stage0_positive_tokens, reasons
         )
-        save_preview(args.output_dir / f"{cache_key}_summary.png", residual, teacher)
+        save_preview(args.output_dir / f"{cache_key}_summary.png", d_warp, teacher)
         for reason in reasons:
             rejection_counts[reason] += 1
         output.append(
@@ -478,7 +531,7 @@ def main():
             }
         )
         payload.close()
-    manifest_path = args.output_dir / "teacher_pool_review_manifest.csv"
+    manifest_path = args.output_dir / str(args.review_manifest_name)
     columns = sorted({key for row in output for key in row})
     with manifest_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)

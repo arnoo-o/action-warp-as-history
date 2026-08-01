@@ -1432,6 +1432,7 @@ class HeliosTransformer3DModel(
         stage_id=0,
         previous_gate=None,
         gate_override=None,
+        reference_latents=None,
     ):
         stack = getattr(self, "interaction_conditioning", None)
         if stack is None:
@@ -1440,6 +1441,25 @@ class HeliosTransformer3DModel(
             self.patch_embedding,
             raw_warp_latents.to(device=self.patch_embedding.weight.device, dtype=self.patch_embedding.weight.dtype),
         ).flatten(2).transpose(1, 2)
+        reference_tokens = None
+        if reference_latents is not None:
+            reference_latents = reference_latents.to(
+                device=raw_warp_latents.device, dtype=raw_warp_latents.dtype
+            )
+            if reference_latents.shape[2] == 1 and raw_warp_latents.shape[2] > 1:
+                reference_latents = reference_latents.expand(
+                    -1, -1, raw_warp_latents.shape[2], -1, -1
+                )
+            if reference_latents.shape[2:] != raw_warp_latents.shape[2:]:
+                reference_latents = F.interpolate(
+                    reference_latents.float(), size=raw_warp_latents.shape[2:], mode="trilinear", align_corners=False
+                ).to(raw_warp_latents)
+            reference_tokens = self.gradient_checkpointing_method(
+                self.patch_embedding,
+                reference_latents.to(
+                    device=self.patch_embedding.weight.device, dtype=self.patch_embedding.weight.dtype
+                ),
+            ).flatten(2).transpose(1, 2)
         return stack(
             hidden_states,
             warp_tokens,
@@ -1453,6 +1473,7 @@ class HeliosTransformer3DModel(
             stage_id=stage_id,
             previous_gate=previous_gate,
             gate_override=gate_override,
+            reference_tokens=reference_tokens,
         )
 
     @staticmethod
@@ -1655,6 +1676,7 @@ class HeliosTransformer3DModel(
                         stage_id=int(interaction_stage_ids[idx]),
                         previous_gate=previous_interaction_gate,
                         gate_override=interaction_conditioning.get("gate_override"),
+                        reference_latents=interaction_conditioning.get("reference_latents"),
                     )
                     interaction_debug.append(cur_debug)
                     previous_interaction_gate = cur_debug["predicted_gate"]
@@ -1731,6 +1753,7 @@ class HeliosTransformer3DModel(
                     stage_id=int(interaction_conditioning.get("stage_id", 0)),
                     previous_gate=interaction_conditioning.get("previous_gate"),
                     gate_override=interaction_conditioning.get("gate_override"),
+                    reference_latents=interaction_conditioning.get("reference_latents"),
                 )
                 interaction_debug.append(cur_debug)
             if target_channel_fusion_latents is not None:

@@ -259,6 +259,7 @@ def candidate_config_payload(args, wah_recipe):
         "seed",
         "interaction_teacher_support_threshold",
         "flow_matching_train_exact_timestep_sampling",
+        "event_aligned_interaction",
     )
     values = {key: str(getattr(args, key, None)) for key in keys}
     for model_key in ("base_model_path", "transformer_path", "camera_checkpoint"):
@@ -272,7 +273,7 @@ def candidate_config_hash(args, wah_recipe):
 
 
 def fixed_identity_from_row(row):
-    return {
+    identity = {
         "event_id": _identity_text(row.get("event_id")),
         "action_type": "none" if is_negative_action(row.get("action_type")) else _identity_text(row.get("action_type")).lower(),
         "block_id": _identity_text(row.get("block_id", row.get("object_id", ""))),
@@ -295,6 +296,9 @@ def fixed_identity_from_row(row):
         "candidate_cache_key": _identity_text(row.get("candidate_cache_key")),
         "candidate_config_hash": _identity_text(row.get("candidate_config_hash")),
     }
+    if _identity_text(row.get("reference_frame_index")):
+        identity["reference_frame_index"] = int(row.get("reference_frame_index"))
+    return identity
 
 
 def validate_fixed_identity(row, cached_identity, expected_config_hash):

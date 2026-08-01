@@ -40,6 +40,7 @@ from warp_as_history.minecraft_camera import (
 from warp_as_history.minecraft_sampling import (
     build_interaction_event_window as _build_interaction_event_window,
 )
+from warp_as_history.event_aligned import drop_reference_render_frame, event_aligned_indices
 from warp_as_history.training import core as opt
 from warp_as_history.training.utils import detach_tree
 from helios.modules.interaction_conditioning import (
@@ -2026,17 +2027,30 @@ class OnlineWarpTrainingCache:
                 else "later"
             )
         elif category in {"place", "mine"}:
-            target_indices, event_local_frame = build_interaction_event_window(
-                int(event_resampled_frame),
-                num_source_frames=n,
-                window_size=num_frames,
-                rng=rng,
-                local_min=int(getattr(self.exact_args, "interaction_event_local_min", 6)),
-                local_max=int(getattr(self.exact_args, "interaction_event_local_max", 16)),
-                require_later=requested_chunk_mode != "interaction_first",
-            )
+            event_aligned_mode = requested_chunk_mode in {
+                "interaction_event_first",
+                "interaction_event_later",
+            }
+            if event_aligned_mode:
+                aligned_window = event_aligned_indices(event_resampled_frame, n, num_frames)
+                target_indices = aligned_window["target_indices"]
+                event_local_frame = 0
+            else:
+                target_indices, event_local_frame = build_interaction_event_window(
+                    int(event_resampled_frame),
+                    num_source_frames=n,
+                    window_size=num_frames,
+                    rng=rng,
+                    local_min=int(getattr(self.exact_args, "interaction_event_local_min", 6)),
+                    local_max=int(getattr(self.exact_args, "interaction_event_local_max", 16)),
+                    require_later=requested_chunk_mode != "interaction_first",
+                )
             chunk_mode = (
-                "first"
+                "event_first"
+                if requested_chunk_mode == "interaction_event_first"
+                else "event_later"
+                if requested_chunk_mode == "interaction_event_later"
+                else "first"
                 if requested_chunk_mode == "interaction_first"
                 else "generated"
                 if requested_chunk_mode == "interaction_generated"
@@ -2073,7 +2087,32 @@ class OnlineWarpTrainingCache:
         if target_indices is None:
             target_indices = choose_online_movement_window(rng, n, num_frames, full_event_payload)
         target_start = int(target_indices[0])
-        if target_start <= 0 or requested_chunk_mode == "interaction_first":
+        event_aligned_mode = requested_chunk_mode in {
+            "interaction_event_first",
+            "interaction_event_later",
+        }
+        reference_frame_index = None
+        if event_aligned_mode:
+            aligned_window = event_aligned_indices(event_resampled_frame, n, num_frames)
+            reference_frame_index = int(aligned_window["reference_frame_index"])
+            render_pose_indices = list(aligned_window["render_pose_indices"])
+            geometry_keyframe_frames = [reference_frame_index]
+            keyframe_indices = list(geometry_keyframe_frames)
+            future_keyframe_indices = []
+            drop_renderer_source = True
+            keyframe_policy = "event_reference_only"
+            condition_frame = frames[reference_frame_index]
+            if requested_chunk_mode == "interaction_event_first":
+                history_indices = []
+            else:
+                max_history = min(
+                    int(getattr(self.exact_args, "online_max_history_frames", 19)),
+                    reference_frame_index + 1,
+                )
+                history_indices = list(
+                    range(reference_frame_index + 1 - max_history, reference_frame_index + 1)
+                )
+        elif target_start <= 0 or requested_chunk_mode == "interaction_first":
             if requested_chunk_mode == "camera_first":
                 chunk_mode = "first"
             if requested_chunk_mode not in {"camera_first", "interaction_first"}:
@@ -2198,8 +2237,8 @@ class OnlineWarpTrainingCache:
         warp_video = rendered["warp_video"]
         warp_mask = rendered["warp_visibility_mask"]
         if drop_renderer_source:
-            warp_video = warp_video[:, :, 1:]
-            warp_mask = warp_mask[:, :, 1:]
+            warp_video = drop_reference_render_frame(warp_video, time_axis=2)
+            warp_mask = drop_reference_render_frame(warp_mask, time_axis=2)
         warp_frames = online_tensor_video_to_pil_frames(warp_video)
         warp_mask_frames = online_mask_tensor_to_pil_frames(warp_mask)
         if len(warp_frames) != num_frames or len(warp_mask_frames) != num_frames:
@@ -2242,7 +2281,12 @@ class OnlineWarpTrainingCache:
         if category in {"place", "mine"}:
             if interaction_payload is None or float(interaction_payload.get("event_valid", 0.0)) != 1.0:
                 raise RuntimeError(f"Positive {category} row lost its event window: {row.get('id', row_index)}.")
-            if not (
+            if event_aligned_mode:
+                if int(interaction_payload["event_frame"]) != 0:
+                    raise RuntimeError(
+                        f"Event-aligned payload must start at local frame 0, got {interaction_payload['event_frame']}."
+                    )
+            elif not (
                 int(getattr(self.exact_args, "interaction_event_local_min", 6))
                 <= int(interaction_payload["event_frame"])
                 <= int(getattr(self.exact_args, "interaction_event_local_max", 16))
@@ -2326,6 +2370,7 @@ class OnlineWarpTrainingCache:
                 "sample_window_type": chunk_mode,
                 "training_category": category,
                 "event_local_frame": event_local_frame,
+                "reference_frame_index": reference_frame_index,
                 "source_fps": float(row.get("fps", 0.0) or 0.0),
                 "target_fps": float(getattr(self.exact_args, "online_target_fps", 0.0) or 0.0),
                 "source_event_frame": None if event_alignment is None else event_alignment["source_event_frame"],
@@ -2361,6 +2406,8 @@ class OnlineWarpTrainingCache:
             "camera_raw_relative_poses": raw_poses.copy(),
             "target_frames": [frames[idx] for idx in target_indices],
             "target_indices": target_indices,
+            "reference_frame": None if reference_frame_index is None else frames[reference_frame_index],
+            "reference_frame_index": reference_frame_index,
             "warp_frames": warp_frames,
             "warp_mask_frames": warp_mask_frames,
             "focus_mask_frames": focus_mask_frames,
@@ -2531,10 +2578,15 @@ def prepare_online_warp_item(
     interaction_teacher_map = None
     interaction_conditioning = None
     interaction_teacher_components = None
+    reference_latents = None
 
     try:
         with torch.no_grad():
             target_latents = opt.encode_video_latents(pipe, target_frames, exact_args, device, mean, std).detach()
+            if case.get("reference_frame") is not None:
+                reference_latents = opt.encode_video_latents(
+                    pipe, [case["reference_frame"]], exact_args, device, mean, std
+                ).detach()
             cached_prompt_embeds, prompt_cache_status = encode_prompt_cached(
                 pipe,
                 prompt_text,
@@ -2755,6 +2807,9 @@ def prepare_online_warp_item(
                 interaction_conditioning = {
                     "payload": interaction_payload_tensors(interaction_payload, device),
                     "warp_latents": video_latents.detach(),
+                    "reference_latents": None
+                    if reference_latents is None
+                    else reference_latents.detach(),
                     "visibility": visibility_latents.detach(),
                     "world_valid": None
                     if world_valid_mask_latents is None
@@ -2806,6 +2861,7 @@ def prepare_online_warp_item(
         else primary_fire_event_latents.detach(),
         "primary_fire_event_debug": primary_fire_event_debug,
         "interaction_payload": case.get("interaction_payload"),
+        "reference_latents": None if reference_latents is None else reference_latents.detach(),
         "interaction_conditioning": detach_tree(interaction_conditioning),
         "interaction_teacher_map": None
         if interaction_teacher_map is None
@@ -2850,6 +2906,11 @@ def prepare_online_warp_item(
     if keep_frames:
         item["target_frames"] = [frame.resize((exact_args.width, exact_args.height)) for frame in target_frames]
         item["history_frames"] = [frame.resize((exact_args.width, exact_args.height)) for frame in history_frames]
+        item["reference_frame"] = (
+            None
+            if case.get("reference_frame") is None
+            else case["reference_frame"].resize((exact_args.width, exact_args.height))
+        )
     print(json.dumps({"event": "online_warp_item_prepared", **case["metadata"]}), flush=True)
     return item
 
