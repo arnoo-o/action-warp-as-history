@@ -1455,6 +1455,8 @@ def build_exact_args(args):
     exact.interaction_min_mine_active_frames = int(args.interaction_min_mine_active_frames)
     exact.interaction_active_stages = [0]
     exact.event_aligned_interaction = bool(args.event_aligned_interaction)
+    exact.teacher_candidate_action_ratios = [float(value) for value in args.teacher_candidate_action_ratios]
+    exact.teacher_candidate_history_ratios = [float(value) for value in args.teacher_candidate_history_ratios]
     exact.base_train_steps = int(args.base_train_steps)
     exact.bidirectional_train_steps = int(args.bidirectional_train_steps)
     exact.enable_bidirectional_training = bool(args.enable_bidirectional_training)
