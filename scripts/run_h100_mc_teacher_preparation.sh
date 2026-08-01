@@ -67,6 +67,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" PYTHONUNBUFFERED=1 "${PYTHON}" scripts/train_warp_
   --interaction_training_mode joint_stage0 \
   --export_teacher_candidates_only \
   --teacher_candidate_output_dir "${WORKDIR}/candidates" \
+  --event_aligned_interaction \
   --camera_checkpoint "${CAMERA_CHECKPOINT}" \
   --interaction_conditioning_mode router \
   --interaction_lr 1e-4 \

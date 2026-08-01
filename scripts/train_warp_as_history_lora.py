@@ -733,7 +733,9 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                     row_index,
                     requested_category=category,
                     requested_chunk_mode=(
-                        "interaction_event_multi"
+                        "interaction_generated"
+                        if history_type == "multi" and action_type in {"", "none", "negative"}
+                        else "interaction_event_multi"
                         if history_type == "multi"
                         else f"interaction_event_{history_type}"
                         if event_aligned and action_type not in {"", "none", "negative"}
@@ -756,6 +758,10 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
             if conditioning is None:
                 raise RuntimeError(f"Candidate {row_index}:{history_type} has no interaction conditioning.")
             target = item["target_latents"].detach().float()
+            if item.get("reference_latents") is None and action_type not in {"", "none", "negative"}:
+                raise RuntimeError(
+                    f"Event-aligned candidate {row.get('event_id')}:{history_type} has no reference latent."
+                )
             aligned = align_interaction_signals_to_grid(
                 conditioning["payload"],
                 batch_size=target.shape[0],
@@ -835,11 +841,14 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 int(target.shape[2]),
                 int(getattr(exact_args, "vae_temporal_scale", 4)),
             )
+            reference_candidate_latents = item.get("reference_latents")
+            if reference_candidate_latents is None:
+                reference_candidate_latents = torch.zeros_like(target[:, :, :1])
             np.savez_compressed(
                 candidate_path,
                 target_latents=target[0].cpu().numpy().astype(np.float16),
                 warp_latents=conditioning["warp_latents"][0].detach().float().cpu().numpy().astype(np.float16),
-                reference_latents=item["reference_latents"][0].detach().float().cpu().numpy().astype(np.float16),
+                reference_latents=reference_candidate_latents[0].detach().float().cpu().numpy().astype(np.float16),
                 action_mask=aligned["action"][0].cpu().numpy().astype(np.float16),
                 visibility=aligned["visibility"][0].cpu().numpy().astype(np.float16),
                 world_valid=aligned["world_valid"][0].cpu().numpy().astype(np.float16),
