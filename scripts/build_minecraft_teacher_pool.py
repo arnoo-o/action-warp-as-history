@@ -73,6 +73,17 @@ def _max_filter(value, kernel_size):
     )
 
 
+def _average_filter(value, kernel_size):
+    radius = int(kernel_size) // 2
+    padded = np.pad(np.asarray(value, dtype=np.float32), ((radius, radius), (radius, radius)), mode="constant")
+    windows = [
+        padded[y : y + value.shape[0], x : x + value.shape[1]]
+        for y in range(kernel_size)
+        for x in range(kernel_size)
+    ]
+    return np.add.reduce(windows) / float(kernel_size * kernel_size)
+
+
 def _sobel_edge(rgb):
     gray = np.asarray(rgb, dtype=np.float32) @ np.asarray([0.299, 0.587, 0.114], dtype=np.float32)
     padded = np.pad(gray, ((1, 1), (1, 1)), mode="edge")
@@ -95,22 +106,40 @@ def old_edge_weights(reference, warp):
         [_max_filter(np.maximum(reference_edge, _sobel_edge(frame)), 5) for frame in warp],
         axis=0,
     )
-    return old_edge, np.clip(1.0 - 0.75 * old_edge, 0.25, 1.0)
+    old_edge = np.stack([_max_filter(frame, 3) for frame in old_edge], axis=0)
+    return old_edge, np.clip(1.0 - 0.95 * old_edge, 0.05, 1.0)
 
 
-def robust_teacher(target, warp, reference, valid, z_cap):
+def interaction_temporal_weights(action_type, frame_count):
+    values = (
+        (0.60, 0.70, 0.80, 0.90, 1.00, 1.00, 1.00, 1.00)
+        if str(action_type).lower() == "mine_active"
+        else (1.00, 0.50, 0.20)
+    )
+    weights = np.zeros((int(frame_count), 1, 1), dtype=np.float32)
+    count = min(len(values), int(frame_count))
+    weights[:count, 0, 0] = np.asarray(values[:count], dtype=np.float32)
+    return weights
+
+
+def robust_teacher(target, warp, reference, valid, z_cap, action_type, support_threshold):
     d_warp, warp_normalized = robust_normalized_residual(target, warp, valid, z_cap)
     d_raw, raw_normalized = robust_normalized_residual(target, reference, valid, z_cap)
     teacher = np.sqrt(np.clip(warp_normalized * raw_normalized, 0.0, 1.0))
     old_edge, edge_weight = old_edge_weights(reference, warp)
     teacher = teacher * edge_weight * valid
+    support = teacher > float(support_threshold)
+    density = np.stack([_average_filter(frame, 5) for frame in support], axis=0)
+    thin_factor = np.clip(density / 0.20, 0.0, 1.0)
+    teacher = np.where(old_edge > 0.5, teacher * thin_factor, teacher)
     if teacher.shape[0] > 1:
         previous = np.concatenate([teacher[:1], teacher[:-1]], axis=0)
         following = np.concatenate([teacher[1:], teacher[-1:]], axis=0)
         temporal_smoothing = 0.5 * teacher + 0.25 * previous + 0.25 * following
     else:
         temporal_smoothing = teacher
-    return d_warp, d_raw, temporal_smoothing * valid, old_edge, edge_weight
+    temporal_weight = interaction_temporal_weights(action_type, teacher.shape[0])
+    return d_warp, d_raw, temporal_smoothing * temporal_weight * valid, old_edge, edge_weight
 
 
 def normalize_map(value, shape, *, conservative=False):
@@ -599,7 +628,8 @@ def main():
         rgb_to_latent = np.asarray(payload["rgb_frame_to_latent_index"], dtype=np.int64)
         action_time_mask_rgb = np.zeros_like(visibility_rgb, dtype=np.float32)
         if not is_negative:
-            action_time_mask_rgb[: min(7, len(action_time_mask_rgb))] = 1.0
+            weighted_frames = 8 if action_type == "mine_active" else 3
+            action_time_mask_rgb[: min(weighted_frames, len(action_time_mask_rgb))] = 1.0
         valid_rgb = (
             action_time_mask_rgb
             * visibility_rgb
@@ -634,7 +664,13 @@ def main():
             old_edge_rgb, edge_weight_rgb = old_edge_weights(reference_rgb, warp_rgb)
         else:
             d_warp, d_raw, teacher_rgb, old_edge_rgb, edge_weight_rgb = robust_teacher(
-                target_rgb, warp_rgb, reference_rgb, valid_rgb, args.z_cap
+                target_rgb,
+                warp_rgb,
+                reference_rgb,
+                valid_rgb,
+                args.z_cap,
+                action_type,
+                args.support_threshold,
             )
         teacher = rgb_teacher_to_latent(teacher_rgb, rgb_to_latent, target.shape[1:])
         teacher_action = rgb_teacher_to_latent(action_time_mask_rgb, rgb_to_latent, target.shape[1:])

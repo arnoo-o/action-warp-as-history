@@ -1413,6 +1413,8 @@ class HeliosTransformer3DModel(
                 self.inner_dim,
                 semantic_dim=int(semantic_dim),
                 rank=int(rank),
+                latent_channels=int(self.patch_embedding.in_channels),
+                patch_size=self.patch_embedding.kernel_size,
                 stage_warp_scales=stage_warp_scales,
                 stage_adapter_scales=stage_adapter_scales,
                 active_stages=active_stages,
@@ -1433,6 +1435,9 @@ class HeliosTransformer3DModel(
         previous_gate=None,
         gate_override=None,
         reference_latents=None,
+        raw_target_latents=None,
+        teacher_guidance=None,
+        adapter_warmup_alpha=0.0,
     ):
         stack = getattr(self, "interaction_conditioning", None)
         if stack is None:
@@ -1474,6 +1479,11 @@ class HeliosTransformer3DModel(
             previous_gate=previous_gate,
             gate_override=gate_override,
             reference_tokens=reference_tokens,
+            raw_target_latents=raw_target_latents,
+            raw_warp_latents=raw_warp_latents,
+            reference_latents=reference_latents,
+            teacher_guidance=teacher_guidance,
+            adapter_warmup_alpha=adapter_warmup_alpha,
         )
 
     @staticmethod
@@ -1645,6 +1655,7 @@ class HeliosTransformer3DModel(
                 else list(interaction_conditioning.get("stage_ids", range(len(latents))))
             )
             for idx, cur_hidden_states in enumerate(latents):
+                cur_raw_hidden_states = cur_hidden_states
                 cur_hidden_states = self.gradient_checkpointing_method(
                     self.patch_embedding,
                     cur_hidden_states.to(self.device, dtype=self.patch_embedding.weight.dtype),
@@ -1677,6 +1688,9 @@ class HeliosTransformer3DModel(
                         previous_gate=previous_interaction_gate,
                         gate_override=interaction_conditioning.get("gate_override"),
                         reference_latents=interaction_conditioning.get("reference_latents"),
+                        raw_target_latents=cur_raw_hidden_states,
+                        teacher_guidance=interaction_conditioning.get("teacher_guidance"),
+                        adapter_warmup_alpha=interaction_conditioning.get("adapter_warmup_alpha", 0.0),
                     )
                     interaction_debug.append(cur_debug)
                     previous_interaction_gate = cur_debug["predicted_gate"]
@@ -1727,6 +1741,7 @@ class HeliosTransformer3DModel(
                     hidden_states = torch.cat([cur_hidden_states, hidden_states], dim=1)
                     rope_freqs = torch.cat([cur_rope_freqs, rope_freqs], dim=1)
         else:
+            raw_hidden_states = latents
             hidden_states = self.gradient_checkpointing_method(
                 self.patch_embedding,
                 latents.to(device=self.patch_embedding.weight.device, dtype=self.patch_embedding.weight.dtype),
@@ -1754,6 +1769,9 @@ class HeliosTransformer3DModel(
                     previous_gate=interaction_conditioning.get("previous_gate"),
                     gate_override=interaction_conditioning.get("gate_override"),
                     reference_latents=interaction_conditioning.get("reference_latents"),
+                    raw_target_latents=raw_hidden_states,
+                    teacher_guidance=interaction_conditioning.get("teacher_guidance"),
+                    adapter_warmup_alpha=interaction_conditioning.get("adapter_warmup_alpha", 0.0),
                 )
                 interaction_debug.append(cur_debug)
             if target_channel_fusion_latents is not None:

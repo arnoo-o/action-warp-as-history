@@ -1366,12 +1366,32 @@ def save_interaction_debug(
         save_map(f"raw_delta_stage{stage_id}.png", raw_delta)
         save_map(f"predicted_gate_stage{stage_id}.png", predicted)
         save_map(f"interaction_injection_map_stage{stage_id}.png", injection)
+        trusted_positive = ((teacher - 0.60) / 0.40).clamp(0.0, 1.0)
+        trusted_background = ((0.15 - teacher) / 0.15).clamp(0.0, 1.0)
+        uncertain = ((trusted_positive + trusted_background) <= 0).to(teacher)
+        save_map(f"trusted_positive_stage{stage_id}.png", trusted_positive)
+        save_map(f"uncertain_stage{stage_id}.png", uncertain)
+        save_map(f"trusted_background_stage{stage_id}.png", trusted_background)
+        for key in (
+            "warmup_blended_gate",
+            "soft_focus",
+            "highres_adapter_raw_delta_rms",
+            "highres_adapter_soft_focused_delta_rms",
+            "projected_token_injection_rms",
+        ):
+            if key in debug:
+                value = debug[key].detach().float().cpu()
+                save_map(f"{key}_stage{stage_id}.png", value)
+                np.save(output_dir / f"{key}_stage{stage_id}.npy", value.numpy())
         np.save(output_dir / f"residual_teacher_map_stage{stage_id}.npy", teacher.numpy())
         np.save(output_dir / f"raw_gate_stage{stage_id}.npy", raw_gate.numpy())
         np.save(output_dir / f"final_gate_stage{stage_id}.npy", final_gate.numpy())
         np.save(output_dir / f"raw_delta_stage{stage_id}.npy", raw_delta.numpy())
         np.save(output_dir / f"predicted_gate_stage{stage_id}.npy", predicted.numpy())
         np.save(output_dir / f"interaction_injection_map_stage{stage_id}.npy", injection.numpy())
+        np.save(output_dir / f"trusted_positive_stage{stage_id}.npy", trusted_positive.numpy())
+        np.save(output_dir / f"uncertain_stage{stage_id}.npy", uncertain.numpy())
+        np.save(output_dir / f"trusted_background_stage{stage_id}.npy", trusted_background.numpy())
         curves = {
             "raw_gate": raw_gate.mean(dim=(0, 1, 3, 4)).tolist(),
             "final_gate": final_gate.mean(dim=(0, 1, 3, 4)).tolist(),
@@ -1397,6 +1417,8 @@ def save_interaction_debug(
         save_frame_strip("target.png", input_debug.get("target_frames"))
         save_frame_strip("warp.png", input_debug.get("warp_frames"))
         save_frame_strip("visibility.png", input_debug.get("visibility_frames"))
+        save_frame_strip("interaction_on.png", input_debug.get("interaction_on_frames"))
+        save_frame_strip("interaction_off.png", input_debug.get("interaction_off_frames"))
         raw_residual = input_debug.get("raw_residual")
         if torch.is_tensor(raw_residual):
             raw_residual = raw_residual.detach().float().cpu()
@@ -1502,6 +1524,8 @@ def pyramid_stage_model_forward(
                     "stage_id": stage_id,
                     "previous_gate": previous_gate,
                     "gate_override": stage_interaction.get("gate_override"),
+                    "teacher_guidance": stage_interaction.get("teacher_guidance"),
+                    "adapter_warmup_alpha": stage_interaction.get("adapter_warmup_alpha", 0.0),
                 }
             current_fusion = (
                 None
@@ -1575,6 +1599,8 @@ def flow_matching_loss_train_exact(
     interaction_conditioning=None,
     interaction_teacher_map=None,
     interaction_gate_override=None,
+    interaction_teacher_guidance=None,
+    adapter_warmup_alpha=0.0,
     interaction_adapter_enabled=True,
     compute_bidirectional_feedback=False,
     bidirectional_feedback_weight=0.5,
@@ -1639,6 +1665,8 @@ def flow_matching_loss_train_exact(
             "visibility": [visibility_pyramid[sid] for sid in stage_ids],
             "world_valid": interaction_conditioning.get("world_valid"),
             "gate_override": interaction_gate_override,
+            "teacher_guidance": interaction_teacher_guidance,
+            "adapter_warmup_alpha": float(adapter_warmup_alpha),
         }
     stage_target_channel_fusion = (
         [
@@ -1789,18 +1817,22 @@ def flow_matching_loss_train_exact(
         )
         teacher_tokens = token_alignment["teacher"]
         support_threshold = float(getattr(args, "interaction_teacher_support_threshold", 0.25))
-        positive_tokens = (teacher_tokens > support_threshold).to(raw_gate) * valid_tokens
-        negative_tokens = valid_tokens * (1.0 - (positive_tokens > 0).to(valid_tokens))
+        positive_confidence = ((teacher_tokens - 0.60) / 0.40).clamp(0.0, 1.0) * valid_tokens
+        negative_confidence = ((0.15 - teacher_tokens) / 0.15).clamp(0.0, 1.0) * valid_tokens
+        classification_confidence = positive_confidence + negative_confidence
+        uncertain_tokens = valid_tokens * (classification_confidence <= 0).to(valid_tokens)
+        positive_tokens = positive_confidence
+        negative_tokens = negative_confidence
         if float(event_valid) > 0.0:
-            positive_bce = (
-                -(raw_gate.log()) * positive_tokens
-            ).sum() / positive_tokens.sum().clamp_min(1.0)
-            negative_bce = (
-                -(1.0 - raw_gate).log() * negative_tokens
-            ).sum() / negative_tokens.sum().clamp_min(1.0)
+            soft_bce = -(teacher_tokens * raw_gate.log() + (1.0 - teacher_tokens) * (1.0 - raw_gate).log())
+            positive_bce = (soft_bce * positive_confidence).sum() / positive_confidence.sum().clamp_min(1.0)
+            negative_bce = (soft_bce * negative_confidence).sum() / negative_confidence.sum().clamp_min(1.0)
             balanced_bce = 0.5 * (positive_bce + negative_bce)
-            dice_numerator = 2.0 * (raw_gate * teacher_tokens * valid_tokens).sum()
-            dice_denominator = (raw_gate * valid_tokens).sum() + (teacher_tokens * valid_tokens).sum()
+            weighted_teacher = teacher_tokens * classification_confidence
+            dice_numerator = 2.0 * (raw_gate * weighted_teacher).sum()
+            dice_denominator = (
+                (raw_gate * classification_confidence).sum() + weighted_teacher.sum()
+            )
             dice_loss = 1.0 - (dice_numerator + 1.0e-6) / (dice_denominator + 1.0e-6)
             interaction_aux_loss = balanced_bce + 0.5 * dice_loss
 
@@ -1818,29 +1850,29 @@ def flow_matching_loss_train_exact(
             )
             latent_teacher = latent_alignment["teacher"]
             latent_valid = latent_alignment["valid"]
-            latent_support = (latent_teacher > support_threshold).to(latent_teacher)
-            focus_weight = latent_teacher * latent_support * latent_valid
-            background_weight = latent_valid * (1.0 - latent_support)
+            focus_scale = float(getattr(args, "interaction_focus_scale", 3.0))
+            flow_weight = latent_valid * (1.0 + (focus_scale - 1.0) * latent_teacher.detach())
+            flow_loss_per_sample, flow_den = _masked_per_sample_mean(stage0_error, flow_weight)
+            focus_weight = latent_teacher.detach() * latent_valid
+            background_weight = (1.0 - latent_teacher.detach()) * latent_valid
             focus_loss_per_sample, focus_den = _masked_per_sample_mean(stage0_error, focus_weight)
             background_loss_per_sample, background_den = _masked_per_sample_mean(stage0_error, background_weight)
-            focus_scale = float(getattr(args, "interaction_focus_scale", 1.0))
-            flow_parts = background_loss_per_sample
-            flow_parts = flow_parts + focus_scale * focus_loss_per_sample
-            total_loss = flow_parts.mean()
+            total_loss = flow_loss_per_sample.mean()
             if str(getattr(args, "interaction_training_mode", "joint_stage0")) == "router_overfit":
                 total_loss = torch.zeros_like(interaction_aux_loss)
             stats["stage0_focus_flow"] = focus_loss_per_sample.mean().detach()
             stats["stage0_background_flow"] = background_loss_per_sample.mean().detach()
             stats["stage0_focus_elements"] = focus_den.mean().detach()
             stats["stage0_background_elements"] = background_den.mean().detach()
+            stats["stage0_weighted_flow_elements"] = flow_den.mean().detach()
             stats["stage0_weighted_flow"] = total_loss.detach()
             raw_delta_map = debug["raw_delta_map"].detach().float()
             injection_map = debug["interaction_injection_map"].detach().float()
             gate_inside, gate_inside_den = _masked_per_sample_mean(final_gate, positive_tokens)
             gate_outside, gate_outside_den = _masked_per_sample_mean(final_gate, negative_tokens)
             # Diagnostics live on the Stage 0 token grid, unlike flow error on the latent grid.
-            token_focus = teacher_tokens * (teacher_tokens > support_threshold).to(teacher_tokens) * valid_tokens
-            token_background = valid_tokens * (1.0 - (teacher_tokens > support_threshold).to(valid_tokens))
+            token_focus = teacher_tokens * valid_tokens
+            token_background = (1.0 - teacher_tokens) * valid_tokens
             raw_delta_inside, _ = _masked_per_sample_mean(raw_delta_map, token_focus)
             raw_delta_outside, _ = _masked_per_sample_mean(raw_delta_map, token_background)
             injection_inside, _ = _masked_per_sample_mean(injection_map, token_focus)
@@ -1853,6 +1885,7 @@ def flow_matching_loss_train_exact(
             stats["interaction_gate_inside_teacher_elements_stage0"] = gate_inside_den.mean().detach()
             stats["interaction_gate_outside_teacher_elements_stage0"] = gate_outside_den.mean().detach()
             stats["interaction_teacher_positive_tokens_stage0"] = positive_tokens.detach().sum()
+            stats["interaction_teacher_uncertain_tokens_stage0"] = uncertain_tokens.detach().sum()
             stats["interaction_raw_delta_inside_teacher_stage0"] = raw_delta_inside.mean().detach()
             stats["interaction_raw_delta_outside_teacher_stage0"] = raw_delta_outside.mean().detach()
             stats["interaction_injection_inside_teacher_stage0"] = injection_inside.mean().detach()
@@ -1876,7 +1909,15 @@ def flow_matching_loss_train_exact(
         )
         stats["raw_gate_mean_stage0"] = raw_gate.detach().mean()
         stats["final_gate_mean_stage0"] = final_gate.detach().mean()
-        stats["raw_delta_rms_stage0"] = debug["raw_delta_map"].detach().float().mean()
+        stats["raw_delta_rms_stage0"] = debug.get(
+            "highres_adapter_raw_delta_rms", debug["raw_delta_map"]
+        ).detach().float().mean()
+        stats["soft_focused_delta_rms_stage0"] = debug.get(
+            "highres_adapter_soft_focused_delta_rms", debug["raw_delta_map"]
+        ).detach().float().mean()
+        stats["projected_token_injection_rms_stage0"] = debug.get(
+            "projected_token_injection_rms", debug["interaction_injection_map"]
+        ).detach().float().mean()
         stats["final_injection_rms_stage0"] = debug["interaction_injection_map"].detach().float().mean()
         stats["stage0_interaction_scale"] = torch.ones((), device=total_loss.device)
         stats["teacher_mask_area_ratio_stage0"] = positive_tokens.detach().sum() / valid_tokens.detach().sum().clamp_min(1.0)
@@ -1904,6 +1945,8 @@ def flow_matching_loss(
     interaction_conditioning=None,
     interaction_teacher_map=None,
     interaction_gate_override=None,
+    interaction_teacher_guidance=None,
+    adapter_warmup_alpha=0.0,
     interaction_adapter_enabled=True,
     compute_bidirectional_feedback=False,
     bidirectional_feedback_weight=0.5,
@@ -1923,6 +1966,8 @@ def flow_matching_loss(
         interaction_conditioning=interaction_conditioning,
         interaction_teacher_map=interaction_teacher_map,
         interaction_gate_override=interaction_gate_override,
+        interaction_teacher_guidance=interaction_teacher_guidance,
+        adapter_warmup_alpha=adapter_warmup_alpha,
         interaction_adapter_enabled=interaction_adapter_enabled,
         compute_bidirectional_feedback=compute_bidirectional_feedback,
         bidirectional_feedback_weight=bidirectional_feedback_weight,

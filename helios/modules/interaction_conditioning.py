@@ -125,22 +125,21 @@ def configure_interaction_trainability(stack, mode):
                 ("semantic_encoder.", "stage_embedding.", "router.", "router_reference_projection.")
             )
         elif mode == "adapter_overfit":
-            trainable = name.startswith(("adapter.", "adapter_reference_projection."))
+            trainable = name.startswith("highres_adapter.")
         else:
             trainable = name.startswith(
                 (
                     "semantic_encoder.",
                     "stage_embedding.",
                     "router.",
-                    "adapter.",
+                    "highres_adapter.",
                     "router_reference_projection.",
-                    "adapter_reference_projection.",
                 )
             )
         parameter.requires_grad_(trainable)
         if not trainable:
             continue
-        if name.startswith(("adapter.", "adapter_reference_projection.")):
+        if name.startswith("highres_adapter."):
             groups["interaction_adapter"].append(parameter)
         elif name.startswith("router."):
             groups["interaction_router"].append(parameter)
@@ -304,12 +303,74 @@ class InteractionAdapter(nn.Module):
         return target_tokens + injection, delta, injection
 
 
+class HighResolutionLatentAdapter(nn.Module):
+    """Stage-0 interaction adapter operating before Helios patch embedding."""
+
+    def __init__(self, latent_channels, hidden_dim, semantic_dim, patch_size, channels=64):
+        super().__init__()
+        self.latent_channels = int(latent_channels)
+        self.semantic_dim = int(semantic_dim)
+        patch_size = tuple(int(value) for value in patch_size)
+        input_channels = self.latent_channels * 5 + self.semantic_dim + 1
+        self.input_projection = nn.Conv3d(input_channels, int(channels), kernel_size=1)
+        self.blocks = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.GroupNorm(8, int(channels)),
+                    nn.SiLU(),
+                    nn.Conv3d(int(channels), int(channels), kernel_size=3, padding=1),
+                    nn.GroupNorm(8, int(channels)),
+                    nn.SiLU(),
+                    nn.Conv3d(int(channels), int(channels), kernel_size=3, padding=1),
+                )
+                for _ in range(2)
+            ]
+        )
+        self.token_projection = nn.Conv3d(
+            int(channels), int(hidden_dim), kernel_size=patch_size, stride=patch_size
+        )
+        nn.init.zeros_(self.token_projection.weight)
+        nn.init.zeros_(self.token_projection.bias)
+
+    def forward(self, noisy, warp, reference, semantic, progress, soft_focus):
+        if noisy.shape != warp.shape:
+            raise ValueError(f"noisy and warp latent grids differ: {tuple(noisy.shape)} != {tuple(warp.shape)}")
+        if reference.shape[2] == 1 and noisy.shape[2] > 1:
+            reference = reference.expand(-1, -1, noisy.shape[2], -1, -1)
+        if reference.shape[2:] != noisy.shape[2:]:
+            reference = F.interpolate(reference.float(), size=noisy.shape[2:], mode="trilinear", align_corners=False)
+        reference = reference.to(noisy)
+        progress = F.interpolate(progress.float(), size=noisy.shape[2:], mode="trilinear", align_corners=False).to(noisy)
+        semantic_grid = semantic.to(noisy).view(semantic.shape[0], semantic.shape[1], 1, 1, 1).expand(
+            -1, -1, *noisy.shape[2:]
+        )
+        features = torch.cat(
+            [noisy, warp.to(noisy), reference, noisy - warp.to(noisy), warp.to(noisy) - reference, semantic_grid, progress],
+            dim=1,
+        ).to(self.input_projection.weight.dtype)
+        delta = self.input_projection(features)
+        for block in self.blocks:
+            delta = delta + block(delta)
+        soft_focus = F.interpolate(
+            soft_focus.float(), size=delta.shape[2:], mode="trilinear", align_corners=False
+        ).clamp(0.0, 1.0).to(delta)
+        focused_delta = delta * soft_focus
+        token_injection_grid = self.token_projection(focused_delta)
+        token_injection = token_injection_grid.flatten(2).transpose(1, 2)
+        raw_rms = delta.float().square().mean(dim=1, keepdim=True).sqrt()
+        focused_rms = focused_delta.float().square().mean(dim=1, keepdim=True).sqrt()
+        token_rms = token_injection_grid.float().square().mean(dim=1, keepdim=True).sqrt()
+        return token_injection, raw_rms, focused_rms, token_rms
+
+
 class InteractionConditioningStack(nn.Module):
     def __init__(
         self,
         hidden_dim: int,
         semantic_dim: int = 256,
         rank: int = 64,
+        latent_channels: int = 16,
+        patch_size=(1, 2, 2),
         stage_warp_scales=DEFAULT_STAGE_WARP_SCALES,
         stage_adapter_scales=DEFAULT_STAGE_ADAPTER_SCALES,
         active_stages=(0,),
@@ -320,6 +381,9 @@ class InteractionConditioningStack(nn.Module):
         nn.init.zeros_(self.stage_embedding.weight)
         self.router = InteractionRouter(hidden_dim, semantic_dim=semantic_dim, rank=rank)
         self.adapter = InteractionAdapter(hidden_dim, semantic_dim=semantic_dim, rank=rank)
+        self.highres_adapter = HighResolutionLatentAdapter(
+            latent_channels, hidden_dim, self.semantic_encoder.semantic_dim, patch_size
+        )
         self.router_reference_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.adapter_reference_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
         nn.init.zeros_(self.router_reference_projection.weight)
@@ -382,6 +446,11 @@ class InteractionConditioningStack(nn.Module):
         previous_gate=None,
         gate_override=None,
         reference_tokens=None,
+        raw_target_latents=None,
+        raw_warp_latents=None,
+        reference_latents=None,
+        teacher_guidance=None,
+        adapter_warmup_alpha=0.0,
     ):
         batch_size = target_tokens.shape[0]
         device = target_tokens.device
@@ -488,31 +557,69 @@ class InteractionConditioningStack(nn.Module):
         injection_gate = raw_gate
         if gate_override is not None:
             injection_gate = aligned["teacher"].flatten(2).transpose(1, 2).detach().to(raw_gate)
-        final_gate = (
-            injection_gate
-            * visibility_tokens.to(raw_gate)
+        elif teacher_guidance is not None and float(adapter_warmup_alpha) > 0.0:
+            guidance = align_interaction_signals_to_grid(
+                payload,
+                batch_size=batch_size,
+                temporal=temporal,
+                height=height,
+                width=width,
+                device=device,
+                visibility=visibility,
+                world_valid=world_valid,
+                teacher=teacher_guidance,
+            )["teacher"].flatten(2).transpose(1, 2).detach().to(raw_gate)
+            positive_confidence = ((guidance - 0.60) / 0.40).clamp(0.0, 1.0)
+            teacher_gate = guidance * positive_confidence
+            alpha = float(adapter_warmup_alpha)
+            injection_gate = alpha * teacher_gate + (1.0 - alpha) * raw_gate
+        hard_valid = (
+            visibility_tokens.to(raw_gate)
             * world_valid_tokens.to(raw_gate)
             * action_tokens.to(raw_gate)
             * event_valid.to(raw_gate).view(-1, 1, 1)
         )
+        final_gate = raw_gate * hard_valid
+        blended_gate = injection_gate
+        soft_focus = hard_valid * (0.10 + 0.90 * blended_gate)
         valid_injection_tokens = (
             visibility_tokens.to(raw_gate)
             * world_valid_tokens.to(raw_gate)
             * action_tokens.to(raw_gate)
         )
-        if bool(interaction_adapter_enabled):
-            output, raw_delta, injection = self.adapter(
-                target_tokens,
-                adapter_warp_tokens,
+        use_highres = all(value is not None for value in (raw_target_latents, raw_warp_latents, reference_latents))
+        if bool(interaction_adapter_enabled) and use_highres:
+            injection, highres_raw_rms, highres_focused_rms, projected_rms = self.highres_adapter(
+                raw_target_latents,
+                raw_warp_latents,
+                reference_latents,
                 semantic,
-                progress_tokens,
-                final_gate,
+                aligned["progress"],
+                soft_focus.transpose(1, 2).reshape(batch_size, 1, temporal, height, width),
+            )
+            if injection.shape != target_tokens.shape:
+                raise ValueError(
+                    f"High-resolution Adapter token order/shape mismatch: {tuple(injection.shape)} != {tuple(target_tokens.shape)}"
+                )
+            output = target_tokens + injection.to(target_tokens)
+            raw_delta = torch.zeros_like(target_tokens)
+        elif bool(interaction_adapter_enabled):
+            output, raw_delta, injection = self.adapter(
+                target_tokens, adapter_warp_tokens, semantic, progress_tokens, soft_focus,
                 stage_scale=torch.ones((), device=device, dtype=torch.float32),
+            )
+            highres_raw_rms = torch.zeros(batch_size, 1, temporal, height, width, device=device)
+            highres_focused_rms = torch.zeros_like(highres_raw_rms)
+            projected_rms = injection.float().square().mean(dim=-1, keepdim=True).sqrt().transpose(1, 2).reshape(
+                batch_size, 1, temporal, height, width
             )
         else:
             output = target_tokens
             raw_delta = torch.zeros_like(target_tokens)
             injection = torch.zeros_like(target_tokens)
+            highres_raw_rms = torch.zeros(batch_size, 1, temporal, height, width, device=device)
+            highres_focused_rms = torch.zeros_like(highres_raw_rms)
+            projected_rms = torch.zeros_like(highres_raw_rms)
         raw_gate_map = raw_gate.transpose(1, 2).reshape(batch_size, 1, temporal, height, width)
         final_gate_map = final_gate.transpose(1, 2).reshape(batch_size, 1, temporal, height, width)
         valid_injection_map = valid_injection_tokens.transpose(1, 2).reshape(
@@ -534,12 +641,18 @@ class InteractionConditioningStack(nn.Module):
             "raw_gate": raw_gate_map,
             "gate_override_used": bool(gate_override is not None),
             "final_gate": final_gate_map,
+            "warmup_blended_gate": blended_gate.transpose(1, 2).reshape(batch_size, 1, temporal, height, width),
+            "soft_focus": soft_focus.transpose(1, 2).reshape(batch_size, 1, temporal, height, width),
             "valid_injection_region": valid_injection_map,
             "world_valid_region": world_valid_map,
             "predicted_gate": final_gate_map,
             f"predicted_gate_stage{stage_id}": final_gate_map,
             "raw_delta_map": raw_delta_map,
             "interaction_injection_map": injection_map,
+            "highres_adapter_raw_delta_rms": highres_raw_rms,
+            "highres_adapter_soft_focused_delta_rms": highres_focused_rms,
+            "projected_token_injection_rms": projected_rms,
+            "adapter_warmup_alpha": float(adapter_warmup_alpha),
             f"interaction_injection_map_stage{stage_id}": injection_map,
             "previous_gate": previous_gate,
             "stage_warp_scale": self.stage_warp_scales[stage_id],

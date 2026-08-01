@@ -1196,7 +1196,7 @@ def parse_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--max_attempt_steps", type=int, default=15000)
     parser.add_argument("--interaction_router_loss_scale", type=float, default=0.005)
-    parser.add_argument("--interaction_focus_scale", type=float, default=1.0)
+    parser.add_argument("--interaction_focus_scale", type=float, default=3.0)
     parser.add_argument("--interaction_teacher_support_threshold", type=float, default=0.25)
     parser.add_argument("--interaction_max_metadata_rotation_deg", type=float, default=20.0)
     parser.add_argument("--interaction_max_camera_rotation_deg", type=float, default=20.0)
@@ -2167,6 +2167,13 @@ def main():
             for name, param in pipe.transformer.named_parameters()
             if param.requires_grad and name.startswith("interaction_conditioning.")
         }
+        effective_step_number = int(step) + 1
+        if effective_step_number <= 100:
+            adapter_warmup_alpha = 0.7
+        elif effective_step_number <= 300:
+            adapter_warmup_alpha = 0.7 * (300 - effective_step_number) / 199.0
+        else:
+            adapter_warmup_alpha = 0.0
         loss, stats, interaction_feedback = opt.flow_matching_loss(
             pipe,
             item["prompt_embeds"],
@@ -2185,11 +2192,16 @@ def main():
                 if str(args.interaction_training_mode) == "adapter_overfit" and router_teacher_map is not None
                 else None
             ),
+            interaction_teacher_guidance=(
+                router_teacher_map.detach() if router_teacher_map is not None else None
+            ),
+            adapter_warmup_alpha=adapter_warmup_alpha,
             interaction_adapter_enabled=str(args.interaction_training_mode) != "router_overfit",
             compute_bidirectional_feedback=compute_bidirectional_feedback,
             bidirectional_feedback_weight=float(args.bidirectional_feedback_weight),
             bidirectional_teacher_floor=float(args.bidirectional_teacher_floor),
         )
+        stats["adapter_warmup_alpha"] = float(adapter_warmup_alpha)
         interaction_feedback = interaction_feedback or {}
         new_refined_teacher = interaction_feedback.get("refined_teacher_map")
         if new_refined_teacher is not None:

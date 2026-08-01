@@ -796,6 +796,8 @@ class HeliosTransformer3DModel(
                 self.inner_dim,
                 semantic_dim=int(semantic_dim),
                 rank=int(rank),
+                latent_channels=int(self.patch_embedding.in_channels),
+                patch_size=self.patch_embedding.kernel_size,
                 stage_warp_scales=stage_warp_scales,
                 stage_adapter_scales=stage_adapter_scales,
                 active_stages=active_stages,
@@ -815,6 +817,9 @@ class HeliosTransformer3DModel(
         previous_gate=None,
         gate_override=None,
         reference_latents=None,
+        raw_target_latents=None,
+        teacher_guidance=None,
+        adapter_warmup_alpha=0.0,
     ):
         stack = getattr(self, "interaction_conditioning", None)
         if stack is None:
@@ -853,6 +858,11 @@ class HeliosTransformer3DModel(
             previous_gate=previous_gate,
             gate_override=gate_override,
             reference_tokens=reference_tokens,
+            raw_target_latents=raw_target_latents,
+            raw_warp_latents=raw_warp_latents,
+            reference_latents=reference_latents,
+            teacher_guidance=teacher_guidance,
+            adapter_warmup_alpha=adapter_warmup_alpha,
         )
 
     @staticmethod
@@ -970,6 +980,7 @@ class HeliosTransformer3DModel(
         p_t, p_h, p_w = self.config.patch_size
 
         # 2. Process noisy latents
+        raw_hidden_states = hidden_states
         hidden_states = self.patch_embedding(
             hidden_states.to(device=self.patch_embedding.weight.device, dtype=self.patch_embedding.weight.dtype)
         )
@@ -983,6 +994,8 @@ class HeliosTransformer3DModel(
         if interaction_conditioning is not None:
             if interaction_conditioning.get("gate_override") is not None:
                 raise ValueError("gate_override is training-only and cannot be used by the inference Transformer.")
+            if interaction_conditioning.get("teacher_guidance") is not None:
+                raise ValueError("teacher_guidance is training-only and cannot be used by the inference Transformer.")
             hidden_states, interaction_debug = self.apply_interaction_conditioning(
                 hidden_states,
                 interaction_conditioning["warp_latents"],
@@ -996,6 +1009,9 @@ class HeliosTransformer3DModel(
                 previous_gate=interaction_conditioning.get("previous_gate"),
                 gate_override=interaction_conditioning.get("gate_override"),
                 reference_latents=interaction_conditioning.get("reference_latents"),
+                raw_target_latents=raw_hidden_states,
+                teacher_guidance=None,
+                adapter_warmup_alpha=0.0,
             )
             self._last_interaction_debug.append(interaction_debug)
         if target_channel_fusion_latents is not None:
