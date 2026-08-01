@@ -644,8 +644,9 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
     success_quotas = _event_aligned_success_quotas(limit) if event_aligned else {}
     successful_by_cell = Counter()
     if event_aligned and int(limit) > 0:
-        minimum_sources = int(math.ceil(int(limit) / 2.0))
-        source_limit = min(len(df), max(minimum_sources * 10, minimum_sources))
+        # Rejections are common under event isolation and rotation constraints.
+        # Scan the full stratified pool, but stop as soon as every success cell is full.
+        source_limit = len(df)
     else:
         source_limit = limit
     candidate_ratios = (
