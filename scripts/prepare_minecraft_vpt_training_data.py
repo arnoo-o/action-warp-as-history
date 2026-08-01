@@ -206,6 +206,9 @@ class Event:
     delta: int = 1
     confidence: str = "exact_stat_delta"
     segment_id: str = ""
+    place_click_source_frame: int | None = None
+    place_stat_source_frame: int | None = None
+    place_click_to_stat_delay: int | None = None
 
 
 @dataclass
@@ -350,6 +353,11 @@ def inspect_pair(video_path: Path, actions_path: Path, args: argparse.Namespace)
     use_item_counts: Counter[str] = Counter()
     rejected_use_item_counts: Counter[str] = Counter()
     invalid_json_lines = 0
+    left_click_edges: list[int] = []
+    left_held_frames: list[bool] = []
+    place_stat_events: list[Event] = []
+    mine_stat_events: list[Event] = []
+    previous_mouse_buttons: set[int] = set()
 
     with actions_path.open("r", encoding="utf-8") as handle:
         for frame, line in enumerate(handle):
@@ -363,6 +371,8 @@ def inspect_pair(video_path: Path, actions_path: Path, args: argparse.Namespace)
                 invalid.append(True)
                 millis.append(millis[-1] + 50 if millis else 0)
                 movement_scores.append(0.0)
+                left_held_frames.append(False)
+                previous_mouse_buttons = set()
                 continue
             is_gui = bool(row.get("isGuiOpen", False))
             gui.append(is_gui)
@@ -371,25 +381,32 @@ def inspect_pair(video_path: Path, actions_path: Path, args: argparse.Namespace)
             if is_gui:
                 gui_type_counts["inventory" if row.get("isGuiInventory") else "other_gui"] += 1
 
+            mouse = row.get("mouse") or {}
+            current_mouse_buttons = {int(value) for value in (mouse.get("buttons") or [])}
+            left_click_down = 0 in current_mouse_buttons and 0 not in previous_mouse_buttons
+            if left_click_down and not is_gui:
+                left_click_edges.append(frame)
+            left_held_frames.append(0 in current_mouse_buttons)
+            previous_mouse_buttons = current_mouse_buttons
+
             stats = row.get("stats") or {}
             if not is_gui:
                 for object_id, delta in stat_deltas(
                     previous_stats, stats, "minecraft.mine_block:minecraft."
                 ):
-                    events.append(Event("mine", frame, object_id, delta))
+                    mine_stat_events.append(Event("mine", frame, object_id, delta))
                 for object_id, delta in stat_deltas(
                     previous_stats, stats, "minecraft.use_item:minecraft."
                 ):
                     use_item_counts[object_id] += delta
                     if is_placeable_item(object_id):
-                        events.append(Event("place", frame, object_id, delta))
+                        place_stat_events.append(Event("place", frame, object_id, delta))
                     else:
                         rejected_use_item_counts[object_id] += delta
             previous_stats = stats
 
             keyboard = row.get("keyboard") or {}
             keys = set(keyboard.get("keys") or [])
-            mouse = row.get("mouse") or {}
             dx = float(mouse.get("dx", 0.0) or 0.0)
             dy = float(mouse.get("dy", 0.0) or 0.0)
             movement_scores.append(
@@ -397,6 +414,32 @@ def inspect_pair(video_path: Path, actions_path: Path, args: argparse.Namespace)
                 if not is_gui
                 else 0.0
             )
+
+    consumed_place_clicks: set[int] = set()
+    for event in sorted(place_stat_events, key=lambda value: value.frame):
+        matches = [
+            click
+            for click in left_click_edges
+            if event.frame - 3 <= click <= event.frame + 1 and click not in consumed_place_clicks
+        ]
+        if not matches:
+            rejected_use_item_counts[f"{event.object_id}:missing_left_click_edge"] += event.delta
+            continue
+        click = min(matches, key=lambda value: (abs(value - event.frame), value))
+        consumed_place_clicks.add(click)
+        event.confidence = "placeable_use_item_plus_left_click_edge"
+        event.place_click_source_frame = click
+        event.place_stat_source_frame = event.frame
+        event.place_click_to_stat_delay = event.frame - click
+        events.append(event)
+
+    for event in mine_stat_events:
+        hold_start = event.frame
+        while hold_start > 0 and hold_start - 1 < len(left_held_frames) and left_held_frames[hold_start - 1]:
+            hold_start -= 1
+        if hold_start in consumed_place_clicks:
+            continue
+        events.append(event)
 
     fps = infer_fps(millis)
     unsafe = dilate_gui(
@@ -813,6 +856,9 @@ def main() -> None:
                     "object_id": event.object_id or None,
                     "delta": event.delta,
                     "confidence": event.confidence,
+                    "place_click_source_frame": event.place_click_source_frame,
+                    "place_stat_source_frame": event.place_stat_source_frame,
+                    "place_click_to_stat_delay": event.place_click_to_stat_delay,
                 }
                 for event in segment_events
             ],
@@ -854,6 +900,16 @@ def main() -> None:
                     "segment_duration_seconds": f"{segment.duration:.3f}",
                     "source_frame_start": segment.start,
                     "source_frame_end_exclusive": segment.end,
+                    "place_click_source_frame": ""
+                    if event.place_click_source_frame is None
+                    else event.place_click_source_frame,
+                    "place_stat_source_frame": ""
+                    if event.place_stat_source_frame is None
+                    else event.place_stat_source_frame,
+                    "place_click_to_stat_delay": ""
+                    if event.place_click_to_stat_delay is None
+                    else event.place_click_to_stat_delay,
+                    "telemetry_confidence": event.confidence,
                 }
             )
 

@@ -6,7 +6,7 @@ PYTHON="${WAH_PYTHON:-/ephemeral/mdu/venvs/wah/bin/python}"
 GPU="${WAH_GPU:-1}"
 DATA_ROOT="${WAH_DATA_ROOT:-data/vpt_9x_100/wah_mc_training}"
 CAMERA_CHECKPOINT="${WAH_CAMERA_CHECKPOINT:-runs/mc_camera_official_wah_c16cf2d_1000/visible_lora_state.pt}"
-WORKDIR="${WAH_TEACHER_WORKDIR:-${DATA_ROOT}/teacher_event_aligned_v1}"
+WORKDIR="${WAH_TEACHER_WORKDIR:-${DATA_ROOT}/teacher_event_aligned_v2}"
 CANDIDATE_LIMIT="${WAH_CANDIDATE_LIMIT:-32}"
 
 fail_missing() { printf 'ERROR: missing required %s: %s\n' "$1" "$2" >&2; exit 2; }
@@ -14,12 +14,15 @@ fail_missing() { printf 'ERROR: missing required %s: %s\n' "$1" "$2" >&2; exit 2
 cd "${ROOT}"
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 [[ -d "${DATA_ROOT}" ]] || fail_missing directory "${DATA_ROOT}"
-[[ -f "${DATA_ROOT}/mc_interaction_training_samples.csv" ]] || fail_missing file "${DATA_ROOT}/mc_interaction_training_samples.csv"
 [[ -f "${CAMERA_CHECKPOINT}" ]] || fail_missing file "${CAMERA_CHECKPOINT}"
 [[ -d checkpoints/helios-distilled ]] || fail_missing directory "${ROOT}/checkpoints/helios-distilled"
 mkdir -p "${WORKDIR}/candidates" "${WORKDIR}/teacher_pool" "${WORKDIR}/candidate_export_run" "${WORKDIR}/geometry_cache"
 
-printf '[1/2] Exporting %s event-aligned candidates; no optimizer is created\n' "${CANDIDATE_LIMIT}"
+printf '[1/4] Rebuilding click/stat matched interaction pools\n'
+"${PYTHON}" scripts/build_minecraft_interaction_manifest.py --data_root "${DATA_ROOT}"
+[[ -f "${DATA_ROOT}/mc_interaction_training_samples.csv" ]] || fail_missing file "${DATA_ROOT}/mc_interaction_training_samples.csv"
+
+printf '[2/4] Exporting %s event-aligned candidates; no optimizer is created\n' "${CANDIDATE_LIMIT}"
 CUDA_VISIBLE_DEVICES="${GPU}" PYTHONUNBUFFERED=1 "${PYTHON}" scripts/train_warp_as_history_lora.py \
   --base_model_path checkpoints/helios-distilled \
   --transformer_path checkpoints/helios-distilled \
@@ -51,7 +54,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" PYTHONUNBUFFERED=1 "${PYTHON}" scripts/train_warp_
 
 [[ -f "${WORKDIR}/candidates/teacher_candidate_manifest.csv" ]] || fail_missing file "${WORKDIR}/candidates/teacher_candidate_manifest.csv"
 
-printf '[2/2] Building dual-residual region teachers and read-only review material\n'
+printf '[3/4] Building RGB dual-residual region teachers and read-only review material\n'
 "${PYTHON}" scripts/build_minecraft_teacher_pool.py \
   --candidate_manifest "${WORKDIR}/candidates/teacher_candidate_manifest.csv" \
   --output_dir "${WORKDIR}/teacher_pool" \
@@ -60,6 +63,12 @@ printf '[2/2] Building dual-residual region teachers and read-only review materi
 
 [[ -f "${WORKDIR}/teacher_pool/teacher_region_review_manifest.csv" ]] || fail_missing file "${WORKDIR}/teacher_pool/teacher_region_review_manifest.csv"
 [[ -f "${WORKDIR}/teacher_pool/review_index.html" ]] || fail_missing file "${WORKDIR}/teacher_pool/review_index.html"
+printf '[4/4] Writing source-frame event-alignment audit\n'
+"${PYTHON}" scripts/audit_minecraft_event_alignment.py \
+  --review_manifest "${WORKDIR}/teacher_pool/teacher_region_review_manifest.csv" \
+  --repo_root "${ROOT}" \
+  --output_dir "${WORKDIR}/event_alignment_audit" \
+  --limit "${CANDIDATE_LIMIT}" --before 1 --after 6
 printf 'STOP: review artifacts are ready; no training was started.\n'
 printf 'Review index: %s\n' "${WORKDIR}/teacher_pool/review_index.html"
 printf 'Review manifest: %s\n' "${WORKDIR}/teacher_pool/teacher_region_review_manifest.csv"

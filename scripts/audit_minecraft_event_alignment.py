@@ -18,10 +18,10 @@ def parse_args():
     parser.add_argument("--review_manifest", type=Path, required=True)
     parser.add_argument("--repo_root", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
-    parser.add_argument("--action_type", default="place")
-    parser.add_argument("--limit", type=int, default=8)
-    parser.add_argument("--before", type=int, default=3)
-    parser.add_argument("--after", type=int, default=7)
+    parser.add_argument("--action_type", default="")
+    parser.add_argument("--limit", type=int, default=32)
+    parser.add_argument("--before", type=int, default=1)
+    parser.add_argument("--after", type=int, default=6)
     return parser.parse_args()
 
 
@@ -40,14 +40,17 @@ def main():
         rows = [
             row
             for row in csv.DictReader(handle)
-            if row.get("review_status") == "pending" and row.get("action_type") == args.action_type
+            if row.get("review_status") == "pending"
+            and (not args.action_type or row.get("action_type") == args.action_type)
         ][: args.limit]
 
     reports = []
     for sample_index, row in enumerate(rows):
         video_path = args.repo_root / row["video_path"]
-        telemetry_frame = int(float(row["verified_event_local_frame"]))
-        frame_indices = list(range(max(0, telemetry_frame - args.before), telemetry_frame + args.after + 1))
+        source_start = int(float(row.get("source_frame_start", 0) or 0))
+        telemetry_frame = int(float(row["telemetry_event_source_frame"])) - source_start
+        visual_start = int(float(row["visual_start_source_frame"])) - source_start
+        frame_indices = list(range(max(0, visual_start - args.before), visual_start + args.after + 1))
         cap = cv2.VideoCapture(str(video_path))
         frames = [read_frame(cap, frame_index) for frame_index in frame_indices]
         cap.release()
@@ -63,7 +66,7 @@ def main():
             tile = cv2.resize(frame, (320, 192))
             cv2.putText(
                 tile,
-                f"source {frame_index} offset {frame_index - telemetry_frame:+d}",
+                f"segment {frame_index} visual offset {frame_index - visual_start:+d}",
                 (8, 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.48,
@@ -93,6 +96,9 @@ def main():
                 "file": filename,
                 "event_id": row["event_id"],
                 "telemetry_source_local_frame": telemetry_frame,
+                "visual_start_source_local_frame": visual_start,
+                "reference_source_frame": row.get("reference_source_frame"),
+                "teacher_rgb_source_frames": row.get("teacher_rgb_source_frames"),
                 "frame_delta_p95": dict(zip(frame_indices, scores)),
             }
         )

@@ -40,15 +40,16 @@ def parse_args():
 
 def robust_normalized_residual(target, source, valid, z_cap):
     source = np.asarray(source, dtype=np.float32)
-    if source.shape[1] == 1 and target.shape[1] > 1:
-        source = np.repeat(source, target.shape[1], axis=1)
+    target = np.asarray(target, dtype=np.float32)
+    if source.ndim == 3 and target.ndim == 4:
+        source = np.repeat(source[None], target.shape[0], axis=0)
     if source.shape != target.shape:
         raise ValueError(f"Dual residual sources must match target: {source.shape} != {target.shape}")
-    residual = np.mean(np.abs(target.astype(np.float32) - source), axis=0, keepdims=True)
+    residual = np.mean(np.abs(target - source), axis=-1)
     residual = residual * (np.asarray(valid, dtype=np.float32) > 0).astype(np.float32)
     normalized = np.zeros_like(residual, dtype=np.float32)
-    for time_index in range(residual.shape[1]):
-        values = residual[0, time_index][valid[0, time_index] > 0]
+    for time_index in range(residual.shape[0]):
+        values = residual[time_index][valid[time_index] > 0]
         if values.size == 0:
             continue
         median = float(np.median(values))
@@ -58,33 +59,58 @@ def robust_normalized_residual(target, source, valid, z_cap):
             scale = float(np.quantile(values, 0.90) - np.quantile(values, 0.50))
         if scale < 1.0e-6:
             continue
-        normalized[0, time_index] = np.clip(
-            np.maximum(residual[0, time_index] - median, 0.0) / (scale * float(z_cap)), 0.0, 1.0
+        normalized[time_index] = np.clip(
+            np.maximum(residual[time_index] - median, 0.0) / (scale * float(z_cap)), 0.0, 1.0
         )
     return residual, normalized
+
+
+def _max_filter(value, kernel_size):
+    radius = int(kernel_size) // 2
+    padded = np.pad(np.asarray(value, dtype=np.float32), ((radius, radius), (radius, radius)), mode="edge")
+    return np.maximum.reduce(
+        [padded[y : y + value.shape[0], x : x + value.shape[1]] for y in range(kernel_size) for x in range(kernel_size)]
+    )
+
+
+def _sobel_edge(rgb):
+    gray = np.asarray(rgb, dtype=np.float32) @ np.asarray([0.299, 0.587, 0.114], dtype=np.float32)
+    padded = np.pad(gray, ((1, 1), (1, 1)), mode="edge")
+    gx = (
+        -padded[:-2, :-2] + padded[:-2, 2:]
+        - 2 * padded[1:-1, :-2] + 2 * padded[1:-1, 2:]
+        - padded[2:, :-2] + padded[2:, 2:]
+    )
+    gy = (
+        -padded[:-2, :-2] - 2 * padded[:-2, 1:-1] - padded[:-2, 2:]
+        + padded[2:, :-2] + 2 * padded[2:, 1:-1] + padded[2:, 2:]
+    )
+    magnitude = np.sqrt(gx * gx + gy * gy)
+    return np.clip(magnitude / max(float(np.quantile(magnitude, 0.99)), 1.0e-6), 0.0, 1.0)
+
+
+def old_edge_weights(reference, warp):
+    reference_edge = _sobel_edge(reference)
+    old_edge = np.stack(
+        [_max_filter(np.maximum(reference_edge, _sobel_edge(frame)), 5) for frame in warp],
+        axis=0,
+    )
+    return old_edge, np.clip(1.0 - 0.75 * old_edge, 0.25, 1.0)
 
 
 def robust_teacher(target, warp, reference, valid, z_cap):
     d_warp, warp_normalized = robust_normalized_residual(target, warp, valid, z_cap)
     d_raw, raw_normalized = robust_normalized_residual(target, reference, valid, z_cap)
     teacher = np.sqrt(np.clip(warp_normalized * raw_normalized, 0.0, 1.0))
-    padded = np.pad(d_warp, ((0, 0), (0, 0), (1, 1), (1, 1)), mode="edge")
-    local_motion = sum(
-        padded[:, :, y : y + d_warp.shape[2], x : x + d_warp.shape[3]]
-        for y in range(3)
-        for x in range(3)
-    ) / 9.0
-    local_residual_suppression = np.clip(
-        d_warp / (d_warp + local_motion + 1.0e-6), 0.25, 1.0
-    )
-    teacher = teacher * local_residual_suppression
-    if teacher.shape[1] > 1:
-        previous = np.concatenate([teacher[:, :1], teacher[:, :-1]], axis=1)
-        following = np.concatenate([teacher[:, 1:], teacher[:, -1:]], axis=1)
+    old_edge, edge_weight = old_edge_weights(reference, warp)
+    teacher = teacher * edge_weight * valid
+    if teacher.shape[0] > 1:
+        previous = np.concatenate([teacher[:1], teacher[:-1]], axis=0)
+        following = np.concatenate([teacher[1:], teacher[-1:]], axis=0)
         temporal_smoothing = 0.5 * teacher + 0.25 * previous + 0.25 * following
     else:
         temporal_smoothing = teacher
-    return d_warp, d_raw, temporal_smoothing * valid
+    return d_warp, d_raw, temporal_smoothing * valid, old_edge, edge_weight
 
 
 def normalize_map(value, shape, *, conservative=False):
@@ -99,8 +125,8 @@ def normalize_map(value, shape, *, conservative=False):
 def minecraft_static_hand_mask(height, width):
     """Return the normalized Minecraft hand/held-item staircase mask."""
     y, x = np.indices((int(height), int(width)))
-    y_thresholds = [int(np.floor(value * int(height) + 0.5)) for value in (0.88, 0.78, 0.66, 0.54, 0.42)]
-    x_thresholds = [int(np.floor(value * int(width) + 0.5)) for value in (0.42, 0.52, 0.62, 0.72, 0.83)]
+    y_thresholds = [int(np.ceil(value * int(height))) for value in (0.95, 0.89, 0.80, 0.68, 0.56)]
+    x_thresholds = [int(np.ceil(value * int(width))) for value in (0.62, 0.70, 0.78, 0.86, 0.94)]
     return (
         ((y >= y_thresholds[0]) & (x >= x_thresholds[0]))
         | ((y >= y_thresholds[1]) & (x >= x_thresholds[1]))
@@ -165,46 +191,60 @@ def minecraft_hand_masks(reference_rgb, target_rgb, action_type):
     time, height, width, _ = target.shape
     static = minecraft_static_hand_mask(height, width)
     dynamic = np.zeros((time, height, width), dtype=bool)
-    if str(action_type).lower() in {"mine_active", "mine_complete"}:
+    if str(action_type).lower() in {"place", "mine_active", "mine_complete"}:
         search = np.zeros((height, width), dtype=bool)
-        search[int(np.ceil(0.32 * height)) :, int(np.ceil(0.38 * width)) :] = True
-        seed = binary_dilate(static, 9, iterations=2)
-        maximum_area = int(np.floor(0.12 * height * width))
+        search[int(np.ceil(0.40 * height)) :, int(np.ceil(0.50 * width)) :] = True
+        seed = static
+        maximum_area = int(np.floor(0.05 * height * width))
         reference_float = reference.astype(np.float32)
         for frame_index, frame in enumerate(target):
             residual = np.mean(np.abs(frame.astype(np.float32) - reference_float), axis=2)
             values = residual[search]
             if not values.size:
                 continue
-            threshold = max(18.0, float(np.quantile(values, 0.90)))
+            threshold = max(20.0, float(np.quantile(values, 0.92)))
             connected = seed_connected_components(
                 (residual >= threshold) & search,
                 seed,
                 min_area=20,
                 max_area=maximum_area,
             )
-            dynamic[frame_index] = binary_dilate(connected, 5, iterations=1)
+            dynamic[frame_index] = binary_dilate(connected, 3, iterations=1)
     combined = dynamic | static[None]
     return combined, dynamic
 
 
-def rgb_mask_to_latent(mask, rgb_to_latent, latent_shape):
-    mask = np.asarray(mask, dtype=np.float32)
+def _area_resize(value, output_height, output_width):
+    value = np.asarray(value, dtype=np.float32)
+    output = np.zeros((int(output_height), int(output_width)), dtype=np.float32)
+    for y in range(int(output_height)):
+        y0 = int(np.floor(y * value.shape[0] / output_height))
+        y1 = max(int(np.ceil((y + 1) * value.shape[0] / output_height)), y0 + 1)
+        for x in range(int(output_width)):
+            x0 = int(np.floor(x * value.shape[1] / output_width))
+            x1 = max(int(np.ceil((x + 1) * value.shape[1] / output_width)), x0 + 1)
+            output[y, x] = float(value[y0:y1, x0:x1].mean())
+    return output
+
+
+def rgb_teacher_to_latent(value, rgb_to_latent, latent_shape):
+    value = np.asarray(value, dtype=np.float32)
     mapping = np.asarray(rgb_to_latent, dtype=np.int64).reshape(-1)
-    if mask.ndim != 3 or len(mapping) != mask.shape[0]:
-        raise ValueError(f"RGB mask/mapping mismatch: {mask.shape}, {mapping.shape}")
+    if value.ndim != 3 or len(mapping) != value.shape[0]:
+        raise ValueError(f"RGB teacher/mapping mismatch: {value.shape}, {mapping.shape}")
     latent_time, latent_height, latent_width = (int(value) for value in latent_shape)
-    temporal = np.zeros((1, latent_time, mask.shape[1], mask.shape[2]), dtype=np.float32)
+    temporal = np.zeros((1, latent_time, latent_height, latent_width), dtype=np.float32)
     for frame_index, latent_index in enumerate(mapping):
         if not 0 <= int(latent_index) < latent_time:
             raise ValueError(f"RGB-to-latent mapping points outside latent timeline: {latent_index}")
-        temporal[0, int(latent_index)] = np.maximum(temporal[0, int(latent_index)], mask[frame_index])
-    return adaptive_max_pool_3d(temporal, (latent_time, latent_height, latent_width))
+        spatial = _area_resize(value[frame_index], latent_height, latent_width)
+        temporal[0, int(latent_index)] = np.maximum(temporal[0, int(latent_index)], spatial)
+    return temporal
 
 
 def save_preview(path, residual, teacher):
-    residual_2d = residual.max(axis=(0, 1))
-    teacher_2d = teacher.max(axis=(0, 1))
+    residual_2d = residual.max(axis=0) if residual.ndim == 3 else residual.max(axis=(0, 1))
+    teacher_2d = teacher.max(axis=0) if teacher.ndim == 3 else teacher.max(axis=(0, 1))
     residual_2d = residual_2d / max(float(residual_2d.max()), 1.0e-6)
     rgb = np.stack([residual_2d, teacher_2d, np.zeros_like(teacher_2d)], axis=-1)
     Image.fromarray((np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)).save(path)
@@ -240,6 +280,8 @@ def save_review_contact_sheet(
     teacher,
     d_warp,
     d_raw,
+    old_edge_rgb,
+    edge_weight_rgb,
     hand_mask_rgb,
     row,
     stage0_positive_tokens,
@@ -251,14 +293,15 @@ def save_review_contact_sheet(
         payload["reference_rgb"] if "reference_rgb" in payload else payload["target_rgb"][0],
         dtype=np.uint8,
     )
-    visibility = np.asarray(payload["visibility"], dtype=np.float32)
-    world = np.asarray(payload["world_valid"], dtype=np.float32)
+    visibility = np.asarray(payload["visibility_rgb"], dtype=np.float32)
+    world = np.asarray(payload["world_valid_rgb"], dtype=np.float32)
     event = int(row.get("event_local_frame", 0) or 0)
     frame_latent_pairs = review_frame_latent_pairs(payload, row)
     panel_size = (240, 135)
     labels = (
         "reference RGB", "target RGB", "event-local warp RGB", "D_warp", "D_raw",
-        "fused teacher", "teacher overlay", "visibility / world", "hand / held-item mask",
+        "old edge", "edge weight", "fused teacher", "teacher overlay",
+        "visibility / world", "hand / held-item mask",
     )
     header_height = 120
     row_height = panel_size[1] + 24
@@ -275,32 +318,30 @@ def save_review_contact_sheet(
         f"stage0_positive_tokens={stage0_positive_tokens}\n"
         f"reference={row.get('reference_frame_index')}  target_indices={row.get('target_indices')}\n"
         f"telemetry_source={row.get('telemetry_source_event_frame')}  "
-        f"visual_source={row.get('visual_source_event_frame')}  "
+        f"visual_start={row.get('visual_start_source_frame')}  reference_source={row.get('reference_source_frame')}\n"
+        f"teacher_source_frames={row.get('teacher_rgb_source_frames')}  "
+        f"teacher_resampled={row.get('teacher_resampled_indices')}\n"
         f"hand_area={row.get('hand_mask_area_ratio')}  dynamic_hand_area={row.get('dynamic_hand_mask_area_ratio')}\n"
         f"invalid_reasons={'|'.join(reasons) or 'none'}"
     )
     draw.multiline_text((8, 8), summary, fill="black", font=font, spacing=3)
     for column, label in enumerate(labels):
         draw.text((column * panel_size[0] + 4, header_height - 18), label, fill="black", font=font)
-    latent_frames = int(teacher.shape[1])
     for row_number, (frame_index, latent_index) in enumerate(frame_latent_pairs):
-        if not 0 <= latent_index < latent_frames:
-            raise ValueError(
-                f"Saved RGB-to-latent mapping points outside teacher grid: frame={frame_index} "
-                f"latent={latent_index} latent_frames={latent_frames}"
-            )
         target_image = Image.fromarray(target[frame_index], mode="RGB").resize(panel_size)
         warp_image = Image.fromarray(warp[frame_index], mode="RGB").resize(panel_size)
         reference_image = Image.fromarray(reference, mode="RGB").resize(panel_size)
-        d_warp_image = _map_image(d_warp[0, latent_index], panel_size, color=0)
-        d_raw_image = _map_image(d_raw[0, latent_index], panel_size, color=0)
-        teacher_image = _map_image(teacher[0, latent_index], panel_size, color=1)
-        overlay = Image.blend(target_image, _map_image(teacher[0, latent_index], panel_size, color=0), 0.35)
+        d_warp_image = _map_image(d_warp[frame_index], panel_size, color=0)
+        d_raw_image = _map_image(d_raw[frame_index], panel_size, color=0)
+        old_edge_image = _map_image(old_edge_rgb[frame_index], panel_size, color=0)
+        edge_weight_image = _map_image(edge_weight_rgb[frame_index], panel_size, color=1)
+        teacher_image = _map_image(teacher[frame_index], panel_size, color=1)
+        overlay = Image.blend(target_image, _map_image(teacher[frame_index], panel_size, color=0), 0.35)
         valid_rgb = np.stack(
             [
-                np.zeros_like(visibility[0, latent_index]),
-                visibility[0, latent_index],
-                world[0, latent_index],
+                np.zeros_like(visibility[frame_index]),
+                visibility[frame_index],
+                world[frame_index],
             ],
             axis=-1,
         )
@@ -310,7 +351,7 @@ def save_review_contact_sheet(
         hand_image = _map_image(np.asarray(hand_mask_rgb[frame_index], dtype=np.float32), panel_size, color=0)
         panels = (
             reference_image, target_image, warp_image, d_warp_image, d_raw_image,
-            teacher_image, overlay, valid_image, hand_image,
+            old_edge_image, edge_weight_image, teacher_image, overlay, valid_image, hand_image,
         )
         top = header_height + row_number * row_height
         draw.text((4, top), f"RGB frame {frame_index} / latent {latent_index}", fill="black", font=font)
@@ -465,10 +506,13 @@ def main():
             "mine_complete": args.min_area_mine_complete,
             "mine_active": args.min_area_mine_active,
         },
-        "teacher": "per-time median/MAD residual with quantile fallback",
-        "local_residual_suppression": "residual/(residual+3x3 local mean)",
+        "teacher": "RGB dual residual per-frame median/MAD with quantile fallback",
+        "old_edge_weight": "dilated Sobel, clip(1-0.75*edge,0.25,1)",
         "temporal_smoothing": "0.5 current + 0.25 previous + 0.25 following",
-        "hand_mask": "normalized_static_staircase+seed_connected_dynamic_tool_v1",
+        "hand_mask": "small_normalized_static+seed_connected_dynamic_all_positive_v2",
+        "teacher_rgb_frames": 7,
+        "spatial_pooling": "area_average",
+        "temporal_pooling": "saved_rgb_to_latent_mapping_pixelwise_max",
     }
     for row in rows:
         precheck_reasons = []
@@ -515,17 +559,25 @@ def main():
                 payload.close()
                 output.append(rejected_manifest_row(row, [reason]))
                 continue
-        grid_shape = (1, *target.shape[1:])
-        action = normalize_map(payload["action_mask"], grid_shape)
-        visibility = normalize_map(payload["visibility"], grid_shape)
-        world = normalize_map(payload["world_valid"], grid_shape, conservative=True)
-        teacher_action = action.copy()
-        if action_type in {"place", "mine_complete"}:
-            mapping = np.asarray(payload["rgb_frame_to_latent_index"], dtype=np.int64).reshape(-1)
-            keep_latents = set(int(value) for value in mapping[:4])
-            for time_index in range(teacher_action.shape[1]):
-                if time_index not in keep_latents:
-                    teacher_action[:, time_index] = 0.0
+        required_rgb = ("target_rgb", "warp_rgb", "visibility_rgb", "world_valid_rgb", "rgb_frame_to_latent_index")
+        missing_rgb = [name for name in required_rgb if name not in payload]
+        if missing_rgb:
+            reason = f"missing_rgb_teacher_inputs:{','.join(missing_rgb)}"
+            rejection_counts[reason] += 1
+            payload.close()
+            output.append(rejected_manifest_row(row, [reason]))
+            continue
+        target_rgb = np.asarray(payload["target_rgb"], dtype=np.uint8)
+        warp_rgb = np.asarray(payload["warp_rgb"], dtype=np.uint8)
+        visibility_rgb = np.clip(np.asarray(payload["visibility_rgb"], dtype=np.float32), 0.0, 1.0)
+        world_valid_rgb = np.clip(np.asarray(payload["world_valid_rgb"], dtype=np.float32), 0.0, 1.0)
+        if target_rgb.shape != warp_rgb.shape or target_rgb.shape[:3] != visibility_rgb.shape:
+            raise ValueError(
+                f"RGB teacher inputs mismatch target={target_rgb.shape} warp={warp_rgb.shape} "
+                f"visibility={visibility_rgb.shape}"
+            )
+        if world_valid_rgb.shape != visibility_rgb.shape:
+            raise ValueError(f"world_valid_rgb mismatch: {world_valid_rgb.shape} != {visibility_rgb.shape}")
         if "reference_rgb" in payload:
             reference_rgb = payload["reference_rgb"]
         elif is_negative:
@@ -538,21 +590,26 @@ def main():
             continue
         hand_mask_rgb, dynamic_hand_mask_rgb = minecraft_hand_masks(
             reference_rgb,
-            payload["target_rgb"],
+            target_rgb,
             action_type,
         )
         rgb_to_latent = np.asarray(payload["rgb_frame_to_latent_index"], dtype=np.int64)
-        hand_mask = rgb_mask_to_latent(hand_mask_rgb, rgb_to_latent, target.shape[1:])
-        dynamic_hand_mask = rgb_mask_to_latent(dynamic_hand_mask_rgb, rgb_to_latent, target.shape[1:])
-        hand_valid = 1.0 - np.clip(hand_mask, 0.0, 1.0)
-        effective_world = world * hand_valid
+        action_time_mask_rgb = np.zeros_like(visibility_rgb, dtype=np.float32)
+        if not is_negative:
+            action_time_mask_rgb[: min(7, len(action_time_mask_rgb))] = 1.0
+        valid_rgb = (
+            action_time_mask_rgb
+            * visibility_rgb
+            * world_valid_rgb
+            * (1.0 - hand_mask_rgb.astype(np.float32))
+        )
         hand_mask_area_ratio = float(hand_mask_rgb.mean())
         dynamic_hand_mask_area_ratio = float(
             dynamic_hand_mask_rgb.reshape(dynamic_hand_mask_rgb.shape[0], -1).mean(axis=1).max()
         )
         payload_json = json.loads(str(payload["interaction_payload_json"].item()))
         event_valid = float(payload_json.get("event_valid", 1.0))
-        valid = teacher_action * visibility * effective_world * event_valid
+        valid_rgb *= event_valid
         identity = json.loads(str(payload["candidate_identity_json"].item()))
         expected_candidate_key = str(row.get("candidate_cache_key", ""))
         reasons = []
@@ -568,12 +625,24 @@ def main():
                 f"history_type={row.get('history_type')}"
             )
         if is_negative:
-            d_warp = np.mean(np.abs(target.astype(np.float32) - warp.astype(np.float32)), axis=0, keepdims=True)
-            reference_broadcast = np.repeat(reference, target.shape[1], axis=1) if reference.shape[1] == 1 else reference
-            d_raw = np.mean(np.abs(target.astype(np.float32) - reference_broadcast.astype(np.float32)), axis=0, keepdims=True)
-            teacher = np.zeros_like(d_warp, dtype=np.float32)
+            d_warp = np.mean(np.abs(target_rgb.astype(np.float32) - warp_rgb.astype(np.float32)), axis=-1)
+            d_raw = np.mean(np.abs(target_rgb.astype(np.float32) - reference_rgb.astype(np.float32)), axis=-1)
+            teacher_rgb = np.zeros_like(d_warp, dtype=np.float32)
+            old_edge_rgb, edge_weight_rgb = old_edge_weights(reference_rgb, warp_rgb)
         else:
-            d_warp, d_raw, teacher = robust_teacher(target, warp, reference, valid, args.z_cap)
+            d_warp, d_raw, teacher_rgb, old_edge_rgb, edge_weight_rgb = robust_teacher(
+                target_rgb, warp_rgb, reference_rgb, valid_rgb, args.z_cap
+            )
+        teacher = rgb_teacher_to_latent(teacher_rgb, rgb_to_latent, target.shape[1:])
+        teacher_action = rgb_teacher_to_latent(action_time_mask_rgb, rgb_to_latent, target.shape[1:])
+        visibility = rgb_teacher_to_latent(visibility_rgb, rgb_to_latent, target.shape[1:])
+        effective_world = rgb_teacher_to_latent(
+            world_valid_rgb * (1.0 - hand_mask_rgb.astype(np.float32)),
+            rgb_to_latent,
+            target.shape[1:],
+        )
+        world = rgb_teacher_to_latent(world_valid_rgb, rgb_to_latent, target.shape[1:])
+        valid = rgb_teacher_to_latent(valid_rgb, rgb_to_latent, target.shape[1:])
         statistics = fixed_teacher_statistics(
             teacher,
             teacher_action,
@@ -613,7 +682,7 @@ def main():
             if str(row.get("metadata_filter_status", "passed")).strip().lower() == "rejected":
                 reasons.append("metadata_filter_rejected")
         else:
-            if dynamic_hand_mask_area_ratio > 0.12:
+            if dynamic_hand_mask_area_ratio > 0.05:
                 reasons.append("excessive_dynamic_hand_mask")
             if valid_count <= 0:
                 reasons.append("empty_valid_region")
@@ -646,10 +715,15 @@ def main():
             d_warp=d_warp.astype(np.float16),
             d_raw=d_raw.astype(np.float16),
             teacher=teacher.astype(np.float16),
+            teacher_rgb=teacher_rgb.astype(np.float16),
+            d_warp_rgb=d_warp.astype(np.float16),
+            d_raw_rgb=d_raw.astype(np.float16),
+            old_edge_rgb=old_edge_rgb.astype(np.float16),
+            edge_weight_rgb=edge_weight_rgb.astype(np.float16),
+            hand_mask_rgb=hand_mask_rgb.astype(np.uint8),
+            valid_rgb=valid_rgb.astype(np.float16),
             visibility=visibility.astype(np.float16),
             world_valid=world.astype(np.float16),
-            hand_mask=hand_mask.astype(np.float16),
-            dynamic_hand_mask=dynamic_hand_mask.astype(np.float16),
             valid=valid.astype(np.float16),
             candidate_cache_key=np.asarray(expected_candidate_key),
             candidate_config_hash=np.asarray(str(row.get("candidate_config_hash", ""))),
@@ -663,15 +737,17 @@ def main():
         save_review_contact_sheet(
             preview_path,
             payload,
-            teacher,
+            teacher_rgb,
             d_warp,
             d_raw,
+            old_edge_rgb,
+            edge_weight_rgb,
             hand_mask_rgb,
             row,
             stage0_positive_tokens,
             reasons,
         )
-        save_preview(args.output_dir / f"{cache_key}_summary.png", d_warp, teacher)
+        save_preview(args.output_dir / f"{cache_key}_summary.png", d_warp, teacher_rgb)
         for reason in reasons:
             rejection_counts[reason] += 1
         output.append(

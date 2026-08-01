@@ -778,6 +778,14 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 "event_local_frame": int(training.get("event_local_frame", 0) or 0),
                 "telemetry_source_event_frame": int(training.get("source_event_frame", -1) or -1),
                 "visual_source_event_frame": int(training.get("visual_source_event_frame", -1) or -1),
+                "visual_start_source_frame": int(training.get("visual_start_source_frame", -1) or -1),
+                "reference_source_frame": int(training.get("reference_source_frame", -1) or -1),
+                "teacher_rgb_source_frames": [
+                    int(value) for value in training.get("teacher_rgb_source_frames", [])
+                ],
+                "teacher_resampled_indices": [
+                    int(value) for value in training.get("teacher_resampled_indices", [])
+                ],
                 "visual_effect_delay_source_frames": int(
                     training.get("visual_effect_delay_source_frames", 0) or 0
                 ),
@@ -796,6 +804,12 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
             warp_rgb = np.stack(
                 [np.asarray(frame.convert("RGB"), dtype=np.uint8) for frame in item.get("history_frames", [])]
             )
+            visibility_rgb = np.stack(
+                [np.asarray(frame.convert("L"), dtype=np.float32) / 255.0 for frame in item["visibility_frames"]]
+            )
+            world_valid_rgb = np.stack(
+                [np.asarray(frame.convert("L"), dtype=np.float32) / 255.0 for frame in item["world_valid_frames"]]
+            )
             rgb_to_latent = rgb_frame_to_latent_indices(
                 len(target_rgb),
                 int(target.shape[2]),
@@ -812,6 +826,8 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 target_rgb=target_rgb,
                 warp_rgb=warp_rgb,
                 reference_rgb=np.asarray(item["reference_frame"].convert("RGB"), dtype=np.uint8),
+                visibility_rgb=visibility_rgb.astype(np.float16),
+                world_valid_rgb=world_valid_rgb.astype(np.float16),
                 interaction_payload_json=np.asarray(json.dumps(interaction_payload, ensure_ascii=False)),
                 rgb_frame_to_latent_index=np.asarray(rgb_to_latent, dtype=np.int16),
                 candidate_identity_json=np.asarray(json.dumps(identity, ensure_ascii=False, sort_keys=True)),
@@ -846,7 +862,12 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                     "target_start_frame": identity["target_start_frame"],
                     "event_local_frame": identity["event_local_frame"],
                     "telemetry_source_event_frame": identity["telemetry_source_event_frame"],
+                    "telemetry_event_source_frame": identity["telemetry_source_event_frame"],
                     "visual_source_event_frame": identity["visual_source_event_frame"],
+                    "visual_start_source_frame": identity["visual_start_source_frame"],
+                    "reference_source_frame": identity["reference_source_frame"],
+                    "teacher_rgb_source_frames": encode_index_sequence(identity["teacher_rgb_source_frames"]),
+                    "teacher_resampled_indices": encode_index_sequence(identity["teacher_resampled_indices"]),
                     "visual_effect_delay_source_frames": identity[
                         "visual_effect_delay_source_frames"
                     ],

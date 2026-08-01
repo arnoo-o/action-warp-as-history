@@ -10,6 +10,8 @@ from pathlib import Path, PureWindowsPath
 
 import numpy as np
 
+from scripts.prepare_minecraft_vpt_training_data import is_placeable_item
+
 
 NEUTRAL_PROMPT = "Minecraft first-person gameplay."
 
@@ -88,7 +90,9 @@ def resolve_manifest_paths(rows, data_root):
 def gui_open(row):
     gui = dict(row.get("gui", {}) or {})
     return bool(
-        gui.get("isGuiOpen")
+        row.get("isGuiOpen")
+        or row.get("is_gui_open")
+        or gui.get("isGuiOpen")
         or gui.get("is_gui_open")
         or gui.get("inventory")
         or gui.get("container")
@@ -97,6 +101,24 @@ def gui_open(row):
 
 def left_held(row):
     return 0 in list(dict(row.get("mouse", {}) or {}).get("buttons", []) or [])
+
+
+def left_click_edges(frames):
+    edges = []
+    previous = set()
+    for frame_index, row in enumerate(frames):
+        current = {int(value) for value in (dict(row.get("mouse", {}) or {}).get("buttons", []) or [])}
+        if 0 in current and 0 not in previous and not gui_open(row):
+            edges.append(frame_index)
+        previous = current
+    return edges
+
+
+def use_item_delta_at(frames, frame_index, object_id):
+    key = f"minecraft.use_item:minecraft.{str(object_id).removeprefix('minecraft:')}"
+    current = dict(frames[frame_index].get("stats", {}) or {})
+    previous = dict(frames[frame_index - 1].get("stats", {}) or {}) if frame_index > 0 else {}
+    return int(current.get(key, 0) or 0) - int(previous.get(key, 0) or 0)
 
 
 def angular_delta(a, b):
@@ -209,28 +231,87 @@ def main():
     metadata_rejections = Counter()
     completions_by_segment = defaultdict(list)
     mine_rows = []
-    for row in source_rows:
+    telemetry_cache = {}
+    click_edges_by_segment = {}
+    consumed_place_clicks = defaultdict(set)
+    matched_places = {}
+    for row_index, row in enumerate(source_rows):
+        if str(row.get("category", "")).strip().lower() != "place":
+            continue
+        actions_path = Path(row["actions_path"])
+        if actions_path not in telemetry_cache:
+            telemetry_cache[actions_path] = read_jsonl(actions_path)
+        frames = telemetry_cache[actions_path]
+        segment_id = row["segment_id"]
+        click_edges_by_segment.setdefault(segment_id, left_click_edges(frames))
+        stat_local = int(row["event_source_frame"]) - int(row["source_frame_start"])
+        object_id = str(row.get("object_id", "") or "")
+        if not is_placeable_item(object_id):
+            metadata_rejections["place_non_placeable_item"] += 1
+            continue
+        if not 0 <= stat_local < len(frames) or gui_open(frames[stat_local]):
+            metadata_rejections["place_gui_or_frame_invalid"] += 1
+            continue
+        if use_item_delta_at(frames, stat_local, object_id) <= 0:
+            metadata_rejections["place_missing_use_item_increment"] += 1
+            continue
+        matches = [
+            click
+            for click in click_edges_by_segment[segment_id]
+            if stat_local - 3 <= click <= stat_local + 1
+            and click not in consumed_place_clicks[segment_id]
+        ]
+        if not matches:
+            metadata_rejections["place_missing_left_click_edge"] += 1
+            continue
+        click_local = min(matches, key=lambda value: (abs(value - stat_local), value))
+        consumed_place_clicks[segment_id].add(click_local)
+        matched_places[row_index] = (click_local, stat_local)
+
+    for row_index, row in enumerate(source_rows):
         category = str(row.get("category", "")).strip().lower()
         reasons = validate_event_metadata(row, args) if category in {"place", "mine"} else []
         if reasons:
             metadata_rejections.update(reasons)
             continue
         if category == "place":
+            if row_index not in matched_places:
+                continue
+            click_local, stat_local = matched_places[row_index]
             result = base_output_row(row)
             result["action_type"] = "place"
             result["history_type"] = "quota"
+            source_start = int(row["source_frame_start"])
+            result["place_click_source_frame"] = str(source_start + click_local)
+            result["place_stat_source_frame"] = str(source_start + stat_local)
+            result["place_click_to_stat_delay"] = str(stat_local - click_local)
+            result["telemetry_confidence"] = "placeable_use_item_plus_left_click_edge"
+            result["telemetry_event_source_frame"] = str(source_start + stat_local)
+            result["visual_start_source_frame"] = str(source_start + max(click_local + 1, stat_local))
             output.append(result)
         elif category == "mine":
+            actions_path = Path(row["actions_path"])
+            if actions_path not in telemetry_cache:
+                telemetry_cache[actions_path] = read_jsonl(actions_path)
+            frames = telemetry_cache[actions_path]
+            complete_local = int(row["event_source_frame"]) - int(row["source_frame_start"])
+            hold_start = complete_local
+            while hold_start > 0 and left_held(frames[hold_start - 1]):
+                hold_start -= 1
+            if hold_start in consumed_place_clicks[row["segment_id"]]:
+                metadata_rejections["mine_click_consumed_by_place"] += 1
+                continue
             result = base_output_row(row)
             result["action_type"] = "mine_complete"
             result["history_type"] = "quota"
             result["complete_frame"] = row["event_source_frame"]
+            result["telemetry_event_source_frame"] = row["event_source_frame"]
+            result["visual_start_source_frame"] = row["event_source_frame"]
             output.append(result)
             local = int(row["event_source_frame"]) - int(row["source_frame_start"])
             completions_by_segment[row["segment_id"]].append(local)
             mine_rows.append(row)
 
-    telemetry_cache = {}
     active_rejections = Counter()
     for row in mine_rows:
         actions_path = Path(row["actions_path"])
@@ -268,6 +349,8 @@ def main():
                 "stable_active_frames": str(active_end - active_start + 1),
                 "cumulative_rotation": f"{cumulative:.6f}",
                 "telemetry_confidence": "exact_complete_stable_suffix",
+                "telemetry_event_source_frame": str(source_start + active_start),
+                "visual_start_source_frame": str(source_start + active_start),
                 "history_type": "quota",
             }
         )

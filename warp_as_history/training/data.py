@@ -302,6 +302,7 @@ def event_alignment_from_row(
     source_fps=None,
     target_fps=None,
     visual_effect_delay_source_frames=0,
+    align_to_visual_start=False,
 ):
     """Map a source-FPS event to the decoded target-FPS timeline by timestamp."""
     if not source_indices:
@@ -313,10 +314,22 @@ def event_alignment_from_row(
     else:
         segment_event_frame = int(row.get("event_local_frame", row.get("event_frame", 0)) or 0)
         source_event_frame = source_start + segment_event_frame
-    visual_segment_event_frame = segment_event_frame + int(visual_effect_delay_source_frames)
-    if int(visual_effect_delay_source_frames) > 0:
-        # VPT telemetry describes the action associated with the current observation.
-        # Its visual consequence first belongs to the following source observation.
+    action_type = canonical_interaction_action(row.get("action_type", row.get("category", "none")))
+    visual_source_frame = None
+    if align_to_visual_start and str(row.get("visual_start_source_frame", "")).strip():
+        visual_source_frame = int(row["visual_start_source_frame"])
+    elif align_to_visual_start and action_type == "place":
+        click = int(row.get("place_click_source_frame", source_event_frame) or source_event_frame)
+        stat = int(row.get("place_stat_source_frame", source_event_frame) or source_event_frame)
+        visual_source_frame = max(click + 1, stat)
+    elif align_to_visual_start and action_type == "mine_active":
+        visual_source_frame = int(row.get("action_start_frame", source_event_frame) or source_event_frame)
+    elif align_to_visual_start and action_type == "mine_complete":
+        visual_source_frame = int(row.get("complete_frame", source_event_frame) or source_event_frame)
+    if visual_source_frame is None:
+        visual_source_frame = source_event_frame + int(visual_effect_delay_source_frames)
+    visual_segment_event_frame = int(visual_source_frame) - source_start
+    if align_to_visual_start or int(visual_effect_delay_source_frames) > 0:
         eligible = [index for index, frame in enumerate(source_indices) if int(frame) >= visual_segment_event_frame]
         if not eligible:
             raise ValueError(
@@ -331,7 +344,8 @@ def event_alignment_from_row(
     return {
         "source_event_frame": int(source_event_frame),
         "segment_event_frame": int(segment_event_frame),
-        "visual_source_event_frame": int(source_start + visual_segment_event_frame),
+        "visual_source_event_frame": int(visual_source_frame),
+        "visual_start_source_frame": int(visual_source_frame),
         "visual_segment_event_frame": int(visual_segment_event_frame),
         "visual_effect_delay_source_frames": int(visual_effect_delay_source_frames),
         "source_event_time_ms": None
@@ -1951,7 +1965,7 @@ class OnlineWarpTrainingCache:
                 prepared["source_indices"],
                 source_fps=float(row.get("fps", 0.0) or 0.0),
                 target_fps=float(getattr(self.exact_args, "online_target_fps", 0.0) or 0.0),
-                visual_effect_delay_source_frames=1 if event_aligned_request else 0,
+                align_to_visual_start=event_aligned_request,
             )
             event_resampled_frame = int(event_alignment["resampled_event_frame"])
             event_end_frame = None
@@ -2407,6 +2421,9 @@ class OnlineWarpTrainingCache:
                 "visual_source_event_frame": None
                 if event_alignment is None
                 else event_alignment["visual_source_event_frame"],
+                "visual_start_source_frame": None
+                if event_alignment is None
+                else event_alignment["visual_start_source_frame"],
                 "visual_effect_delay_source_frames": None
                 if event_alignment is None
                 else event_alignment["visual_effect_delay_source_frames"],
@@ -2417,6 +2434,15 @@ class OnlineWarpTrainingCache:
                 "resampled_event_time_ms": None
                 if event_alignment is None
                 else event_alignment["resampled_event_time_ms"],
+                "reference_source_frame": None
+                if reference_frame_index is None
+                else int(row.get("source_frame_start", 0) or 0)
+                + int(prepared["source_indices"][reference_frame_index]),
+                "teacher_rgb_source_frames": [
+                    int(row.get("source_frame_start", 0) or 0) + int(prepared["source_indices"][index])
+                    for index in target_indices[:7]
+                ],
+                "teacher_resampled_indices": [int(index) for index in target_indices[:7]],
                 "pose_source": pose_source,
                 "pose_convention": POSE_CONVENTION,
                 "raw_translation_norm": motion_stats["raw_translation_norm"],
@@ -2942,6 +2968,18 @@ def prepare_online_warp_item(
     if keep_frames:
         item["target_frames"] = [frame.resize((exact_args.width, exact_args.height)) for frame in target_frames]
         item["history_frames"] = [frame.resize((exact_args.width, exact_args.height)) for frame in history_frames]
+        item["visibility_frames"] = [
+            frame.resize((exact_args.width, exact_args.height), Image.Resampling.NEAREST)
+            for frame in mask_frames
+        ]
+        item["world_valid_frames"] = (
+            [Image.new("L", (exact_args.width, exact_args.height), 255) for _ in target_frames]
+            if case.get("world_valid_mask_frames") is None
+            else [
+                frame.resize((exact_args.width, exact_args.height), Image.Resampling.NEAREST)
+                for frame in case["world_valid_mask_frames"]
+            ]
+        )
         item["reference_frame"] = (
             None
             if case.get("reference_frame") is None
