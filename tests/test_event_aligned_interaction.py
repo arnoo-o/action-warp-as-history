@@ -13,6 +13,14 @@ from warp_as_history.event_aligned import (
 from warp_as_history.training.fixed_teacher import fixed_identity_from_row, validate_fixed_identity
 
 
+def test_event_aligned_success_quotas_are_stratified():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "train_warp_as_history_lora.py"
+    source = script.read_text(encoding="utf-8")
+    assert 'quotas[(action, "first")]' in source
+    assert 'quotas[(action, "later")]' in source
+    assert "successful_by_cell[cell] += 1" in source
+
+
 def test_event_aligned_indices_and_reference_render_drop():
     indices = event_aligned_indices(12, 100)
     assert indices["reference_frame_index"] == 11

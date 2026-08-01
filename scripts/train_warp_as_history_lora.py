@@ -618,13 +618,36 @@ def _event_aligned_conflict(df, row_index, target_fps, window_frames):
     return None
 
 
+def _event_aligned_success_quotas(limit):
+    limit = int(limit)
+    if limit <= 0:
+        return {}
+    action_ratios = (("place", 0.5), ("mine_active", 0.25), ("mine_complete", 0.25))
+    action_counts = {action: int(math.floor(limit * ratio)) for action, ratio in action_ratios}
+    for action, _ in action_ratios:
+        if sum(action_counts.values()) >= limit:
+            break
+        action_counts[action] += 1
+    quotas = {}
+    for action, count in action_counts.items():
+        quotas[(action, "first")] = int(math.ceil(count / 2.0))
+        quotas[(action, "later")] = int(count // 2)
+    return quotas
+
+
 def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows = []
     source_digest_cache = {}
     event_aligned = bool(getattr(exact_args, "event_aligned_interaction", False))
-    source_limit = int(math.ceil(int(limit) / 2.0)) if event_aligned and int(limit) > 0 else limit
+    success_quotas = _event_aligned_success_quotas(limit) if event_aligned else {}
+    successful_by_cell = Counter()
+    if event_aligned and int(limit) > 0:
+        minimum_sources = int(math.ceil(int(limit) / 2.0))
+        source_limit = min(len(df), max(minimum_sources * 10, minimum_sources))
+    else:
+        source_limit = limit
     candidate_ratios = (
         {"place": 0.5, "mine_active": 0.25, "mine_complete": 0.25, "negative": 0.0}
         if event_aligned
@@ -652,12 +675,26 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
         ),
         flush=True,
     )
+    attempted_source_rows = 0
     for row_index in row_indices:
         row = df.iloc[row_index]
         action_type = str(row.get("action_type", "none") or "none").strip().lower()
+        if event_aligned and success_quotas and all(
+            successful_by_cell[cell] >= quota for cell, quota in success_quotas.items()
+        ):
+            break
+        if event_aligned and success_quotas and all(
+            successful_by_cell[(action_type, history)] >= success_quotas.get((action_type, history), 0)
+            for history in ("first", "later")
+        ):
+            continue
+        attempted_source_rows += 1
         category = "negative" if action_type == "none" else "mine" if action_type.startswith("mine") else "place"
         histories = ["first", "later"]
         for history_type in histories:
+            cell = (action_type, history_type)
+            if event_aligned and success_quotas and successful_by_cell[cell] >= success_quotas.get(cell, 0):
+                continue
             if event_aligned:
                 conflict = _event_aligned_conflict(
                     df, row_index, exact_args.online_target_fps, exact_args.num_frames
@@ -824,6 +861,7 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                     "candidate_error": "",
                 }
             )
+            successful_by_cell[cell] += 1
             del item, target, aligned
             release_cuda_cache()
     manifest_path = output_dir / "teacher_candidate_manifest.csv"
@@ -837,7 +875,14 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
         {
             "rows": len(manifest_rows),
             "selected_source_rows": len(row_indices),
+            "attempted_source_rows": attempted_source_rows,
             "selected_source_action_counts": dict(selected_actions),
+            "requested_success_quotas": {
+                f"{action}|{history}": count for (action, history), count in success_quotas.items()
+            },
+            "successful_action_history_counts": {
+                f"{action}|{history}": count for (action, history), count in successful_by_cell.items()
+            },
             "successful": sum(not row.get("candidate_error") for row in manifest_rows),
             "failed": sum(bool(row.get("candidate_error")) for row in manifest_rows),
             "manifest": str(manifest_path),
