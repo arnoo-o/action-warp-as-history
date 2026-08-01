@@ -106,7 +106,13 @@ class InteractionValidationTorchTest(unittest.TestCase):
         groups, changed = self.one_group_step("adapter_overfit")
         self.assertTrue(groups["interaction_adapter"])
         self.assertFalse(groups["interaction_router"])
-        self.assertTrue(all(name.startswith("adapter.") for name in changed))
+        self.assertTrue(
+            all(
+                name.startswith("adapter.") or name.startswith("adapter_reference_projection.")
+                for name in changed
+            )
+        )
+        self.assertFalse(any(name.startswith("router_reference_projection.") for name in changed))
 
         self.stack = INTERACTION.InteractionConditioningStack(16, semantic_dim=8, rank=4)
         groups, changed = self.one_group_step("joint_pilot")
