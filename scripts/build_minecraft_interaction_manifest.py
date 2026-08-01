@@ -103,12 +103,12 @@ def left_held(row):
     return 0 in list(dict(row.get("mouse", {}) or {}).get("buttons", []) or [])
 
 
-def left_click_edges(frames):
+def button_down_edges(frames, button):
     edges = []
     previous = set()
     for frame_index, row in enumerate(frames):
         current = {int(value) for value in (dict(row.get("mouse", {}) or {}).get("buttons", []) or [])}
-        if 0 in current and 0 not in previous and not gui_open(row):
+        if int(button) in current and int(button) not in previous and not gui_open(row):
             edges.append(frame_index)
         previous = current
     return edges
@@ -243,7 +243,8 @@ def main():
             telemetry_cache[actions_path] = read_jsonl(actions_path)
         frames = telemetry_cache[actions_path]
         segment_id = row["segment_id"]
-        click_edges_by_segment.setdefault(segment_id, left_click_edges(frames))
+        # VPT/Minecraft uses button 1 for use/place and button 0 for attack/mine.
+        click_edges_by_segment.setdefault(segment_id, button_down_edges(frames, 1))
         stat_local = int(row["event_source_frame"]) - int(row["source_frame_start"])
         object_id = str(row.get("object_id", "") or "")
         if not is_placeable_item(object_id):

@@ -353,7 +353,7 @@ def inspect_pair(video_path: Path, actions_path: Path, args: argparse.Namespace)
     use_item_counts: Counter[str] = Counter()
     rejected_use_item_counts: Counter[str] = Counter()
     invalid_json_lines = 0
-    left_click_edges: list[int] = []
+    place_click_edges: list[int] = []
     left_held_frames: list[bool] = []
     place_stat_events: list[Event] = []
     mine_stat_events: list[Event] = []
@@ -383,9 +383,9 @@ def inspect_pair(video_path: Path, actions_path: Path, args: argparse.Namespace)
 
             mouse = row.get("mouse") or {}
             current_mouse_buttons = {int(value) for value in (mouse.get("buttons") or [])}
-            left_click_down = 0 in current_mouse_buttons and 0 not in previous_mouse_buttons
-            if left_click_down and not is_gui:
-                left_click_edges.append(frame)
+            place_click_down = 1 in current_mouse_buttons and 1 not in previous_mouse_buttons
+            if place_click_down and not is_gui:
+                place_click_edges.append(frame)
             left_held_frames.append(0 in current_mouse_buttons)
             previous_mouse_buttons = current_mouse_buttons
 
@@ -419,7 +419,7 @@ def inspect_pair(video_path: Path, actions_path: Path, args: argparse.Namespace)
     for event in sorted(place_stat_events, key=lambda value: value.frame):
         matches = [
             click
-            for click in left_click_edges
+            for click in place_click_edges
             if event.frame - 3 <= click <= event.frame + 1 and click not in consumed_place_clicks
         ]
         if not matches:
