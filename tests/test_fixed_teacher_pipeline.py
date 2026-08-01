@@ -451,7 +451,91 @@ class NegativeCandidateReviewTest(unittest.TestCase):
         }
         row = identity_row("place", "first", 0)
         row["event_local_frame"] = "7"
-        self.assertEqual(BUILDER.review_frame_latent_pairs(payload, row), [(6, 1), (7, 2), (8, 0)])
+        self.assertEqual(
+            BUILDER.review_frame_latent_pairs(payload, row),
+            [(7, 2), (8, 0), (9, 1), (10, 1), (11, 1), (12, 1), (13, 1)],
+        )
+
+    def test_static_hand_mask_matches_640_by_384_staircase(self):
+        mask = BUILDER.minecraft_static_hand_mask(384, 640)
+        for y, x in ((338, 269), (300, 333), (253, 397), (207, 461), (161, 531)):
+            self.assertTrue(mask[y, x], (y, x))
+        for y, x in ((337, 269), (299, 333), (252, 397), (206, 461), (160, 531)):
+            self.assertFalse(mask[y, x], (y, x))
+        central = mask[77:277, 192:448]
+        self.assertFalse(mask[192, 320])
+        self.assertLess(float(central.mean()), 0.05)
+
+    def test_place_uses_static_mask_without_dynamic_expansion(self):
+        reference = np.zeros((384, 640, 3), dtype=np.uint8)
+        target = np.repeat(reference[None], 2, axis=0)
+        target[:, 190:240, 440:490] = 255
+        combined, dynamic = BUILDER.minecraft_hand_masks(reference, target, "place")
+        self.assertFalse(dynamic.any())
+        self.assertTrue(np.array_equal(combined[0], BUILDER.minecraft_static_hand_mask(384, 640)))
+
+    def test_mining_masks_seed_connected_tool_but_not_background_motion(self):
+        reference = np.zeros((384, 640, 3), dtype=np.uint8)
+        target = np.repeat(reference[None], 1, axis=0)
+        target[0, 195:230, 445:485] = 255
+        target[0, 130:160, 280:320] = 255
+        _, dynamic = BUILDER.minecraft_hand_masks(reference, target, "mine_active")
+        self.assertTrue(dynamic[0, 205, 450])
+        self.assertFalse(dynamic[0, 145, 300])
+
+    def test_hand_mask_pixels_do_not_generate_teacher_or_tokens(self):
+        static = BUILDER.minecraft_static_hand_mask(384, 640)
+        target = np.zeros((1, 1, 384, 640), dtype=np.float32)
+        target[0, 0, static] = 100.0
+        valid = (~static)[None, None].astype(np.float32)
+        _, _, teacher = BUILDER.robust_teacher(
+            target,
+            np.zeros_like(target),
+            np.zeros_like(target),
+            valid,
+            3.0,
+        )
+        self.assertEqual(float(teacher[..., static].sum()), 0.0)
+        stats = BUILDER.fixed_teacher_statistics(
+            teacher,
+            np.ones_like(valid),
+            np.ones_like(valid),
+            valid,
+            0.25,
+            (1, 6, 10),
+            action_type="place",
+        )
+        self.assertEqual(stats["stage0_positive_tokens"], 0)
+
+    def test_review_sheet_has_seven_rows_and_hand_mask_panel(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "review.png"
+            payload = {
+                "target_rgb": np.zeros((33, 16, 16, 3), dtype=np.uint8),
+                "warp_rgb": np.zeros((33, 16, 16, 3), dtype=np.uint8),
+                "reference_rgb": np.zeros((16, 16, 3), dtype=np.uint8),
+                "visibility": np.ones((1, 9, 2, 2), dtype=np.float32),
+                "world_valid": np.ones((1, 9, 2, 2), dtype=np.float32),
+                "rgb_frame_to_latent_index": np.repeat(np.arange(9), 4)[:33],
+            }
+            row = identity_row("place", "first", 0)
+            row.update({"event_local_frame": "0", "teacher_area_ratio": "0.1"})
+            maps = np.zeros((1, 9, 2, 2), dtype=np.float32)
+            BUILDER.save_review_contact_sheet(
+                path,
+                payload,
+                maps,
+                maps,
+                maps,
+                np.zeros((33, 16, 16), dtype=bool),
+                row,
+                1,
+                [],
+            )
+            image = BUILDER.Image.open(path)
+            self.assertEqual(image.width, 9 * 240)
+            self.assertEqual(image.height, 120 + 7 * (135 + 24))
+            self.assertIn('"hand / held-item mask"', (ROOT / "scripts" / "build_minecraft_teacher_pool.py").read_text())
 
 
 class LauncherAndResumeTest(unittest.TestCase):

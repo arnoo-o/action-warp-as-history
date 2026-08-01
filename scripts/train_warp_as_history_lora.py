@@ -776,6 +776,11 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 "render_pose_indices": [int(value) for value in training.get("render_pose_indices", [])],
                 "target_start_frame": int(training.get("target_start_frame", 0)),
                 "event_local_frame": int(training.get("event_local_frame", 0) or 0),
+                "telemetry_source_event_frame": int(training.get("source_event_frame", -1) or -1),
+                "visual_source_event_frame": int(training.get("visual_source_event_frame", -1) or -1),
+                "visual_effect_delay_source_frames": int(
+                    training.get("visual_effect_delay_source_frames", 0) or 0
+                ),
                 "chunk_mode": str(training.get("chunk_mode", "")),
                 "direction": str(training.get("direction", "")),
                 "source_segment_id": str(row.get("segment_id", row.get("id", ""))),
@@ -840,6 +845,11 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                     "reference_frame_index": identity["reference_frame_index"],
                     "target_start_frame": identity["target_start_frame"],
                     "event_local_frame": identity["event_local_frame"],
+                    "telemetry_source_event_frame": identity["telemetry_source_event_frame"],
+                    "visual_source_event_frame": identity["visual_source_event_frame"],
+                    "visual_effect_delay_source_frames": identity[
+                        "visual_effect_delay_source_frames"
+                    ],
                     "history_indices": encode_index_sequence(identity["history_indices"]),
                     "geometry_keyframe_frames": encode_index_sequence(identity["geometry_keyframe_frames"]),
                     "render_pose_indices": encode_index_sequence(identity["render_pose_indices"]),

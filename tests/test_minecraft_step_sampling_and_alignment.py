@@ -93,6 +93,21 @@ class MinecraftStepSamplingAndAlignmentTest(unittest.TestCase):
         self.assertAlmostEqual(result["source_event_time_ms"], 600.0)
         self.assertAlmostEqual(result["resampled_event_time_ms"], 625.0)
 
+    def test_event_aligned_visual_effect_uses_first_frame_after_action(self):
+        source_indices = [0, 1, 2, 4, 5, 6, 8]
+        result = DATA["event_alignment_from_row"](
+            {"source_frame_start": 100, "event_source_frame": 102},
+            source_indices,
+            source_fps=20,
+            target_fps=16,
+            visual_effect_delay_source_frames=1,
+        )
+        self.assertEqual(result["segment_event_frame"], 2)
+        self.assertEqual(result["visual_segment_event_frame"], 3)
+        self.assertEqual(result["visual_source_event_frame"], 103)
+        self.assertEqual(result["resampled_event_frame"], 3)
+        self.assertEqual(source_indices[result["resampled_event_frame"]], 4)
+
     def test_reverse_keeps_event_masks_and_poses_aligned(self):
         payload = {
             "event_frame": 7,

@@ -295,7 +295,14 @@ def canonical_interaction_action(value):
     return "none"
 
 
-def event_alignment_from_row(row, source_indices, *, source_fps=None, target_fps=None):
+def event_alignment_from_row(
+    row,
+    source_indices,
+    *,
+    source_fps=None,
+    target_fps=None,
+    visual_effect_delay_source_frames=0,
+):
     """Map a source-FPS event to the decoded target-FPS timeline by timestamp."""
     if not source_indices:
         raise ValueError("Cannot align an event without decoded source frame indices.")
@@ -306,13 +313,27 @@ def event_alignment_from_row(row, source_indices, *, source_fps=None, target_fps
     else:
         segment_event_frame = int(row.get("event_local_frame", row.get("event_frame", 0)) or 0)
         source_event_frame = source_start + segment_event_frame
-    distances = [abs(int(frame) - segment_event_frame) for frame in source_indices]
-    resampled_event_frame = int(np.argmin(distances))
+    visual_segment_event_frame = segment_event_frame + int(visual_effect_delay_source_frames)
+    if int(visual_effect_delay_source_frames) > 0:
+        # VPT telemetry describes the action associated with the current observation.
+        # Its visual consequence first belongs to the following source observation.
+        eligible = [index for index, frame in enumerate(source_indices) if int(frame) >= visual_segment_event_frame]
+        if not eligible:
+            raise ValueError(
+                f"No decoded RGB frame at or after visual event source frame {visual_segment_event_frame}."
+            )
+        resampled_event_frame = int(eligible[0])
+    else:
+        distances = [abs(int(frame) - segment_event_frame) for frame in source_indices]
+        resampled_event_frame = int(np.argmin(distances))
     source_fps = float(source_fps if source_fps is not None else row.get("fps", 0.0) or 0.0)
     target_fps = float(target_fps or 0.0)
     return {
         "source_event_frame": int(source_event_frame),
         "segment_event_frame": int(segment_event_frame),
+        "visual_source_event_frame": int(source_start + visual_segment_event_frame),
+        "visual_segment_event_frame": int(visual_segment_event_frame),
+        "visual_effect_delay_source_frames": int(visual_effect_delay_source_frames),
         "source_event_time_ms": None
         if source_fps <= 0.0
         else 1000.0 * float(segment_event_frame) / source_fps,
@@ -1921,11 +1942,16 @@ class OnlineWarpTrainingCache:
         event_resampled_frame = None
         event_alignment = None
         if category in {"place", "mine"}:
+            event_aligned_request = requested_chunk_mode in {
+                "interaction_event_first",
+                "interaction_event_later",
+            }
             event_alignment = event_alignment_from_row(
                 row,
                 prepared["source_indices"],
                 source_fps=float(row.get("fps", 0.0) or 0.0),
                 target_fps=float(getattr(self.exact_args, "online_target_fps", 0.0) or 0.0),
+                visual_effect_delay_source_frames=1 if event_aligned_request else 0,
             )
             event_resampled_frame = int(event_alignment["resampled_event_frame"])
             event_end_frame = None
@@ -1992,6 +2018,10 @@ class OnlineWarpTrainingCache:
                         "action_end_frame": None if event_end_frame is None else int(event_end_frame),
                         "complete_frame": complete_frame,
                         "source_event_frame": event_alignment["source_event_frame"],
+                        "visual_source_event_frame": event_alignment["visual_source_event_frame"],
+                        "visual_effect_delay_source_frames": event_alignment[
+                            "visual_effect_delay_source_frames"
+                        ],
                         "source_event_time_ms": event_alignment["source_event_time_ms"],
                     }
                 ]
@@ -2374,6 +2404,12 @@ class OnlineWarpTrainingCache:
                 "source_fps": float(row.get("fps", 0.0) or 0.0),
                 "target_fps": float(getattr(self.exact_args, "online_target_fps", 0.0) or 0.0),
                 "source_event_frame": None if event_alignment is None else event_alignment["source_event_frame"],
+                "visual_source_event_frame": None
+                if event_alignment is None
+                else event_alignment["visual_source_event_frame"],
+                "visual_effect_delay_source_frames": None
+                if event_alignment is None
+                else event_alignment["visual_effect_delay_source_frames"],
                 "source_event_time_ms": None
                 if event_alignment is None
                 else event_alignment["source_event_time_ms"],

@@ -262,6 +262,7 @@ def candidate_config_payload(args, wah_recipe):
         "event_aligned_interaction",
     )
     values = {key: str(getattr(args, key, None)) for key in keys}
+    values["event_alignment_schema"] = "telemetry_action_then_visual_source_plus_one_v2"
     for model_key in ("base_model_path", "transformer_path", "camera_checkpoint"):
         values[f"{model_key}_fingerprint"] = model_artifact_fingerprint(getattr(args, model_key, None))
     values["wah_recipe"] = dict(wah_recipe or {})
@@ -298,6 +299,13 @@ def fixed_identity_from_row(row):
     }
     if _identity_text(row.get("reference_frame_index")):
         identity["reference_frame_index"] = int(row.get("reference_frame_index"))
+    for key in (
+        "telemetry_source_event_frame",
+        "visual_source_event_frame",
+        "visual_effect_delay_source_frames",
+    ):
+        if _identity_text(row.get(key)):
+            identity[key] = int(row.get(key))
     return identity
 
 
