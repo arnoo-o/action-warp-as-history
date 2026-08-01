@@ -442,7 +442,7 @@ def write_review_index(path, rows):
     )
     grouped = {name: [] for name in groups}
     for row in rows:
-        if row.get("review_status") != "pending" or not str(row.get("teacher_overlay_path", "") or "").strip():
+        if not str(row.get("teacher_overlay_path", "") or "").strip():
             continue
         action = "negative" if is_negative_action(row.get("action_type")) else str(row.get("action_type", ""))
         key = f"{action}|{row.get('history_type', '')}"
@@ -456,7 +456,7 @@ def write_review_index(path, rows):
         ".card{background:white;border:1px solid #c7c2b5;padding:10px}.card img{width:100%;height:auto}",
         "code{font-size:12px;overflow-wrap:anywhere}.rejected{border-color:#b64632}</style></head><body>",
         "<h1>Minecraft fixed teacher review</h1>",
-        "<p>This page shows pending candidates only. Rejected preparation rows remain in the adjacent CSV and audit JSON.</p>",
+        "<p>This page shows all candidates with review images. Automated rejected rows remain visible with their warning.</p>",
     ]
     for group in groups:
         entries = grouped[group]
@@ -476,6 +476,7 @@ def write_review_index(path, rows):
                 f"{html.escape(label)}: <code>{html.escape(str(row.get(field, '')))}</code>"
                 for label, field in (
                     ("event_id", "event_id"),
+                    ("review_status", "review_status"),
                     ("action_type", "action_type"),
                     ("block_id", "block_id"),
                     ("history_type", "history_type"),
@@ -783,9 +784,14 @@ def main():
     review_index_path = args.output_dir / "review_index.html"
     write_review_index(review_index_path, output)
     combination_counts = Counter()
+    reviewable_action_counts = Counter()
+    reviewable_combination_counts = Counter()
     for row in output:
         action = "negative" if is_negative_action(row.get("action_type")) else str(row.get("action_type", ""))
         combination_counts[f"{action}|{row.get('history_type', '')}"] += 1
+        if str(row.get("teacher_overlay_path", "") or "").strip():
+            reviewable_action_counts[action] += 1
+            reviewable_combination_counts[f"{action}|{row.get('history_type', '')}"] += 1
     (args.output_dir / "teacher_pool_audit.json").write_text(
         json.dumps(
             {
@@ -795,6 +801,8 @@ def main():
                 "rejected": sum(row.get("review_status") == "rejected" for row in output),
                 "rejection_counts": dict(rejection_counts),
                 "action_history_counts": dict(combination_counts),
+                "reviewable_action_counts": dict(reviewable_action_counts),
+                "reviewable_action_history_counts": dict(reviewable_combination_counts),
                 "recipe": recipe,
                 "manifest": str(manifest_path),
                 "review_index": str(review_index_path),

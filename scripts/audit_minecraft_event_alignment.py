@@ -40,7 +40,7 @@ def main():
         rows = [
             row
             for row in csv.DictReader(handle)
-            if row.get("review_status") == "pending"
+            if str(row.get("teacher_overlay_path", "") or "").strip()
             and (not args.action_type or row.get("action_type") == args.action_type)
         ][: args.limit]
 
