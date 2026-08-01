@@ -259,7 +259,7 @@ def main():
         matches = [
             click
             for click in click_edges_by_segment[segment_id]
-            if stat_local - 3 <= click <= stat_local + 1
+            if stat_local - 8 <= click <= stat_local + 1
             and click not in consumed_place_clicks[segment_id]
         ]
         if not matches:
@@ -288,7 +288,9 @@ def main():
             result["place_click_to_stat_delay"] = str(stat_local - click_local)
             result["telemetry_confidence"] = "placeable_use_item_plus_left_click_edge"
             result["telemetry_event_source_frame"] = str(source_start + stat_local)
-            result["visual_start_source_frame"] = str(source_start + max(click_local + 1, stat_local))
+            # The rendered placement appears on the observation after the click;
+            # use_item statistics are bookkeeping and commonly lag by 5-6 frames.
+            result["visual_start_source_frame"] = str(source_start + click_local + 1)
             output.append(result)
         elif category == "mine":
             actions_path = Path(row["actions_path"])

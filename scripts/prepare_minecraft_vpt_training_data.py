@@ -420,7 +420,7 @@ def inspect_pair(video_path: Path, actions_path: Path, args: argparse.Namespace)
         matches = [
             click
             for click in place_click_edges
-            if event.frame - 3 <= click <= event.frame + 1 and click not in consumed_place_clicks
+            if event.frame - 8 <= click <= event.frame + 1 and click not in consumed_place_clicks
         ]
         if not matches:
             rejected_use_item_counts[f"{event.object_id}:missing_left_click_edge"] += event.delta

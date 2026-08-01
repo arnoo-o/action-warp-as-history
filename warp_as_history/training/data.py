@@ -320,8 +320,7 @@ def event_alignment_from_row(
         visual_source_frame = int(row["visual_start_source_frame"])
     elif align_to_visual_start and action_type == "place":
         click = int(row.get("place_click_source_frame", source_event_frame) or source_event_frame)
-        stat = int(row.get("place_stat_source_frame", source_event_frame) or source_event_frame)
-        visual_source_frame = max(click + 1, stat)
+        visual_source_frame = click + 1
     elif align_to_visual_start and action_type == "mine_active":
         visual_source_frame = int(row.get("action_start_frame", source_event_frame) or source_event_frame)
     elif align_to_visual_start and action_type == "mine_complete":

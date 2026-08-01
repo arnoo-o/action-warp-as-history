@@ -319,6 +319,8 @@ def save_review_contact_sheet(
         f"reference={row.get('reference_frame_index')}  target_indices={row.get('target_indices')}\n"
         f"telemetry_source={row.get('telemetry_source_event_frame')}  "
         f"visual_start={row.get('visual_start_source_frame')}  reference_source={row.get('reference_source_frame')}\n"
+        f"place_click={row.get('place_click_source_frame')}  place_stat={row.get('place_stat_source_frame')}  "
+        f"click_to_stat_delay={row.get('place_click_to_stat_delay')}\n"
         f"teacher_source_frames={row.get('teacher_rgb_source_frames')}  "
         f"teacher_resampled={row.get('teacher_resampled_indices')}\n"
         f"hand_area={row.get('hand_mask_area_ratio')}  dynamic_hand_area={row.get('dynamic_hand_mask_area_ratio')}\n"

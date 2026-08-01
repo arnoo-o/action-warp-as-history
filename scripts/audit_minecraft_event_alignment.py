@@ -99,6 +99,9 @@ def main():
                 "visual_start_source_local_frame": visual_start,
                 "reference_source_frame": row.get("reference_source_frame"),
                 "teacher_rgb_source_frames": row.get("teacher_rgb_source_frames"),
+                "place_click_source_frame": row.get("place_click_source_frame"),
+                "place_stat_source_frame": row.get("place_stat_source_frame"),
+                "place_click_to_stat_delay": row.get("place_click_to_stat_delay"),
                 "frame_delta_p95": dict(zip(frame_indices, scores)),
             }
         )
