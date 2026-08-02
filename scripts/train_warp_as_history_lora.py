@@ -2432,9 +2432,17 @@ def main():
             if param.grad is None or not name.startswith("interaction_conditioning."):
                 continue
             value = float(param.grad.detach().float().square().sum().item())
-            if ".router." in name or ".semantic_encoder." in name:
+            if (
+                ".router." in name
+                or ".semantic_encoder." in name
+                or ".router_reference_projection." in name
+            ):
                 router_grad_sq += value
-            elif ".adapter." in name:
+            elif (
+                ".adapter." in name
+                or ".highres_adapter." in name
+                or ".adapter_reference_projection." in name
+            ):
                 adapter_grad_sq += value
         grad_norm = None
         if float(args.max_grad_norm) > 0:
@@ -2445,9 +2453,17 @@ def main():
         for name, before in trainable_before.items():
             param = dict(pipe.transformer.named_parameters())[name]
             value = float((param.detach().float() - before).square().sum().item())
-            if ".router." in name or ".semantic_encoder." in name:
+            if (
+                ".router." in name
+                or ".semantic_encoder." in name
+                or ".router_reference_projection." in name
+            ):
                 router_update_sq += value
-            elif ".adapter." in name:
+            elif (
+                ".adapter." in name
+                or ".highres_adapter." in name
+                or ".adapter_reference_projection." in name
+            ):
                 adapter_update_sq += value
         stats["interaction_router_grad_norm"] = math.sqrt(router_grad_sq)
         stats["interaction_adapter_grad_norm"] = math.sqrt(adapter_grad_sq)
