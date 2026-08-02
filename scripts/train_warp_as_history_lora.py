@@ -901,6 +901,20 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
             reference_candidate_latents = item.get("reference_latents")
             if reference_candidate_latents is None:
                 reference_candidate_latents = torch.zeros_like(target[:, :, :1])
+            reference_frame = item.get("reference_frame")
+            if reference_frame is None:
+                if normalized_action != "none":
+                    raise RuntimeError(
+                        f"Event-aligned candidate {row.get('event_id')}:{history_type} has no reference frame."
+                    )
+                # Negative samples do not inject interaction features. Keep their
+                # cache schema complete with the legal first-frame anchor used by WAH.
+                target_frames = item.get("target_frames", [])
+                if not target_frames:
+                    raise RuntimeError(
+                        f"Negative candidate {row.get('event_id')}:{history_type} has no anchor frame."
+                    )
+                reference_frame = target_frames[0]
             np.savez_compressed(
                 candidate_path,
                 target_latents=target[0].cpu().numpy().astype(np.float16),
@@ -911,7 +925,7 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                 world_valid=aligned["world_valid"][0].cpu().numpy().astype(np.float16),
                 target_rgb=target_rgb,
                 warp_rgb=warp_rgb,
-                reference_rgb=np.asarray(item["reference_frame"].convert("RGB"), dtype=np.uint8),
+                reference_rgb=np.asarray(reference_frame.convert("RGB"), dtype=np.uint8),
                 visibility_rgb=visibility_rgb.astype(np.float16),
                 world_valid_rgb=world_valid_rgb.astype(np.float16),
                 interaction_payload_json=np.asarray(json.dumps(interaction_payload, ensure_ascii=False)),
