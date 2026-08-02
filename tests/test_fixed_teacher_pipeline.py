@@ -313,6 +313,50 @@ class FixedTeacherPoolTest(unittest.TestCase):
         )
         self.assertAlmostEqual(stats["teacher_area_ratio"], 0.5)
 
+    def test_global_edge_teacher_rejects_distributed_edge_fragments(self):
+        teacher = np.zeros((3, 64, 64), dtype=np.float32)
+        for y in range(3, 64, 8):
+            for x in range(1, 58, 8):
+                teacher[:, y, x : x + 5] = 1.0
+        statistics = BUILDER.global_edge_teacher_statistics(
+            teacher,
+            teacher.copy(),
+            np.ones_like(teacher),
+            0.25,
+        )
+        recipe = {
+            "min_overlap": 0.30,
+            "max_largest_component_ratio": 0.45,
+            "min_components": 24,
+            "min_grid_coverage": 0.50,
+        }
+        self.assertTrue(BUILDER.is_global_edge_teacher(statistics, recipe))
+        self.assertGreaterEqual(statistics["teacher_significant_component_count"], 24)
+        self.assertGreaterEqual(statistics["teacher_grid_coverage_ratio"], 0.50)
+
+    def test_global_edge_teacher_keeps_compact_interaction_region(self):
+        teacher = np.zeros((3, 64, 64), dtype=np.float32)
+        teacher[:, 20:44, 20:44] = 1.0
+        old_edge = np.zeros_like(teacher)
+        old_edge[:, 20, 20:44] = 1.0
+        old_edge[:, 43, 20:44] = 1.0
+        old_edge[:, 20:44, 20] = 1.0
+        old_edge[:, 20:44, 43] = 1.0
+        statistics = BUILDER.global_edge_teacher_statistics(
+            teacher,
+            old_edge,
+            np.ones_like(teacher),
+            0.25,
+        )
+        recipe = {
+            "min_overlap": 0.30,
+            "max_largest_component_ratio": 0.45,
+            "min_components": 24,
+            "min_grid_coverage": 0.50,
+        }
+        self.assertFalse(BUILDER.is_global_edge_teacher(statistics, recipe))
+        self.assertGreater(statistics["teacher_largest_component_ratio"], 0.90)
+
     def test_negative_allows_zero_stage0_tokens(self):
         self.assertEqual(validate_stage0_positive_tokens("none", 0), 0)
         stats = BUILDER.fixed_teacher_statistics(

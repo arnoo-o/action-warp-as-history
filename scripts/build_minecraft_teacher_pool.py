@@ -8,6 +8,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -33,6 +34,10 @@ def parse_args():
     parser.add_argument("--min_area_mine_complete", type=float, default=0.001)
     parser.add_argument("--min_area_mine_active", type=float, default=0.0005)
     parser.add_argument("--max_area", type=float, default=0.25)
+    parser.add_argument("--global_edge_min_overlap", type=float, default=0.30)
+    parser.add_argument("--global_edge_max_largest_component_ratio", type=float, default=0.45)
+    parser.add_argument("--global_edge_min_components", type=int, default=24)
+    parser.add_argument("--global_edge_min_grid_coverage", type=float, default=0.50)
     parser.add_argument("--stage0_grid", type=int, nargs=3, default=[9, 6, 10], metavar=("T", "H", "W"))
     parser.add_argument("--review_manifest_name", default="teacher_pool_review_manifest.csv")
     return parser.parse_args()
@@ -353,6 +358,10 @@ def save_review_contact_sheet(
         f"teacher_source_frames={row.get('teacher_rgb_source_frames')}  "
         f"teacher_resampled={row.get('teacher_resampled_indices')}\n"
         f"hand_area={row.get('hand_mask_area_ratio')}  dynamic_hand_area={row.get('dynamic_hand_mask_area_ratio')}\n"
+        f"edge_overlap={row.get('teacher_old_edge_overlap_ratio')}  "
+        f"largest_component={row.get('teacher_largest_component_ratio')}  "
+        f"components={row.get('teacher_significant_component_count')}  "
+        f"grid_coverage={row.get('teacher_grid_coverage_ratio')}\n"
         f"invalid_reasons={'|'.join(reasons) or 'none'}"
     )
     draw.multiline_text((8, 8), summary, fill="black", font=font, spacing=3)
@@ -440,6 +449,61 @@ def fixed_teacher_statistics(
     }
 
 
+def global_edge_teacher_statistics(teacher, old_edge, valid, support_threshold, *, grid_size=8):
+    teacher = np.asarray(teacher, dtype=np.float32)
+    old_edge = np.asarray(old_edge, dtype=np.float32)
+    valid = np.asarray(valid, dtype=np.float32)
+    if teacher.shape != old_edge.shape or teacher.shape != valid.shape:
+        raise ValueError(
+            f"Global-edge teacher inputs must match: {teacher.shape}, {old_edge.shape}, {valid.shape}"
+        )
+    support = (teacher > float(support_threshold)) & (valid > 0)
+    support_count = int(support.sum())
+    edge_overlap_ratio = float(
+        (support & (old_edge > 0.5)).sum() / max(support_count, 1)
+    )
+    spatial_support = support.any(axis=0).astype(np.uint8)
+    spatial_count = int(spatial_support.sum())
+    component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(
+        spatial_support, connectivity=8
+    )
+    component_areas = (
+        component_stats[1:, cv2.CC_STAT_AREA]
+        if component_count > 1
+        else np.asarray([], dtype=np.int32)
+    )
+    significant_component_count = int((component_areas >= 8).sum())
+    largest_component_ratio = float(
+        component_areas.max() / max(spatial_count, 1)
+    ) if component_areas.size else 0.0
+    height, width = spatial_support.shape
+    occupied_cells = 0
+    for grid_y in range(int(grid_size)):
+        y0 = grid_y * height // int(grid_size)
+        y1 = (grid_y + 1) * height // int(grid_size)
+        for grid_x in range(int(grid_size)):
+            x0 = grid_x * width // int(grid_size)
+            x1 = (grid_x + 1) * width // int(grid_size)
+            occupied_cells += int(spatial_support[y0:y1, x0:x1].any())
+    grid_coverage_ratio = float(occupied_cells / max(int(grid_size) ** 2, 1))
+    return {
+        "teacher_old_edge_overlap_ratio": edge_overlap_ratio,
+        "teacher_largest_component_ratio": largest_component_ratio,
+        "teacher_significant_component_count": significant_component_count,
+        "teacher_grid_coverage_ratio": grid_coverage_ratio,
+    }
+
+
+def is_global_edge_teacher(statistics, recipe):
+    return bool(
+        statistics["teacher_old_edge_overlap_ratio"] >= float(recipe["min_overlap"])
+        and statistics["teacher_largest_component_ratio"]
+        <= float(recipe["max_largest_component_ratio"])
+        and statistics["teacher_significant_component_count"] >= int(recipe["min_components"])
+        and statistics["teacher_grid_coverage_ratio"] >= float(recipe["min_grid_coverage"])
+    )
+
+
 def rejected_manifest_row(row, reasons):
     return {
         **row,
@@ -447,6 +511,11 @@ def rejected_manifest_row(row, reasons):
         "teacher_overlay_path": "",
         "teacher_cache_key": "",
         "teacher_area_ratio": "0.00000000",
+        "teacher_old_edge_overlap_ratio": "0.00000000",
+        "teacher_largest_component_ratio": "0.00000000",
+        "teacher_significant_component_count": "0",
+        "teacher_grid_coverage_ratio": "0.00000000",
+        "teacher_global_edge_like": "false",
         "hand_mask_area_ratio": "0.00000000",
         "dynamic_hand_mask_area_ratio": "0.00000000",
         "stage0_positive_tokens": "0",
@@ -510,6 +579,11 @@ def write_review_index(path, rows):
                     ("block_id", "block_id"),
                     ("history_type", "history_type"),
                     ("teacher_area_ratio", "teacher_area_ratio"),
+                    ("old_edge_overlap", "teacher_old_edge_overlap_ratio"),
+                    ("largest_component", "teacher_largest_component_ratio"),
+                    ("significant_components", "teacher_significant_component_count"),
+                    ("grid_coverage", "teacher_grid_coverage_ratio"),
+                    ("global_edge_like", "teacher_global_edge_like"),
                     ("stage0_positive_tokens", "stage0_positive_tokens"),
                     ("hand_mask_area_ratio", "hand_mask_area_ratio"),
                     ("dynamic_hand_mask_area_ratio", "dynamic_hand_mask_area_ratio"),
@@ -533,13 +607,19 @@ def main():
         "support_threshold": args.support_threshold,
         "z_cap": args.z_cap,
         "max_area": args.max_area,
+        "global_edge_filter": {
+            "min_overlap": args.global_edge_min_overlap,
+            "max_largest_component_ratio": args.global_edge_max_largest_component_ratio,
+            "min_components": args.global_edge_min_components,
+            "min_grid_coverage": args.global_edge_min_grid_coverage,
+        },
         "min_area": {
             "place": args.min_area_place,
             "mine_complete": args.min_area_mine_complete,
             "mine_active": args.min_area_mine_active,
         },
         "teacher": "RGB dual residual per-frame median/MAD with quantile fallback",
-        "old_edge_weight": "dilated Sobel, clip(1-0.75*edge,0.25,1)",
+        "old_edge_weight": "dilated Sobel, clip(1-0.95*edge,0.05,1) plus local thin-line suppression",
         "temporal_smoothing": "0.5 current + 0.25 previous + 0.25 following",
         "hand_mask": "small_normalized_static+seed_connected_dynamic_all_positive_v2",
         "teacher_rgb_frames": 7,
@@ -695,6 +775,15 @@ def main():
         stage0_positive_tokens = statistics["stage0_positive_tokens"]
         valid_count = float(statistics["valid_action_region"].sum())
         area = statistics["teacher_area_ratio"]
+        edge_statistics = global_edge_teacher_statistics(
+            teacher_rgb,
+            old_edge_rgb,
+            valid_rgb,
+            args.support_threshold,
+        )
+        global_edge_like = is_global_edge_teacher(
+            edge_statistics, recipe["global_edge_filter"]
+        )
         min_area = float(recipe["min_area"].get(action_type, args.min_area_place))
         if is_negative:
             target_indices = [int(value) for value in identity.get("target_indices", [])]
@@ -738,6 +827,8 @@ def main():
                 reasons.append("teacher_too_small")
             if area > float(args.max_area):
                 reasons.append("teacher_too_large")
+            if global_edge_like:
+                reasons.append("global_edge_teacher")
         cache_payload = {
             "candidate": str(candidate_path.resolve()),
             "candidate_sha256": str(row.get("candidate_npz_sha256", "")),
@@ -769,10 +860,34 @@ def main():
             candidate_npz_sha256=np.asarray(str(row.get("candidate_npz_sha256", ""))),
             training_cache_sha256=np.asarray(str(row.get("training_cache_sha256", ""))),
             candidate_identity_json=np.asarray(json.dumps(identity, ensure_ascii=False, sort_keys=True)),
+            teacher_old_edge_overlap_ratio=np.asarray(
+                edge_statistics["teacher_old_edge_overlap_ratio"], dtype=np.float32
+            ),
+            teacher_largest_component_ratio=np.asarray(
+                edge_statistics["teacher_largest_component_ratio"], dtype=np.float32
+            ),
+            teacher_significant_component_count=np.asarray(
+                edge_statistics["teacher_significant_component_count"], dtype=np.int32
+            ),
+            teacher_grid_coverage_ratio=np.asarray(
+                edge_statistics["teacher_grid_coverage_ratio"], dtype=np.float32
+            ),
+            teacher_global_edge_like=np.asarray(global_edge_like),
         )
         row["teacher_area_ratio"] = f"{area:.8f}"
         row["hand_mask_area_ratio"] = f"{hand_mask_area_ratio:.8f}"
         row["dynamic_hand_mask_area_ratio"] = f"{dynamic_hand_mask_area_ratio:.8f}"
+        row.update(
+            {
+                "teacher_old_edge_overlap_ratio": f'{edge_statistics["teacher_old_edge_overlap_ratio"]:.8f}',
+                "teacher_largest_component_ratio": f'{edge_statistics["teacher_largest_component_ratio"]:.8f}',
+                "teacher_significant_component_count": str(
+                    edge_statistics["teacher_significant_component_count"]
+                ),
+                "teacher_grid_coverage_ratio": f'{edge_statistics["teacher_grid_coverage_ratio"]:.8f}',
+                "teacher_global_edge_like": str(global_edge_like).lower(),
+            }
+        )
         save_review_contact_sheet(
             preview_path,
             payload,
@@ -799,6 +914,13 @@ def main():
                 "stage0_positive_tokens": str(stage0_positive_tokens),
                 "hand_mask_area_ratio": f"{hand_mask_area_ratio:.8f}",
                 "dynamic_hand_mask_area_ratio": f"{dynamic_hand_mask_area_ratio:.8f}",
+                "teacher_old_edge_overlap_ratio": f'{edge_statistics["teacher_old_edge_overlap_ratio"]:.8f}',
+                "teacher_largest_component_ratio": f'{edge_statistics["teacher_largest_component_ratio"]:.8f}',
+                "teacher_significant_component_count": str(
+                    edge_statistics["teacher_significant_component_count"]
+                ),
+                "teacher_grid_coverage_ratio": f'{edge_statistics["teacher_grid_coverage_ratio"]:.8f}',
+                "teacher_global_edge_like": str(global_edge_like).lower(),
                 "teacher_invalid_reasons": "|".join(reasons),
                 "teacher_valid": str(not reasons).lower(),
                 "review_status": "pending" if not reasons else "rejected",
