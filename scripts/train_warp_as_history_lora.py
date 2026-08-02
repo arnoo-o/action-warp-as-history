@@ -707,6 +707,22 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows = []
     source_digest_cache = {}
+    existing_candidates = {}
+    expected_config_hash = str(exact_args.fixed_teacher_config_hash)
+    for existing_path in output_dir.glob("*.npz"):
+        training_path = existing_path.with_suffix(".pt")
+        if not training_path.is_file():
+            continue
+        try:
+            with np.load(existing_path, allow_pickle=False) as payload:
+                identity = json.loads(str(payload["candidate_identity_json"].item()))
+                rgb_to_latent = [int(value) for value in payload["rgb_frame_to_latent_index"].tolist()]
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if str(identity.get("candidate_config_hash", "")) != expected_config_hash:
+            continue
+        key = (str(identity.get("event_id", "")), str(identity.get("history_type", "")))
+        existing_candidates[key] = (existing_path, training_path, identity, rgb_to_latent)
     event_aligned = bool(getattr(exact_args, "event_aligned_interaction", False))
     candidate_action_ratios = tuple(float(value) for value in exact_args.teacher_candidate_action_ratios)
     candidate_history_ratios = tuple(float(value) for value in exact_args.teacher_candidate_history_ratios)
@@ -785,6 +801,52 @@ def export_teacher_candidates(items, df, exact_args, output_dir, limit=0):
                         }
                     )
                     continue
+            existing = existing_candidates.get((str(row.get("event_id", "")), history_type))
+            if existing is not None:
+                candidate_path, training_cache_path, identity, rgb_to_latent = existing
+                candidate_name = str(identity["candidate_cache_key"])
+                manifest_rows.append(
+                    {
+                        **row.to_dict(),
+                        "history_type": history_type,
+                        "teacher_candidate_path": candidate_path.as_posix(),
+                        "training_cache_path": training_cache_path.as_posix(),
+                        "target_indices": encode_index_sequence(identity["target_indices"]),
+                        "reference_frame_index": identity["reference_frame_index"],
+                        "target_start_frame": identity["target_start_frame"],
+                        "event_local_frame": identity["event_local_frame"],
+                        "telemetry_source_event_frame": identity["telemetry_source_event_frame"],
+                        "telemetry_event_source_frame": identity["telemetry_source_event_frame"],
+                        "visual_source_event_frame": identity["visual_source_event_frame"],
+                        "visual_start_source_frame": identity["visual_start_source_frame"],
+                        "reference_source_frame": identity["reference_source_frame"],
+                        "teacher_rgb_source_frames": encode_index_sequence(identity["teacher_rgb_source_frames"]),
+                        "teacher_resampled_indices": encode_index_sequence(identity["teacher_resampled_indices"]),
+                        "visual_effect_delay_source_frames": identity["visual_effect_delay_source_frames"],
+                        "history_indices": encode_index_sequence(identity["history_indices"]),
+                        "geometry_keyframe_frames": encode_index_sequence(identity["geometry_keyframe_frames"]),
+                        "render_pose_indices": encode_index_sequence(identity["render_pose_indices"]),
+                        "chunk_mode": identity["chunk_mode"],
+                        "direction": identity["direction"],
+                        "source_segment_id": identity["source_segment_id"],
+                        "candidate_cache_key": candidate_name,
+                        "candidate_config_hash": identity["candidate_config_hash"],
+                        "action_type": identity["action_type"],
+                        "block_id": identity["block_id"],
+                        "object_id": identity["object_id"],
+                        "training_category": identity["training_category"],
+                        "interaction_payload_hash": identity["interaction_payload_hash"],
+                        "source_video_digest": identity["source_video_digest"],
+                        "candidate_npz_sha256": file_sha256(candidate_path),
+                        "training_cache_sha256": file_sha256(training_cache_path),
+                        "rgb_frame_to_latent_index": encode_index_sequence(rgb_to_latent),
+                        "target_reference": str(row.get("video_path", "")),
+                        "warp_reference": "reused_existing_candidate",
+                        "candidate_error": "",
+                    }
+                )
+                successful_by_cell[cell] += 1
+                continue
             try:
                 item = items.get(
                     row_index,
