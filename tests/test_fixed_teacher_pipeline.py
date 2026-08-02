@@ -317,7 +317,7 @@ class FixedTeacherPoolTest(unittest.TestCase):
         teacher = np.zeros((3, 64, 64), dtype=np.float32)
         for y in range(3, 64, 8):
             for x in range(1, 58, 8):
-                teacher[:, y, x : x + 5] = 1.0
+                teacher[:, y : y + 2, x : x + 4] = 1.0
         statistics = BUILDER.global_edge_teacher_statistics(
             teacher,
             teacher.copy(),
