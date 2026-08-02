@@ -249,6 +249,45 @@ class FixedTeacherPoolTest(unittest.TestCase):
         with self.assertRaisesRegex(FixedTeacherIntegrityError, "candidate_config_hash"):
             validate_fixed_identity(row, changed, ["config-hash", "second-batch-hash"])
 
+    def test_damaged_cache_binds_teacher_to_clean_base_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            row = dict(self.rows[0])
+            candidate = temp / "candidate.npz"
+            current_training = temp / "damaged.pt"
+            candidate.write_bytes(b"candidate")
+            current_training.write_bytes(b"damaged training cache")
+            row.update(
+                {
+                    "history_variant": "damaged",
+                    "candidate_npz_sha256": file_sha256(candidate),
+                    "training_cache_sha256": file_sha256(current_training),
+                    "base_training_cache_sha256": "clean-base-hash",
+                }
+            )
+            teacher = {
+                "candidate_npz_sha256": np.asarray(row["candidate_npz_sha256"]),
+                "training_cache_sha256": np.asarray("clean-base-hash"),
+            }
+            validate_fixed_artifact_hashes(
+                row,
+                candidate_path=candidate,
+                training_cache_path=current_training,
+                teacher_payload=teacher,
+            )
+
+    def test_damaged_cache_requires_explicit_clean_base_hash(self):
+        row = dict(self.rows[0])
+        row.update(
+            {
+                "history_variant": "damaged",
+                "candidate_npz_sha256": "candidate-hash",
+                "training_cache_sha256": "damaged-hash",
+            }
+        )
+        with self.assertRaisesRegex(FixedTeacherIntegrityError, "base_training_cache_sha256"):
+            validate_fixed_artifact_hashes(row)
+
     def test_index_or_config_mismatch_reports_event_and_history(self):
         row = self.rows[3]
         changed = cached_identity(row)

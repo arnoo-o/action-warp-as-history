@@ -342,10 +342,21 @@ def validate_fixed_identity(row, cached_identity, expected_config_hash):
 
 
 def fixed_artifact_hashes_from_row(row):
-    return {
+    hashes = {
         "candidate_npz_sha256": _identity_text(row.get("candidate_npz_sha256")),
         "training_cache_sha256": _identity_text(row.get("training_cache_sha256")),
+        "base_training_cache_sha256": _identity_text(row.get("base_training_cache_sha256")),
     }
+    history_variant = _identity_text(row.get("history_variant", "clean")).lower() or "clean"
+    if history_variant == "damaged" and not hashes["base_training_cache_sha256"]:
+        raise FixedTeacherIntegrityError(
+            "Damaged fixed-cache row is missing base_training_cache_sha256 "
+            f"event_id={_identity_text(row.get('event_id'))} "
+            f"history_type={_identity_text(row.get('history_type'))}"
+        )
+    if not hashes["base_training_cache_sha256"]:
+        hashes["base_training_cache_sha256"] = hashes["training_cache_sha256"]
+    return hashes
 
 
 def validate_fixed_artifact_hashes(
@@ -369,8 +380,16 @@ def validate_fixed_artifact_hashes(
                 differences[field] = {"manifest": expected[field], "file": actual}
         if teacher_payload is not None and field in teacher_payload:
             cached = str(teacher_payload[field].item())
-            if cached != expected[field]:
-                differences[f"teacher_{field}"] = {"manifest": expected[field], "teacher": cached}
+            teacher_expected = (
+                expected["base_training_cache_sha256"]
+                if field == "training_cache_sha256"
+                else expected[field]
+            )
+            if cached != teacher_expected:
+                differences[f"teacher_{field}"] = {
+                    "manifest": teacher_expected,
+                    "teacher": cached,
+                }
     if differences:
         raise FixedTeacherIntegrityError(
             "Fixed teacher artifact hash mismatch "
