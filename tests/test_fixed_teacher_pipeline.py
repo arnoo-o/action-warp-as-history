@@ -228,6 +228,27 @@ class FixedTeacherPoolTest(unittest.TestCase):
         with self.assertRaisesRegex(FixedTeacherIntegrityError, "candidate_cache_key"):
             validate_fixed_identity(row, changed, "config-hash")
 
+    def test_split_candidate_batches_use_locked_hash_allowlist(self):
+        first = self.rows[0]
+        second = dict(self.rows[1])
+        second["candidate_config_hash"] = "second-batch-hash"
+        allowed = ["config-hash", "second-batch-hash"]
+        validate_fixed_identity(first, cached_identity(first), allowed)
+        validate_fixed_identity(second, cached_identity(second), allowed)
+
+        unapproved = dict(second)
+        unapproved["candidate_config_hash"] = "unknown-batch-hash"
+        with self.assertRaisesRegex(FixedTeacherIntegrityError, "allowed_manifest_hashes"):
+            validate_fixed_identity(unapproved, cached_identity(unapproved), allowed)
+
+    def test_batch_allowlist_does_not_relax_cache_identity(self):
+        row = dict(self.rows[0])
+        row["candidate_config_hash"] = "second-batch-hash"
+        changed = cached_identity(row)
+        changed["candidate_config_hash"] = "config-hash"
+        with self.assertRaisesRegex(FixedTeacherIntegrityError, "candidate_config_hash"):
+            validate_fixed_identity(row, changed, ["config-hash", "second-batch-hash"])
+
     def test_index_or_config_mismatch_reports_event_and_history(self):
         row = self.rows[3]
         changed = cached_identity(row)

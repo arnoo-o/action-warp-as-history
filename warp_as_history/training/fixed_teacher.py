@@ -311,6 +311,14 @@ def fixed_identity_from_row(row):
     return identity
 
 
+def _allowed_config_hashes(expected_config_hash):
+    if isinstance(expected_config_hash, str):
+        values = [expected_config_hash]
+    else:
+        values = list(expected_config_hash or [])
+    return {str(value) for value in values if str(value)}
+
+
 def validate_fixed_identity(row, cached_identity, expected_config_hash):
     expected = fixed_identity_from_row(row)
     differences = {}
@@ -318,10 +326,11 @@ def validate_fixed_identity(row, cached_identity, expected_config_hash):
         actual_value = cached_identity.get(key)
         if actual_value != expected_value:
             differences[key] = {"manifest": expected_value, "cache": actual_value}
-    if str(expected["candidate_config_hash"]) != str(expected_config_hash):
+    allowed_hashes = _allowed_config_hashes(expected_config_hash)
+    if str(expected["candidate_config_hash"]) not in allowed_hashes:
         differences["runtime_config_hash"] = {
             "manifest": expected["candidate_config_hash"],
-            "runtime": str(expected_config_hash),
+            "allowed_manifest_hashes": sorted(allowed_hashes),
         }
     if differences:
         raise FixedTeacherIntegrityError(

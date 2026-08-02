@@ -3041,8 +3041,14 @@ def load_fixed_teacher_training_item(row, exact_args, device, *, requested_categ
     cached = torch.load(training_cache_path, map_location="cpu", weights_only=False)
     if int(cached.get("schema_version", 0)) not in {1, 2}:
         raise FixedTeacherIntegrityError(f"Unsupported fixed training cache schema: {training_cache_path}")
-    expected_config_hash = str(getattr(exact_args, "fixed_teacher_config_hash", ""))
-    identity = validate_fixed_identity(row, dict(cached.get("candidate_identity", {})), expected_config_hash)
+    expected_config_hashes = getattr(exact_args, "fixed_teacher_config_hashes", None)
+    if not expected_config_hashes:
+        expected_config_hashes = [str(getattr(exact_args, "fixed_teacher_config_hash", ""))]
+    identity = validate_fixed_identity(
+        row,
+        dict(cached.get("candidate_identity", {})),
+        expected_config_hashes,
+    )
     if interaction_payload_hash(cached.get("interaction_payload")) != identity["interaction_payload_hash"]:
         raise FixedTeacherIntegrityError(
             "Fixed training payload hash mismatch "
@@ -3050,10 +3056,10 @@ def load_fixed_teacher_training_item(row, exact_args, device, *, requested_categ
         )
     with np.load(candidate_path) as candidate_payload:
         candidate_identity = json.loads(str(candidate_payload["candidate_identity_json"].item()))
-        validate_fixed_identity(row, candidate_identity, expected_config_hash)
+        validate_fixed_identity(row, candidate_identity, expected_config_hashes)
     teacher_payload = np.load(teacher_cache_path)
     teacher_identity = json.loads(str(teacher_payload["candidate_identity_json"].item()))
-    validate_fixed_identity(row, teacher_identity, expected_config_hash)
+    validate_fixed_identity(row, teacher_identity, expected_config_hashes)
     validate_fixed_artifact_hashes(
         row,
         candidate_path=candidate_path,
@@ -3062,12 +3068,13 @@ def load_fixed_teacher_training_item(row, exact_args, device, *, requested_categ
     )
     teacher_candidate_key = str(teacher_payload["candidate_cache_key"].item())
     teacher_config_hash = str(teacher_payload["candidate_config_hash"].item())
-    if teacher_candidate_key != identity["candidate_cache_key"] or teacher_config_hash != expected_config_hash:
+    row_config_hash = str(identity["candidate_config_hash"])
+    if teacher_candidate_key != identity["candidate_cache_key"] or teacher_config_hash != row_config_hash:
         raise FixedTeacherIntegrityError(
             "Fixed teacher cache identity mismatch "
             f"event_id={identity['event_id']} history_type={history_type}: "
             f"manifest_candidate={identity['candidate_cache_key']} teacher_candidate={teacher_candidate_key} "
-            f"runtime_config={expected_config_hash} teacher_config={teacher_config_hash}"
+            f"manifest_config={row_config_hash} teacher_config={teacher_config_hash}"
         )
     teacher_array = np.asarray(teacher_payload["teacher"]).copy()
     teacher_payload.close()

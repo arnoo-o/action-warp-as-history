@@ -320,6 +320,9 @@ def training_resume_contract(args, *, camera_fingerprint=None):
             args.flow_matching_train_exact_timestep_sampling
         ),
         "candidate_config_hash": str(getattr(args, "fixed_teacher_config_hash", "")),
+        "candidate_config_hashes": sorted(
+            str(value) for value in (getattr(args, "fixed_teacher_config_hashes", []) or [])
+        ),
         "later_damage_ratios": [float(value) for value in args.interaction_later_damage_ratios],
     }
 
@@ -1852,16 +1855,30 @@ def main():
         vae_temporal_scale=int(pipe.vae_scale_factor_temporal),
     )
     exact_args.vae_temporal_scale = int(pipe.vae_scale_factor_temporal)
-    if args.resume_from_checkpoint is not None:
+    runtime_config_hash = candidate_config_hash(args, pipe.transformer._wah_recipe)
+    exact_args.fixed_teacher_config_hash = runtime_config_hash
+    if fixed_cache_only:
         manifest_config_hashes = sorted(
-            set(str(value) for value in df["candidate_config_hash"].tolist())
+            set(str(value) for value in df["candidate_config_hash"].tolist() if str(value))
         )
-        if len(manifest_config_hashes) != 1:
-            raise ValueError(f"Resume requires one candidate_config_hash, got {manifest_config_hashes}.")
-        exact_args.fixed_teacher_config_hash = manifest_config_hashes[0]
+        if not manifest_config_hashes:
+            raise ValueError("Fixed-cache training requires candidate_config_hash on every approved row.")
+        exact_args.fixed_teacher_config_hashes = manifest_config_hashes
+        print(
+            json.dumps(
+                {
+                    "event": "fixed_teacher_batch_contract",
+                    "runtime_config_hash": runtime_config_hash,
+                    "allowed_manifest_hashes": manifest_config_hashes,
+                    "validation": "row identity + row batch hash + artifact SHA256",
+                }
+            ),
+            flush=True,
+        )
     else:
-        exact_args.fixed_teacher_config_hash = candidate_config_hash(args, pipe.transformer._wah_recipe)
+        exact_args.fixed_teacher_config_hashes = [runtime_config_hash]
     args.fixed_teacher_config_hash = str(exact_args.fixed_teacher_config_hash)
+    args.fixed_teacher_config_hashes = list(exact_args.fixed_teacher_config_hashes)
     args.training_resume_contract = training_resume_contract(args)
     mean, std = opt.latent_stats(pipe, device)
 
