@@ -357,6 +357,73 @@ class FixedTeacherPoolTest(unittest.TestCase):
         self.assertFalse(BUILDER.is_global_edge_teacher(statistics, recipe))
         self.assertGreater(statistics["teacher_largest_component_ratio"], 0.90)
 
+    def test_mining_spatial_filter_keeps_particles_but_rejects_global_noise(self):
+        recipe = {
+            "min_overlap": 0.30,
+            "max_largest_component_ratio": 0.45,
+            "min_components": 24,
+            "min_grid_coverage": 0.50,
+            "mining": {
+                "active_dense_min_area": 0.20,
+                "active_dense_min_grid_coverage": 0.90,
+                "fragment_min_components": 200,
+                "fragment_min_grid_coverage": 0.75,
+                "fragment_min_thin_ratio": 0.10,
+                "fragment_max_largest_component_ratio": 0.25,
+            },
+        }
+        good_samples = (
+            {
+                "teacher_old_edge_overlap_ratio": 0.066,
+                "teacher_largest_component_ratio": 0.167,
+                "teacher_significant_component_count": 94,
+                "teacher_grid_coverage_ratio": 0.625,
+                "teacher_thin_support_ratio": 0.006,
+            },
+            {
+                "teacher_old_edge_overlap_ratio": 0.074,
+                "teacher_largest_component_ratio": 0.098,
+                "teacher_significant_component_count": 140,
+                "teacher_grid_coverage_ratio": 0.547,
+                "teacher_thin_support_ratio": 0.013,
+            },
+        )
+        for statistics in good_samples:
+            with self.subTest(statistics=statistics):
+                self.assertEqual(
+                    BUILDER.teacher_spatial_rejection_reasons(
+                        statistics, recipe, action_type="mine_complete", area_ratio=0.06
+                    ),
+                    [],
+                )
+
+        dense = {
+            "teacher_old_edge_overlap_ratio": 0.001,
+            "teacher_largest_component_ratio": 0.866,
+            "teacher_significant_component_count": 87,
+            "teacher_grid_coverage_ratio": 0.953,
+            "teacher_thin_support_ratio": 0.003,
+        }
+        self.assertIn(
+            "global_dense_teacher",
+            BUILDER.teacher_spatial_rejection_reasons(
+                dense, recipe, action_type="mine_active", area_ratio=0.239
+            ),
+        )
+        fragmented = {
+            "teacher_old_edge_overlap_ratio": 0.166,
+            "teacher_largest_component_ratio": 0.095,
+            "teacher_significant_component_count": 509,
+            "teacher_grid_coverage_ratio": 0.844,
+            "teacher_thin_support_ratio": 0.172,
+        }
+        self.assertIn(
+            "global_fragmented_teacher",
+            BUILDER.teacher_spatial_rejection_reasons(
+                fragmented, recipe, action_type="mine_complete", area_ratio=0.034
+            ),
+        )
+
     def test_negative_allows_zero_stage0_tokens(self):
         self.assertEqual(validate_stage0_positive_tokens("none", 0), 0)
         stats = BUILDER.fixed_teacher_statistics(

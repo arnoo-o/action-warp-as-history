@@ -38,6 +38,12 @@ def parse_args():
     parser.add_argument("--global_edge_max_largest_component_ratio", type=float, default=0.45)
     parser.add_argument("--global_edge_min_components", type=int, default=24)
     parser.add_argument("--global_edge_min_grid_coverage", type=float, default=0.50)
+    parser.add_argument("--mine_active_dense_min_area", type=float, default=0.20)
+    parser.add_argument("--mine_active_dense_min_grid_coverage", type=float, default=0.90)
+    parser.add_argument("--mine_fragment_min_components", type=int, default=200)
+    parser.add_argument("--mine_fragment_min_grid_coverage", type=float, default=0.75)
+    parser.add_argument("--mine_fragment_min_thin_ratio", type=float, default=0.10)
+    parser.add_argument("--mine_fragment_max_largest_component_ratio", type=float, default=0.25)
     parser.add_argument("--stage0_grid", type=int, nargs=3, default=[9, 6, 10], metavar=("T", "H", "W"))
     parser.add_argument("--review_manifest_name", default="teacher_pool_review_manifest.csv")
     return parser.parse_args()
@@ -361,7 +367,8 @@ def save_review_contact_sheet(
         f"edge_overlap={row.get('teacher_old_edge_overlap_ratio')}  "
         f"largest_component={row.get('teacher_largest_component_ratio')}  "
         f"components={row.get('teacher_significant_component_count')}  "
-        f"grid_coverage={row.get('teacher_grid_coverage_ratio')}\n"
+        f"grid_coverage={row.get('teacher_grid_coverage_ratio')}  "
+        f"thin_support={row.get('teacher_thin_support_ratio')}\n"
         f"invalid_reasons={'|'.join(reasons) or 'none'}"
     )
     draw.multiline_text((8, 8), summary, fill="black", font=font, spacing=3)
@@ -486,11 +493,16 @@ def global_edge_teacher_statistics(teacher, old_edge, valid, support_threshold, 
             x1 = (grid_x + 1) * width // int(grid_size)
             occupied_cells += int(spatial_support[y0:y1, x0:x1].any())
     grid_coverage_ratio = float(occupied_cells / max(int(grid_size) ** 2, 1))
+    local_density = cv2.blur(spatial_support.astype(np.float32), (5, 5))
+    thin_support_ratio = float(
+        ((local_density < 0.20) & (spatial_support > 0)).sum() / max(spatial_count, 1)
+    )
     return {
         "teacher_old_edge_overlap_ratio": edge_overlap_ratio,
         "teacher_largest_component_ratio": largest_component_ratio,
         "teacher_significant_component_count": significant_component_count,
         "teacher_grid_coverage_ratio": grid_coverage_ratio,
+        "teacher_thin_support_ratio": thin_support_ratio,
     }
 
 
@@ -504,6 +516,34 @@ def is_global_edge_teacher(statistics, recipe):
     )
 
 
+def teacher_spatial_rejection_reasons(statistics, recipe, *, action_type, area_ratio):
+    reasons = []
+    if is_global_edge_teacher(statistics, recipe):
+        reasons.append("global_edge_teacher")
+    action_type = str(action_type).strip().lower()
+    mining = recipe["mining"]
+    if (
+        action_type == "mine_active"
+        and float(area_ratio) >= float(mining["active_dense_min_area"])
+        and statistics["teacher_grid_coverage_ratio"]
+        >= float(mining["active_dense_min_grid_coverage"])
+    ):
+        reasons.append("global_dense_teacher")
+    if (
+        action_type in {"mine_active", "mine_complete"}
+        and statistics["teacher_significant_component_count"]
+        >= int(mining["fragment_min_components"])
+        and statistics["teacher_grid_coverage_ratio"]
+        >= float(mining["fragment_min_grid_coverage"])
+        and statistics["teacher_thin_support_ratio"]
+        >= float(mining["fragment_min_thin_ratio"])
+        and statistics["teacher_largest_component_ratio"]
+        <= float(mining["fragment_max_largest_component_ratio"])
+    ):
+        reasons.append("global_fragmented_teacher")
+    return reasons
+
+
 def rejected_manifest_row(row, reasons):
     return {
         **row,
@@ -515,6 +555,7 @@ def rejected_manifest_row(row, reasons):
         "teacher_largest_component_ratio": "0.00000000",
         "teacher_significant_component_count": "0",
         "teacher_grid_coverage_ratio": "0.00000000",
+        "teacher_thin_support_ratio": "0.00000000",
         "teacher_global_edge_like": "false",
         "hand_mask_area_ratio": "0.00000000",
         "dynamic_hand_mask_area_ratio": "0.00000000",
@@ -583,6 +624,7 @@ def write_review_index(path, rows):
                     ("largest_component", "teacher_largest_component_ratio"),
                     ("significant_components", "teacher_significant_component_count"),
                     ("grid_coverage", "teacher_grid_coverage_ratio"),
+                    ("thin_support", "teacher_thin_support_ratio"),
                     ("global_edge_like", "teacher_global_edge_like"),
                     ("stage0_positive_tokens", "stage0_positive_tokens"),
                     ("hand_mask_area_ratio", "hand_mask_area_ratio"),
@@ -612,6 +654,14 @@ def main():
             "max_largest_component_ratio": args.global_edge_max_largest_component_ratio,
             "min_components": args.global_edge_min_components,
             "min_grid_coverage": args.global_edge_min_grid_coverage,
+            "mining": {
+                "active_dense_min_area": args.mine_active_dense_min_area,
+                "active_dense_min_grid_coverage": args.mine_active_dense_min_grid_coverage,
+                "fragment_min_components": args.mine_fragment_min_components,
+                "fragment_min_grid_coverage": args.mine_fragment_min_grid_coverage,
+                "fragment_min_thin_ratio": args.mine_fragment_min_thin_ratio,
+                "fragment_max_largest_component_ratio": args.mine_fragment_max_largest_component_ratio,
+            },
         },
         "min_area": {
             "place": args.min_area_place,
@@ -781,9 +831,13 @@ def main():
             valid_rgb,
             args.support_threshold,
         )
-        global_edge_like = is_global_edge_teacher(
-            edge_statistics, recipe["global_edge_filter"]
+        spatial_reasons = teacher_spatial_rejection_reasons(
+            edge_statistics,
+            recipe["global_edge_filter"],
+            action_type=action_type,
+            area_ratio=area,
         )
+        global_edge_like = bool(spatial_reasons)
         min_area = float(recipe["min_area"].get(action_type, args.min_area_place))
         if is_negative:
             target_indices = [int(value) for value in identity.get("target_indices", [])]
@@ -827,8 +881,7 @@ def main():
                 reasons.append("teacher_too_small")
             if area > float(args.max_area):
                 reasons.append("teacher_too_large")
-            if global_edge_like:
-                reasons.append("global_edge_teacher")
+            reasons.extend(spatial_reasons)
         cache_payload = {
             "candidate": str(candidate_path.resolve()),
             "candidate_sha256": str(row.get("candidate_npz_sha256", "")),
@@ -872,6 +925,9 @@ def main():
             teacher_grid_coverage_ratio=np.asarray(
                 edge_statistics["teacher_grid_coverage_ratio"], dtype=np.float32
             ),
+            teacher_thin_support_ratio=np.asarray(
+                edge_statistics["teacher_thin_support_ratio"], dtype=np.float32
+            ),
             teacher_global_edge_like=np.asarray(global_edge_like),
         )
         row["teacher_area_ratio"] = f"{area:.8f}"
@@ -885,6 +941,7 @@ def main():
                     edge_statistics["teacher_significant_component_count"]
                 ),
                 "teacher_grid_coverage_ratio": f'{edge_statistics["teacher_grid_coverage_ratio"]:.8f}',
+                "teacher_thin_support_ratio": f'{edge_statistics["teacher_thin_support_ratio"]:.8f}',
                 "teacher_global_edge_like": str(global_edge_like).lower(),
             }
         )
@@ -920,6 +977,7 @@ def main():
                     edge_statistics["teacher_significant_component_count"]
                 ),
                 "teacher_grid_coverage_ratio": f'{edge_statistics["teacher_grid_coverage_ratio"]:.8f}',
+                "teacher_thin_support_ratio": f'{edge_statistics["teacher_thin_support_ratio"]:.8f}',
                 "teacher_global_edge_like": str(global_edge_like).lower(),
                 "teacher_invalid_reasons": "|".join(reasons),
                 "teacher_valid": str(not reasons).lower(),
