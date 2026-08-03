@@ -1410,8 +1410,17 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         state["interaction_warp_latents"] = clean_warp_latents.detach()
         state["interaction_visibility_latents"] = visibility_latents.detach()
         reference_mean, reference_std = self._latent_stats(device)
+        if source_frame.ndim == 4:
+            interaction_reference_video = source_frame.unsqueeze(2)
+        elif source_frame.ndim == 5:
+            interaction_reference_video = source_frame
+        else:
+            raise ValueError(
+                "Interaction reference must be BCHW or BCTHW, got "
+                f"shape={tuple(source_frame.shape)}."
+            )
         _, interaction_reference_latents = self.prepare_video_latents(
-            source_frame,
+            interaction_reference_video,
             latents_mean=reference_mean,
             latents_std=reference_std,
             num_latent_frames_per_chunk=1,
