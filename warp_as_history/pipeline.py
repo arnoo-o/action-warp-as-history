@@ -1857,8 +1857,11 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                     "pyramid_num_inference_steps_list must contain "
                     f"{WAH_PYRAMID_NUM_STAGES} values, got {len(pyramid_steps)}."
                 )
-            if any(step <= 0 for step in pyramid_steps):
-                raise ValueError("pyramid_num_inference_steps_list values must be positive.")
+            if pyramid_steps[0] <= 0 or any(step < 0 for step in pyramid_steps):
+                raise ValueError(
+                    "pyramid_num_inference_steps_list requires a positive Stage 0 step count "
+                    "and non-negative refinement step counts."
+                )
 
         state.update(
             {
@@ -2710,6 +2713,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         previous_stage_interaction_gate = None
         try:
             for i_s in range(pyramid_num_stages):
+                stage_num_steps = int(pyramid_num_inference_steps_list[i_s])
                 use_wah_lora = bool(state["lora_active"]) and i_s == 0
                 if use_wah_lora:
                     if not self._fuse_wah_lora():
@@ -2728,14 +2732,17 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                     self.scheduler.config.get("base_shift", 0.5),
                     self.scheduler.config.get("max_shift", 1.15),
                 )
-                self.scheduler.set_timesteps(
-                    pyramid_num_inference_steps_list[i_s],
-                    i_s,
-                    device=device,
-                    mu=mu,
-                    is_amplify_first_chunk=is_amplify_first_chunk,
-                )
-                timesteps = self.scheduler.timesteps
+                if stage_num_steps > 0:
+                    self.scheduler.set_timesteps(
+                        stage_num_steps,
+                        i_s,
+                        device=device,
+                        mu=mu,
+                        is_amplify_first_chunk=is_amplify_first_chunk,
+                    )
+                    timesteps = self.scheduler.timesteps
+                else:
+                    timesteps = ()
 
                 if i_s > 0:
                     height *= 2
@@ -2749,27 +2756,28 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                         0, 2, 1, 3, 4
                     )
 
-                    ori_sigma = 1 - self.scheduler.ori_start_sigmas[i_s]
-                    gamma = self.scheduler.config.gamma
-                    alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
-                    beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
+                    if stage_num_steps > 0:
+                        ori_sigma = 1 - self.scheduler.ori_start_sigmas[i_s]
+                        gamma = self.scheduler.config.gamma
+                        alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
+                        beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
 
-                    batch_size, channel, num_frames, height, width = latents.shape
-                    noise = self.sample_block_noise(
-                        batch_size,
-                        channel,
-                        num_frames,
-                        height,
-                        width,
-                        patch_size,
-                        device,
-                        generator,
-                    )
-                    noise = noise.to(device=device, dtype=transformer_dtype)
-                    latents = alpha * latents + beta * noise
+                        batch_size, channel, num_frames, height, width = latents.shape
+                        noise = self.sample_block_noise(
+                            batch_size,
+                            channel,
+                            num_frames,
+                            height,
+                            width,
+                            patch_size,
+                            device,
+                            generator,
+                        )
+                        noise = noise.to(device=device, dtype=transformer_dtype)
+                        latents = alpha * latents + beta * noise
 
-                    if self.config.is_distilled:
-                        start_point_list.append(latents)
+                        if self.config.is_distilled:
+                            start_point_list.append(latents)
 
                 if i_s == 0:
                     pyramid_base_histories = self._build_pyramid_base_histories(
